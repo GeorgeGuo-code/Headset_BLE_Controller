@@ -1,23 +1,80 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'">
-    <title>Web Bluetooth API</title>
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; script-src 'self'; style-src 'self'">
+    <title>HMBC 头部手势配置工具</title>
+    <link rel="stylesheet" href="./styles.css">
   </head>
   <body>
-    <h1>Web Bluetooth API</h1>
+    <header>
+      <h1>HMBC 配置工具</h1>
+      <div class="conn">
+        <span id="conn-dot" class="dot"></span>
+        <span id="status">未连接</span>
+        <button id="btn-connect" class="primary">连接设备</button>
+        <button id="btn-disconnect" disabled>断开</button>
+        <label class="chk"><input type="checkbox" id="chk-all"> 显示所有设备</label>
+      </div>
+    </header>
 
-    <p>Status: <strong id="status">Idle</strong></p>
+    <div id="device-list" class="panel hidden"></div>
 
-    <button id="clickme">Test Bluetooth</button>
-    <button id="cancel">Cancel Bluetooth Request</button>
+    <main>
+      <section class="panel span2">
+        <h2>校准</h2>
+        <div class="row">
+          <button data-cmd="c" class="primary need-conn" disabled>完整校准（3 步）</button>
+          <button data-cmd="ca" class="need-conn" disabled>仅点头轴</button>
+          <button data-cmd="ct" class="need-conn" disabled>仅左右倾斜</button>
+        </div>
+        <ol id="steps">
+          <li class="step" data-step="1"><span class="mark"></span>
+            <span class="text">保持头部静止（基准姿态，2 s）</span></li>
+          <li class="step" data-step="2"><span class="mark"></span>
+            <span class="text">缓慢点头几次（点头轴，4 s）</span></li>
+          <li class="step" data-step="3"><span class="mark"></span>
+            <span class="text">缓慢左右倾头（倾斜轴，4 s）</span></li>
+        </ol>
+        <div id="cal-progress"><div id="cal-bar"></div></div>
+        <p id="cal-result" class="result"></p>
+      </section>
 
-    <p>Currently selected bluetooth device: <strong id="device-name"></strong></p>
+      <section class="panel">
+        <h2>参数</h2>
+        <div class="row">
+          <button data-cmd="p" class="need-conn" disabled>读取参数</button>
+          <button data-cmd="sp" class="need-conn" disabled>翻转俯仰符号</button>
+          <button data-cmd="sr" class="need-conn" disabled>翻转左右符号</button>
+        </div>
+        <table id="params"><tbody></tbody></table>
+        <p id="params-empty" class="hint">尚未读取。点击“读取参数”。</p>
+      </section>
 
-    <div id="device-list"></div>
+      <section class="panel">
+        <h2>手势事件</h2>
+        <div id="gesture-badges"></div>
+        <p id="gesture-last" class="hint">等待手势…</p>
+      </section>
 
-    <div id="services"></div>
+      <section class="panel span2">
+        <h2>日志 <span id="log-count" class="hint"></span></h2>
+        <div class="row">
+          <input id="log-filter" placeholder="过滤关键字">
+          <label class="chk"><input type="checkbox" id="chk-autoscroll" checked> 自动滚动</label>
+          <label class="chk"><input type="checkbox" id="chk-ts" checked> 时间戳</label>
+          <button id="btn-clear">清空</button>
+          <button id="btn-copy">复制</button>
+          <button id="btn-save">保存…</button>
+        </div>
+        <pre id="log"></pre>
+        <div class="row">
+          <input id="cmd-input" placeholder="自定义命令：c / ca / ct / p / sp / sr">
+          <button id="btn-send" class="need-conn" disabled>发送</button>
+        </div>
+      </section>
+    </main>
 
     <script src="./renderer.js"></script>
   </body>

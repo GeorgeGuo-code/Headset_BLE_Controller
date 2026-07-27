@@ -12,6 +12,7 @@
  * overflow). Yaw is computed by the DMP but NEVER consumed here.
  */
 
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -286,24 +287,26 @@ static bool step_axis(axis_ctx_t *ctx,
 
     switch (ctx->state) {
     case GD_AXIS_NEUTRAL:
+        /* Skip trigger check entirely during global cooldown — do NOT rewind
+         * to NEUTRAL (we're already there) and do NOT enter LOCKED. This
+         * prevents the suppressed axis from immediately re-competing on the
+         * very next tick after the dominant axis fired. */
+        if (now_ms < s_gd.cooldown_until_ms) {
+            break;
+        }
         if (absf(signed_rel) > trigger && abs_velocity > trigger_v) {
             ctx->state         = (signed_rel > 0) ? GD_AXIS_LOCKED_POS
                                                   : GD_AXIS_LOCKED_NEG;
             ctx->t_enter_ms    = now_ms;
             ctx->peak_abs_rel  = absf(signed_rel);
             ctx->peak_abs_vel  = abs_velocity;
-            /* Even when this is the "dominant" axis this tick, suppress
-             * the emit if we're inside the global cooldown from a recent
-             * prior fire. Suppressed locks rewind to NEUTRAL so the next
-             * genuine gesture isn't lost in a phantom lock. */
-            if (allow_fire && now_ms >= s_gd.cooldown_until_ms) {
+            if (allow_fire) {
                 emit_event((signed_rel > 0) ? pos_gesture : neg_gesture,
                            ctx->peak_abs_rel, ctx->peak_abs_vel);
                 return true;
             }
-            /* Suppressed by cross-axis mutex or global cooldown: rearm
-             * to NEUTRAL so this axis is ready to fire on the next
-             * genuine gesture. */
+            /* Suppressed by cross-axis mutex: rewind so this axis re-arms
+             * cleanly for the next genuine gesture. */
             ctx->state = GD_AXIS_NEUTRAL;
             ctx->peak_abs_rel = 0.0f;
             ctx->peak_abs_vel = 0.0f;
@@ -312,16 +315,12 @@ static bool step_axis(axis_ctx_t *ctx,
 
     case GD_AXIS_LOCKED_POS:
     case GD_AXIS_LOCKED_NEG:
-        /* Track peaks while still locked. */
         if (absf(signed_rel) > ctx->peak_abs_rel) {
             ctx->peak_abs_rel = absf(signed_rel);
         }
         if (abs_velocity > ctx->peak_abs_vel) {
             ctx->peak_abs_vel = abs_velocity;
         }
-        /* Return to NEUTRAL only when back inside the zone AND the
-         * debounce window has elapsed. The debounce guards against
-         * chatter on a borderline reading. */
         if (absf(signed_rel) < zone &&
             (now_ms - ctx->t_enter_ms) >= debounce) {
             ctx->state = GD_AXIS_NEUTRAL;
@@ -450,7 +449,35 @@ static void detector_task(void *arg)
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
         }
-        bool nod_dominant = absf(vel_nod) >= absf(vel_tilt);
+
+        /* Dominance gate. A real nod/look-up carries a tilt crosstalk that can
+         * be 40-70% of the nod magnitude (a person doesn't nod on a perfect
+         * vertical axis). The old per-tick mutex picked whichever axis was
+         * faster, but a tilt axis can briefly cross its trigger threshold
+         * before the nod does on a nod motion, firing the wrong label.
+         *
+         * Require the dominant axis to exceed the other by 1.4× before any
+         * NEUTRAL→LOCKED transition. Mixed-direction motions (e.g. nodding
+         * with a clear left lean) get re-decided next tick when one axis
+         * clearly leads. */
+        const float DOMINANCE = 1.4f;
+        bool nod_dominant;
+        if (absf(vel_nod) < 1.0f && absf(vel_tilt) < 1.0f) {
+            nod_dominant = absf(vel_nod) >= absf(vel_tilt);
+        } else {
+            float ratio_nt = absf(vel_nod)  / (absf(vel_tilt) + 1e-3f);
+            float ratio_tn = absf(vel_tilt) / (absf(vel_nod)  + 1e-3f);
+            if (ratio_nt >= DOMINANCE) {
+                nod_dominant = true;
+            } else if (ratio_tn >= DOMINANCE) {
+                nod_dominant = false;
+            } else {
+                /* Neither axis dominates — mixed motion. Hold fire this tick
+                 * and let the per-axis velocity check resolve on the next one. */
+                vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
+                continue;
+            }
+        }
         if (nod_dominant) {
             step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
                       GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ true);
@@ -624,8 +651,21 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
     float best_mag = 0.0f;
     float best_r[3] = {0.0f, 0.0f, 0.0f};
     uint32_t valid     = 0;
-    uint32_t rejected  = 0;   /* DMP samples with |w| too small (near 180°) */
-    uint32_t too_large = 0;   /* frames where rel-rotation exceeded 90° */
+    uint32_t rejected  = 0;
+    uint32_t too_large = 0;
+
+    /* Peak velocity must be measured along the nod axis, which isn't known
+     * until the capture loop has found the peak rotation. So retain each
+     * accepted sample (rotation vector + its tick index) and do the velocity
+     * pass afterwards. Tick index is needed because rejected samples leave
+     * gaps — differencing adjacent entries without it would overstate dt. */
+    typedef struct { uint32_t tick; float r[3]; } cal_sample_t;
+    cal_sample_t *samples = calloc(ticks, sizeof(cal_sample_t));
+    if (samples == NULL) {
+        ESP_LOGE(TAG, "axis calibration aborted: out of memory for %u samples",
+                 (unsigned)ticks);
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Reject thresholds:
      *   - |w| < 0.05: DMP quaternion is near-singular (180° rotation). Even
@@ -657,6 +697,8 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
             float mag = v3_norm(r);
             if (mag > R_MAX_PER_FRAME) { too_large++; vTaskDelay(pdMS_TO_TICKS(period_ms)); continue; }
             if (mag > best_mag) { best_mag = mag; memcpy(best_r, r, sizeof(best_r)); }
+            samples[valid].tick = i;
+            memcpy(samples[valid].r, r, sizeof(r));
             valid++;
         }
         vTaskDelay(pdMS_TO_TICKS(period_ms));
@@ -680,11 +722,13 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
         ESP_LOGE(TAG, "axis calibration failed: too few samples (%u/%u) — keep head "
                       "very still between nods and the device firmly mounted",
                  (unsigned)valid, (unsigned)ticks);
+        free(samples);
         return ESP_FAIL;
     }
     if (best_mag < 15.0f) {
         ESP_LOGE(TAG, "axis calibration aborted: nod too small (peak %.1f°) — nod harder",
                  best_mag);
+        free(samples);
         return ESP_FAIL;
     }
 
@@ -694,18 +738,73 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
     if (v3_normalize(nod) < 5.0f) {
         /* Peak was almost purely vertical — that's a yaw twist, not a nod. */
         ESP_LOGE(TAG, "axis calibration aborted: motion had no horizontal (nod) component");
+        free(samples);
         return ESP_FAIL;
     }
     float tilt[3]; v3_cross(up, nod, tilt);
     if (v3_normalize(tilt) == 0.0f) {
         ESP_LOGE(TAG, "axis calibration aborted: degenerate tilt axis");
+        free(samples);
         return ESP_FAIL;
     }
+
+    /* Second pass: peak |d(proj_nod)/dt|, the same quantity step_axis() gates
+     * on. Differencing |r| instead (the first attempt) measured total rotation
+     * speed across all axes, which is always ≥ the nod-axis component — the
+     * derived threshold came out too high and swallowed real gestures. */
+    float best_vel = 0.0f;
+    for (uint32_t k = 1; k < valid; k++) {
+        uint32_t dticks = samples[k].tick - samples[k - 1].tick;
+        if (dticks == 0 || dticks > 3) {
+            continue;   /* gap from rejected samples — dt unreliable */
+        }
+        float p_now  = v3_dot(samples[k].r,     nod);
+        float p_prev = v3_dot(samples[k - 1].r, nod);
+        float dt_s   = (float)(dticks * period_ms) / 1000.0f;
+        float vel    = absf(p_now - p_prev) / dt_s;
+        if (vel > best_vel) {
+            best_vel = vel;
+        }
+    }
+    free(samples);
 
     memcpy(np.nod_axis,  nod,  sizeof(nod));
     memcpy(np.tilt_axis, tilt, sizeof(tilt));
     gesture_params_set_neutral_aligned(&np);
     /* set_neutral_aligned already persists to NVS. */
+
+    /* Derive trigger thresholds from the motion the user just performed, so
+     * the dead zone scales to how hard they actually gesture instead of using
+     * one fixed guess.
+     *
+     *   trigger_deg = 50% of peak angle    — reached about mid-swing
+     *   trigger_vel = 50% of peak velocity — the dead zone that rejects the
+     *                 slow crosstalk a nod induces on the tilt axis
+     *
+     * 50% (not 80%) because these are *peak* values from a deliberate
+     * calibration gesture: everyday gestures are smaller and slower, and a
+     * threshold near the calibration peak would only fire on a repeat of the
+     * user's hardest motion. The floors are raised well above the old
+     * 20°/50°/s defaults, which is what let nods false-trigger tilt. */
+    if (best_vel > 10.0f) {
+        float new_trig_deg = best_mag * 0.5f;
+        float new_trig_vel = best_vel * 0.5f;
+        if (new_trig_deg < 12.0f) new_trig_deg = 12.0f;
+        if (new_trig_vel < 70.0f) new_trig_vel = 70.0f;
+        s_gd.params.trigger_deg            = new_trig_deg;
+        s_gd.params.trigger_velocity_deg_s = new_trig_vel;
+        /* Re-arm zone tracks the trigger so a bigger trigger doesn't leave the
+         * axis unable to return to neutral. */
+        s_gd.params.neutral_zone_deg       = new_trig_deg * 0.35f;
+        gesture_params_save_to_nvs(&s_gd.params);
+        ESP_LOGI(TAG, "thresholds derived: trigger=%.1f° vel=%.1f°/s zone=%.1f° "
+                      "(peak %.1f° / %.1f°/s along nod axis)",
+                 new_trig_deg, new_trig_vel, s_gd.params.neutral_zone_deg,
+                 best_mag, best_vel);
+    } else {
+        ESP_LOGW(TAG, "peak nod-axis velocity only %.1f°/s — keeping existing "
+                      "thresholds (nod faster to auto-tune them)", best_vel);
+    }
 
     s_gd.calibrated = true;
 

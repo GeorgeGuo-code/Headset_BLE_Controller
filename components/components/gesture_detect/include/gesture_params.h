@@ -15,7 +15,7 @@
 #define GESTURE_DEFAULT_DEBOUNCE_MS          500     /*!< min ms the user must hold inside zone before re-arming */
 #define GESTURE_DEFAULT_COOLDOWN_MS          500     /*!< min ms between any two fired events (kills double-fire / phantom second gesture from return-swing) */
 #define GESTURE_DEFAULT_SIGN_PITCH             1     /*!< 1: positive pitch = nod (chin-down) */
-#define GESTURE_DEFAULT_SIGN_ROLL              1     /*!< 1: positive roll = right-tilt */
+#define GESTURE_DEFAULT_SIGN_ROLL              0     /*!< 0: positive roll = left-tilt (flip with `sr` if needed) */
 
 /* ===== Magic / version ===================================================
  * Any read of `magic` that doesn't match or a `version` higher than we

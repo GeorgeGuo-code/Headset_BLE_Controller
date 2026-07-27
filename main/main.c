@@ -11,6 +11,7 @@
  * BOOT button remains as an offline fallback trigger.
  */
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -42,6 +43,11 @@
  * executed serially by cal_worker_task, so the long (~11 s) calibration never
  * runs in the BLE stack task context. */
 static QueueHandle_t s_cmd_q;
+
+/* False until gesture_detect_init() succeeds. The console (and therefore the
+ * command worker) comes up before the sensor, so commands can arrive while the
+ * detector is not initialised — or never will be, if the MPU is dead. */
+static volatile bool s_detector_ready = false;
 
 /* ── Gesture consumer: stream each event over BLE (and UART). ─────────────── */
 static void gesture_bridge_task(void *arg)
@@ -95,6 +101,11 @@ static void run_guided_calibration(void)
  * set). Runs in cal_worker_task, so blocking calibration is fine here. */
 static void handle_command(const char *cmd)
 {
+    if (!s_detector_ready) {
+        ble_console_log("sensor not initialised — commands unavailable\n");
+        return;
+    }
+
     if (strcmp(cmd, "c") == 0 || strcmp(cmd, "cal") == 0) {
         ble_console_log("triggering guided calibration...\n");
         run_guided_calibration();
@@ -201,6 +212,24 @@ static void boot_button_task(void *arg)
     }
 }
 
+/* Human-readable mpu_dmp_init() return codes (see inv_mpu.c). */
+static const char *dmp_err_str(uint8_t code)
+{
+    switch (code) {
+    case 1:  return "mpu_set_sensors";
+    case 2:  return "mpu_configure_fifo";
+    case 3:  return "mpu_set_sample_rate";
+    case 4:  return "dmp_load_motion_driver_firmware";
+    case 5:  return "dmp_set_orientation";
+    case 6:  return "dmp_enable_feature";
+    case 7:  return "dmp_set_fifo_rate";
+    case 8:  return "run_self_test (keep the board still)";
+    case 9:  return "mpu_set_dmp_state";
+    case 10: return "MPU_Init / I2C — sensor not responding";
+    default: return "unknown";
+    }
+}
+
 void app_main(void)
 {
     /* 1. NVS — required for gesture params AND the BLE stack. */
@@ -211,45 +240,64 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* 2. MPU6050 + DMP. Retry self-test (fails when chip is held vertical at
-     *    power-on). */
-    MPU_Init();
+    /* 2. MPU6050 + DMP, BEFORE the BLE stack comes up.
+     *
+     *    Order matters: bringing Bluedroid up first starves the I2C driver
+     *    (its controller tasks sit at near-top priority), which made
+     *    mpu_dmp_init fail randomly at whatever register write happened to be
+     *    in flight. DMP firmware load is ~1 k transfers, so it wants a quiet
+     *    bus. A failure here no longer halts boot — the console still starts
+     *    below, in degraded mode. */
     uint8_t dmp_res = 0;
     for (int attempt = 1; attempt <= 5; attempt++) {
         dmp_res = mpu_dmp_init();
         if (dmp_res == 0) {
             break;
         }
-        ESP_LOGW(TAG, "mpu_dmp_init attempt %d failed (%u)%s", attempt, (unsigned)dmp_res,
-                 dmp_res == 8 ? " (self-test — keep chip flat)" : "");
+        ESP_LOGW(TAG, "mpu_dmp_init attempt %d failed (%u: %s)", attempt,
+                 (unsigned)dmp_res, dmp_err_str(dmp_res));
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (dmp_res != 0) {
-        ESP_LOGE(TAG, "mpu_dmp_init failed after 5 attempts (%u); halting", (unsigned)dmp_res);
-        return;
+        ESP_LOGE(TAG, "mpu_dmp_init failed after 5 attempts (%u: %s)",
+                 (unsigned)dmp_res, dmp_err_str(dmp_res));
     }
 
-    /* 3. Detector — loads params from NVS (or installs defaults). */
-    ESP_ERROR_CHECK(gesture_detect_init());
+    /* 3. Detector — loads params from NVS (or installs defaults). Skipped when
+     *    the sensor is dead. */
+    if (dmp_res == 0) {
+        ESP_ERROR_CHECK(gesture_detect_init());
+        s_detector_ready = true;
+    }
 
-    /* 4. Command queue + BLE console (trigger + log stream). */
+    /* 4. Command queue + BLE console. Comes up even in degraded mode, so the
+     *    failure is visible in the config tool instead of only on UART. */
     s_cmd_q = xQueueCreate(CMD_QUEUE_LEN, CMD_MAX_LEN);
     ESP_ERROR_CHECK(s_cmd_q == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(ble_console_init(on_console_cmd));
+    xTaskCreate(cal_worker_task,  "cal_worker",  4096, NULL, 3, NULL);
+    xTaskCreate(boot_button_task, "boot_button", 4096, NULL, 3, NULL);
+
+    if (!s_detector_ready) {
+        ble_console_logf("SENSOR FAIL: mpu_dmp_init=%u (%s)\n",
+                         (unsigned)dmp_res, dmp_err_str(dmp_res));
+        if (dmp_res == 10) {
+            ble_console_log("no I2C answer at 0x68 — check SDA=5 / SCL=6, 3V3, GND, AD0\n");
+            MPU_Bus_Scan();   /* results go to UART */
+        }
+        ble_console_log("BLE console is up, but gesture detection is disabled\n");
+        return;
+    }
 
     ESP_LOGI(TAG, "wear device, connect over BLE (\"HMBC-Console\"), then send `c` "
                   "to calibrate — or hold BOOT 1 s");
 
-    /* 5. Event queue + detector + consumers. */
+    /* 5. Event queue + detector + consumer. */
     QueueHandle_t q = xQueueCreate(EVENT_QUEUE_LEN, sizeof(gesture_event_t));
     ESP_ERROR_CHECK(q == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(gesture_detect_start(q));
 
-    xTaskCreate(gesture_bridge_task, "gesture_bridge", 3072, q,    4, NULL);
-    /* calibration allocates aligned pose temporaries + float[4] quat helpers;
-     * 2048 words overflows, so give the worker 4096. */
-    xTaskCreate(cal_worker_task,     "cal_worker",     4096, NULL, 3, NULL);
-    xTaskCreate(boot_button_task,    "boot_button",    4096, NULL, 3, NULL);
+    xTaskCreate(gesture_bridge_task, "gesture_bridge", 3072, q, 4, NULL);
 
     ble_console_log("boot complete — gestures stream here; send `c` to calibrate\n");
 }

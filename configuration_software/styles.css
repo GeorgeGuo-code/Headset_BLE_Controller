@@ -1,0 +1,153 @@
+:root {
+  --bg: #14171c;
+  --panel: #1c2128;
+  --line: #2c333d;
+  --fg: #d8dee6;
+  --dim: #8b95a3;
+  --accent: #4a90e2;
+  --ok: #3fb950;
+  --err: #f2545b;
+  --warn: #d29922;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 12px 16px 20px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+h1 { font-size: 17px; margin: 0; }
+h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.conn { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+.dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--err); flex: none;
+}
+.dot.on { background: var(--ok); }
+.dot.busy { background: var(--warn); }
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+.span2 { grid-column: 1 / -1; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+
+button {
+  background: #262d36;
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+input {
+  background: #10141a;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--fg);
+  padding: 6px 8px;
+  font-size: 13px;
+  min-width: 200px;
+}
+input:focus { outline: none; border-color: var(--accent); }
+
+.chk { display: flex; align-items: center; gap: 5px; color: var(--dim); font-size: 12px; min-width: auto; }
+.chk input { min-width: auto; }
+
+.hint { color: var(--dim); font-size: 12px; margin: 4px 0 0; }
+.hidden { display: none; }
+
+/* calibration steps */
+#steps { list-style: none; margin: 10px 0; padding: 0; }
+.step { display: flex; align-items: center; gap: 8px; padding: 4px 0; color: var(--dim); }
+.step .mark {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 1px solid var(--line); flex: none;
+  font-size: 11px; line-height: 14px; text-align: center;
+}
+.step.active { color: var(--fg); }
+.step.active .mark { border-color: var(--accent); background: var(--accent); }
+.step.done { color: var(--ok); }
+.step.done .mark { border-color: var(--ok); background: var(--ok); color: #14171c; }
+.step.done .mark::after { content: "\2713"; }
+.step.fail { color: var(--err); }
+.step.fail .mark { border-color: var(--err); background: var(--err); color: #14171c; }
+.step.fail .mark::after { content: "\00d7"; }
+
+#cal-progress { height: 4px; background: #10141a; border-radius: 2px; overflow: hidden; }
+#cal-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
+
+.result { font-size: 13px; margin: 8px 0 0; min-height: 20px; }
+.result.ok { color: var(--ok); }
+.result.err { color: var(--err); }
+
+/* params */
+#params { width: 100%; border-collapse: collapse; font-size: 13px; }
+#params td { padding: 3px 0; border-bottom: 1px solid var(--line); }
+#params td:first-child { color: var(--dim); width: 45%; }
+#params td:last-child { font-family: Consolas, monospace; }
+
+/* gestures */
+#gesture-badges { display: flex; gap: 8px; flex-wrap: wrap; }
+.badge {
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 8px 10px; font-size: 12px; text-align: center; min-width: 78px;
+}
+.badge .n { display: block; font-size: 18px; font-family: Consolas, monospace; }
+.badge.hit { border-color: var(--accent); background: #1e2a3a; }
+
+/* log */
+#log {
+  background: #0d1117;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  height: 260px;
+  overflow-y: auto;
+  margin: 0 0 8px;
+  padding: 8px;
+  font: 12px/1.45 Consolas, "Cascadia Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+#log .l { display: block; }
+#log .l.tx { color: var(--accent); }
+#log .l.sys { color: var(--dim); }
+#log .l.ok { color: var(--ok); }
+#log .l.err { color: var(--err); }
+#log .l.cal { color: var(--warn); }
+#log .l.gesture { color: #a371f7; }
+#log .t { color: #55606e; }
+
+#device-list { margin-top: 12px; }
+#device-list button { display: block; margin: 4px 0; min-width: 260px; text-align: left; }
