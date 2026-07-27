@@ -3,5 +3,5 @@ idf_component_register(
          "gesture_params.c"
          "calib_session.c"
     INCLUDE_DIRS "include"
-    REQUIRES main freertos nvs_flash MPU6050 inv_mpu
+    REQUIRES freertos nvs_flash MPU6050 inv_mpu
 )
