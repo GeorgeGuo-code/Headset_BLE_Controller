@@ -182,6 +182,26 @@ static void quat_rotate_vec(const float q[4], const float v[3], float out[3])
     out[0] = r[1]; out[1] = r[2]; out[2] = r[3];
 }
 
+/* Phase 6: rotate the q_neutral-frame nod_axis / tilt_axis into the
+ * current q_drift frame so they can be dotted with r (which the detector
+ * already computes as rotvec(conj(q_drift) ⊗ qcur), i.e. in q_drift frame).
+ * The rotation is q_diff = conj(q_drift) ⊗ q_neutral — identity when
+ * there's no佩戴微调, full rotation when q_drift has snapped far away.
+ * Recomputed each tick (cost is two quat-vec rotations, ~100 flops at
+ * 50 Hz — negligible) so q_drift updates are reflected immediately without
+ * state-synchronisation bugs. Also used by the `p` command for diagnostics. */
+static void compute_effective_axes(const neutral_pose_aligned_t *np,
+                                   const float q_drift[4],
+                                   float out_nod[3],
+                                   float out_tilt[3])
+{
+    float qd_conj[4]; quat_conj(q_drift, qd_conj);
+    float q_diff[4];  quat_mul(qd_conj, np->q_neutral, q_diff);
+    quat_normalize(q_diff);
+    quat_rotate_vec(q_diff, np->nod_axis,  out_nod);
+    quat_rotate_vec(q_diff, np->tilt_axis, out_tilt);
+}
+
 /* Apply sign convention: flips the projection so that a positive value
  * always corresponds to the user's gesture of choice. */
 static inline float apply_sign_pitch(float rel, uint8_t sign_pitch)
@@ -267,6 +287,16 @@ void gesture_detect_get_q_drift(float out[4])
         return;
     }
     memcpy(out, s_gd.q_drift, sizeof(s_gd.q_drift));
+}
+
+void gesture_detect_get_effective_axes(float out_nod[3], float out_tilt[3])
+{
+    if (out_nod == NULL || out_tilt == NULL) {
+        return;
+    }
+    neutral_pose_aligned_t np;
+    gesture_params_get_neutral_aligned(&np);
+    compute_effective_axes(&np, s_gd.q_drift, out_nod, out_tilt);
 }
 
 /**
@@ -456,10 +486,18 @@ static void detector_task(void *arg)
         quat_normalize(qrel);
         float r[3];       quat_to_rotvec_deg(qrel, r);
 
-        /* Project onto the calibrated gesture axes, then apply sign. The
-         * projection replaces the old rel_pitch / rel_roll channels. */
-        float proj_nod  = v3_dot(r, np.nod_axis);
-        float proj_tilt = v3_dot(r, np.tilt_axis);
+        /* Phase 6: rotate the calibrated nod/tilt axes into the current
+         * q_drift frame so the projection stays correct as q_drift drifts
+         * away from q_neutral. With no drift this is a no-op (q_diff =
+         * identity); after佩戴微调 the axes rotate by the same amount as
+         * q_drift, keeping the geometry consistent. */
+        float nod_axis_eff[3], tilt_axis_eff[3];
+        compute_effective_axes(&np, s_gd.q_drift, nod_axis_eff, tilt_axis_eff);
+
+        /* Project onto the (drift-rotated) gesture axes, then apply sign.
+         * The projection replaces the old rel_pitch / rel_roll channels. */
+        float proj_nod  = v3_dot(r, nod_axis_eff);
+        float proj_tilt = v3_dot(r, tilt_axis_eff);
         proj_nod  = apply_sign_pitch(proj_nod,  s_gd.params.sign_pitch);
         proj_tilt = apply_sign_roll (proj_tilt, s_gd.params.sign_roll);
 

@@ -137,6 +137,17 @@ static void handle_command(const char *cmd)
         gesture_detect_get_q_drift(qd);
         ble_console_logf("  q_drift =[%.3f %.3f %.3f %.3f]\n",
                          qd[0], qd[1], qd[2], qd[3]);
+        /* Phase 6: nod/tilt axes rotated into the current q_drift frame.
+         * These are what the detector actually projects motion against; if
+         * they differ noticeably from the q_neutral-frame axes printed
+         * above, q_drift has absorbed佩戴微调 and the projection is still
+         * geometrically correct. */
+        float nod_eff[3], tilt_eff[3];
+        gesture_detect_get_effective_axes(nod_eff, tilt_eff);
+        ble_console_logf("  nod_eff  =[%.2f %.2f %.2f]\n",
+                         nod_eff[0], nod_eff[1], nod_eff[2]);
+        ble_console_logf("  tilt_eff =[%.2f %.2f %.2f]\n",
+                         tilt_eff[0], tilt_eff[1], tilt_eff[2]);
     } else if (strcmp(cmd, "q") == 0) {
         /* Phase 5: standalone q_drift diagnostic. Reports the angle between
          * q_drift and q_neutral — the larger this gets, the more佩戴微调

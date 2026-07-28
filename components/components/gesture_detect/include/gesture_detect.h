@@ -61,6 +61,15 @@ void gesture_detect_set_sign(bool positive_pitch_is_nod, bool positive_roll_is_r
 void gesture_detect_get_q_drift(float out[4]);
 
 /**
+ * @brief Phase 6: copy the nod_axis / tilt_axis rotated into the current
+ *        q_drift frame into `out_nod` / `out_tilt`. These are the actual
+ *        vectors the detector projects motion against — what the
+ *        q_neutral-frame nod_axis rotates to as q_drift drifts. With no
+ *        drift they equal `params.neutral.nod_axis` / `tilt_axis`. Used
+ *        by the `p` console command for diagnostics. */
+void gesture_detect_get_effective_axes(float out_nod[3], float out_tilt[3]);
+
+/**
  * @brief Phase 5: force the sliding baseline to re-sync from the next
  *        DMP sample. Use after佩戴微调 changes faster than the still-snap
  *        can absorb (e.g. taking the device off and putting it back on
