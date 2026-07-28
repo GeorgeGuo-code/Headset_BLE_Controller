@@ -103,10 +103,20 @@ esp_err_t gesture_params_load_from_nvs(gesture_params_t *out)
         return err;
     }
 
-    if (out->magic != GESTURE_PARAMS_MAGIC || out->version != GESTURE_PARAMS_VERSION) {
-        ESP_LOGW(TAG, "magic/version mismatch (got magic=0x%08lx ver=%u)",
-                 (unsigned long)out->magic, (unsigned)out->version);
+    if (out->magic != GESTURE_PARAMS_MAGIC) {
+        ESP_LOGW(TAG, "magic mismatch (got 0x%08lx expected 0x%08lx) — using defaults",
+                 (unsigned long)out->magic, (unsigned long)GESTURE_PARAMS_MAGIC);
         return ESP_ERR_INVALID_CRC;
+    }
+    if (out->version != GESTURE_PARAMS_VERSION) {
+        /* The v2 → v3 reinterpretation keeps `trigger_deg` and
+         * `trigger_velocity_deg_s` in the same numeric range (the new window-
+         * accumulated semantics accept the same numbers as the old single-frame
+         * semantics for a typical wearer), so we just stamp the new version
+         * in-place and keep going. */
+        ESP_LOGW(TAG, "params version is %u, current is %u — auto-migrating in place",
+                 (unsigned)out->version, (unsigned)GESTURE_PARAMS_VERSION);
+        out->version = GESTURE_PARAMS_VERSION;
     }
     return ESP_OK;
 }

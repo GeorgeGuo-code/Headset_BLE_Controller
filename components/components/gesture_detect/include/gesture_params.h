@@ -9,9 +9,9 @@
  * (a) at first boot when NVS is empty and
  * (b) after `gesture_params_reset_default()`.
  */
-#define GESTURE_DEFAULT_TRIGGER_DEG          20.0f   /*!< |angle-neutral| to fire */
-#define GESTURE_DEFAULT_TRIGGER_VEL_DEG_S    50.0f   /*!< min angular speed to fire */
-#define GESTURE_DEFAULT_NEUTRAL_ZONE_DEG      6.0f   /*!< |angle-neutral| to re-arm (wider → cleaner return) */
+#define GESTURE_DEFAULT_TRIGGER_DEG           7.0f   /*!< window-accum |proj| to fire (°) — relaxed from 12° so casual nods fire */
+#define GESTURE_DEFAULT_TRIGGER_VEL_DEG_S    50.0f   /*!< window peak d(proj)/dt to fire (°/s) — relaxed from 80°/s; peak in a typical slow nod is ~40-60°/s */
+#define GESTURE_DEFAULT_NEUTRAL_ZONE_DEG      2.5f   /*!< per-frame dead zone for re-arming (°) — smaller so the system re-arms quickly between gestures */
 #define GESTURE_DEFAULT_DEBOUNCE_MS          500     /*!< min ms the user must hold inside zone before re-arming */
 #define GESTURE_DEFAULT_COOLDOWN_MS          500     /*!< min ms between any two fired events (kills double-fire / phantom second gesture from return-swing) */
 #define GESTURE_DEFAULT_SIGN_PITCH             1     /*!< 1: positive pitch = nod (chin-down) */
@@ -23,7 +23,7 @@
  * detector falls back to defaults and (optionally) re-saves them.
  */
 #define GESTURE_PARAMS_MAGIC   0xCA1178E7u
-#define GESTURE_PARAMS_VERSION 2u   /*!< v2: quaternion neutral + calibrated gesture axes */
+#define GESTURE_PARAMS_VERSION 3u   /*!< v3: trigger_deg/vel reinterpreted as window-accum metrics (see gesture_params_t) */
 
 /* ===== NVS layout ========================================================
  * Persisted under namespace "gesture", key "params" as a blob.
@@ -91,20 +91,30 @@ typedef struct {
  *        Layout is `__attribute__((packed))` and ends up exactly 64 bytes
  *        (4 + 1 + 40 + 4 + 4 + 4 + 2 + 1 + 1 + 3 = 64). Grew from v1's 32 B
  *        when `neutral_pose_t` went from 2 Euler offsets to a quaternion +
- *        two gesture axes. Old v1 blobs are rejected by the version check
+ *        two gesture axes. Old v1/v2 blobs are rejected by the version check
  *        and the detector falls back to defaults (user must re-calibrate).
  *
- *        Threshold values are SYMMETRIC across all four gestures — the
- *        calibration session derives them as the conservative-min across
- *        every per-rep peak collected.
+ *        Threshold semantics (v3): the detector works on a 200ms sliding
+ *        window of frame-to-frame rotation deltas. `trigger_deg` and
+ *        `trigger_velocity_deg_s` gate a single window, not a single frame:
+ *          - trigger_deg            — sum of |Δproj| over the window must
+ *                                     exceed this to fire (≈ "how far the
+ *                                     user moved overall")
+ *          - trigger_velocity_deg_s — peak |d(proj)/dt| in the window must
+ *                                     exceed this (≈ "how fast at the
+ *                                     sharpest instant")
+ *        Default values (7° / 50°/s / 2.5°) are calibrated for a casual
+ *        nod; auto-tune in `gesture_detect_calibrate_axes()` further lowers
+ *        them when the wearer's own calibration motion allows it (typical
+ *        tuned trigger ≈ 5° / vel ≈ 40°/s).
  */
 typedef struct __attribute__((packed)) {
     uint32_t     magic;                 /*!< GESTURE_PARAMS_MAGIC */
     uint8_t      version;               /*!< GESTURE_PARAMS_VERSION */
     neutral_pose_t neutral;             /*!< 40 B: q_neutral + nod/tilt axes */
-    float        trigger_deg;           /*!< symmetric */
-    float        trigger_velocity_deg_s;
-    float        neutral_zone_deg;      /*!< symmetric */
+    float        trigger_deg;           /*!< window-accumulated angle threshold (°) */
+    float        trigger_velocity_deg_s;/*!< window peak-velocity threshold (°/s) */
+    float        neutral_zone_deg;      /*!< per-frame dead zone for re-arming (°) */
     uint16_t     debounce_ms;
     uint8_t      sign_pitch;            /*!< 0: flip nod-axis projection sign (positive = LOOK_UP) */
     uint8_t      sign_roll;             /*!< 0: flip tilt-axis projection sign (positive = LEFT) */

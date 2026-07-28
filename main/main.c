@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -130,6 +131,42 @@ static void handle_command(const char *cmd)
                          p->neutral.q_neutral[2], p->neutral.q_neutral[3],
                          p->neutral.nod_axis[0], p->neutral.nod_axis[1], p->neutral.nod_axis[2],
                          p->neutral.tilt_axis[0], p->neutral.tilt_axis[1], p->neutral.tilt_axis[2]);
+        /* Phase 5: also report the runtime sliding baseline so the user can
+         * see how much佩戴微调 has been absorbed. */
+        float qd[4];
+        gesture_detect_get_q_drift(qd);
+        ble_console_logf("  q_drift =[%.3f %.3f %.3f %.3f]\n",
+                         qd[0], qd[1], qd[2], qd[3]);
+    } else if (strcmp(cmd, "q") == 0) {
+        /* Phase 5: standalone q_drift diagnostic. Reports the angle between
+         * q_drift and q_neutral — the larger this gets, the more佩戴微调
+         * the device has absorbed. A persistently large value (e.g. >15°)
+         * means the still-snap isn't catching up; run `q reset` to force
+         * a re-sync from the next DMP sample. */
+        const gesture_params_t *p = gesture_detect_get_params();
+        float qd[4];
+        gesture_detect_get_q_drift(qd);
+        float qn_conj[4], qdiff[4];
+        /* Use the same quat helpers the detector does. They aren't exposed
+         * in the public header, so we re-derive the angle inline: the angle
+         * between two unit quaternions is 2·acos(|dot|) degrees. */
+        float d = qd[0]*p->neutral.q_neutral[0] +
+                  qd[1]*p->neutral.q_neutral[1] +
+                  qd[2]*p->neutral.q_neutral[2] +
+                  qd[3]*p->neutral.q_neutral[3];
+        if (d < 0.0f) d = -d;
+        if (d > 1.0f) d = 1.0f;
+        float angle_deg = 2.0f * acosf(d) * 57.29578f;
+        ble_console_logf("q_drift  : [%.3f %.3f %.3f %.3f]\n",
+                         qd[0], qd[1], qd[2], qd[3]);
+        ble_console_logf("q_neutral: [%.3f %.3f %.3f %.3f]\n",
+                         p->neutral.q_neutral[0], p->neutral.q_neutral[1],
+                         p->neutral.q_neutral[2], p->neutral.q_neutral[3]);
+        ble_console_logf("angle(deg)=%.2f  (use 'q reset' to force re-sync)\n",
+                         angle_deg);
+    } else if (strcmp(cmd, "q reset") == 0) {
+        gesture_detect_reset_q_drift();
+        ble_console_log("q_drift reset — next DMP sample becomes new baseline\n");
     } else if (strcmp(cmd, "sp") == 0) {
         gesture_params_t params = *gesture_detect_get_params();
         params.sign_pitch ^= 1;
@@ -144,8 +181,21 @@ static void handle_command(const char *cmd)
         ESP_ERROR_CHECK(gesture_params_save_to_nvs(&params));
         ble_console_logf("sign_roll flipped -> positive_roll_is_right=%u\n",
                          (unsigned)(params.sign_roll == 1));
+    } else if (strcmp(cmd, "cd") == 0) {
+        /* Capture diagnostics for the v3 prototype. Shows how stable the last
+         * calibration was, which is the main knob we don't yet verify at
+         * runtime. Re-run after `c` to compare runs. */
+        gesture_detect_capture_t cap;
+        gesture_detect_get_last_capture(&cap);
+        ble_console_logf("cap diag: valid=%u used=%u sum_mag=%.1f drift=%.1f\n",
+                         (unsigned)cap.valid, (unsigned)cap.used,
+                         cap.sum_mag_deg, cap.drift_deg);
+        ble_console_logf("  nod =[%.2f %.2f %.2f]\n",
+                         cap.nod_axis[0], cap.nod_axis[1], cap.nod_axis[2]);
+        ble_console_logf("  tilt=[%.2f %.2f %.2f]\n",
+                         cap.tilt_axis[0], cap.tilt_axis[1], cap.tilt_axis[2]);
     } else if (cmd[0] != '\0') {
-        ble_console_logf("unknown command: '%s' (try c, ca, ct, p, sp, sr)\n", cmd);
+        ble_console_logf("unknown command: '%s' (try c, ca, ct, p, q, sp, sr, cd)\n", cmd);
     }
 }
 
