@@ -92,6 +92,14 @@ void I2C_Init();
 uint8_t MPU_Init();
 
 /**
+ * @brief Log every I2C address that ACKs on the bus.
+ *
+ * Diagnostic for MPU_Init() failures: distinguishes a dead bus from a device
+ * sitting at an unexpected address (e.g. 0x69 when AD0 is pulled high).
+ */
+void MPU_Bus_Scan(void);
+
+/**
  * @brief Write a byte to MPU-6050 through I2C
  *
  * @param reg parameter is a register of MPU-6050

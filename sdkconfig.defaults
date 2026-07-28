@@ -1,0 +1,26 @@
+# ── Project sdkconfig defaults ─────────────────────────────────────────────
+# Source of truth for config (sdkconfig itself is generated & .gitignored).
+# After editing this file: `rm sdkconfig && idf.py reconfigure` (or set-target)
+# to regenerate sdkconfig with these applied.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# I2C: v6.0.2 legacy i2c.c collides with the new i2c_master driver's weak
+# symbol; MPU6050.c uses the new driver. (Carried over from prior sdkconfig.)
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# ── Bluetooth: Bluedroid BLE (GATT server for the console service) ─────────
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_GATTS_ENABLE=y
+# The console uses the legacy GAP advertising API (esp_ble_gap_config_adv_data
+# / esp_ble_gap_start_advertising), which requires the 4.2 feature set on
+# chips (S3/C3/...) that otherwise default to extended-advertising only.
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+
+# ── Flash / partitions ─────────────────────────────────────────────────────
+# A Bluedroid app image does not fit the default single-app partition; use the
+# "large" single-app layout (~1.5 MB app) on the 8 MB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

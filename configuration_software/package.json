@@ -1,0 +1,17 @@
+{
+  "name": "bluetooth_example",
+  "version": "1.0.0",
+  "description": "My Electron application description",
+  "keywords": [],
+  "license": "ISC",
+  "author": "george",
+  "type": "commonjs",
+  "main": "./main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^43.2.0"
+  },
+  "productName": "concerned-trick-succeed-syajy"
+}

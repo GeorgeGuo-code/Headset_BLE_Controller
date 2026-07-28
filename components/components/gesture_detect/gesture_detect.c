@@ -12,6 +12,7 @@
  * overflow). Yaw is computed by the DMP but NEVER consumed here.
  */
 
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -56,7 +57,38 @@ typedef struct {
     volatile bool   calibrating;         /*!< set by calibrate_* during their DMP-loop window */
     bool            running;
     bool            calibrated;   /*!< true once neutral + axes (and, ideally, tilt) calibration finished */
+
+    /* ===== Phase 5: q_drift sliding baseline ============================
+     * `q_neutral` is captured once at calibration and never updated.
+     * After wearing the device for a while the head settles a few degrees
+     * away from that snapshot, the nod projects partly onto the tilt axis,
+     * and the detector starts firing the wrong gesture. q_drift is the
+     * detector's runtime baseline: seeded from q_neutral at apply_params(),
+     * snapped to the current quaternion after STILL_DURATION_MS of rest,
+     * and held fixed during motion so gestures register as relative
+     * displacement. The nod/tilt axes stay expressed in the q_neutral
+     * frame (still meaningful as long as q_drift stays close to it). */
+    float           q_drift[4];          /*!< runtime "neutral" pose (w,x,y,z) */
+    bool            q_drift_valid;       /*!< false until detector has a fresh sample after apply_params */
+    uint32_t        still_since_ms;      /*!< ms tick at which stillness began; 0 = not still */
 } gd_t;
+
+/* Diagnostic snapshot of the most recent axis calibration, exposed via the
+ * `cd` BLE command. Used in the v3 prototype to verify that the Δr-average
+ * algorithm produces a stable direction across runs without needing to
+ * instrument the detector task itself. */
+typedef struct {
+    uint32_t valid;             /*!< samples kept after DMP-glitch rejection */
+    uint32_t used;              /*!< samples contributing to the average */
+    float    nod_axis[3];       /*!< persisted nod_axis (device frame) */
+    float    tilt_axis[3];      /*!< persisted tilt_axis (device frame) */
+    float    sum_mag_deg;       /*!< Σ|Δr| over the kept samples */
+    float    drift_deg;         /*!< max |Δr − mean(Δr)| — a small drift means the user's
+                                     motion was consistent; large means the user wasn't doing the
+                                     same gesture repeatedly. */
+} last_capture_t;
+
+static last_capture_t s_last_cap;
 
 static gd_t s_gd;
 
@@ -150,6 +182,26 @@ static void quat_rotate_vec(const float q[4], const float v[3], float out[3])
     out[0] = r[1]; out[1] = r[2]; out[2] = r[3];
 }
 
+/* Phase 6: rotate the q_neutral-frame nod_axis / tilt_axis into the
+ * current q_drift frame so they can be dotted with r (which the detector
+ * already computes as rotvec(conj(q_drift) ⊗ qcur), i.e. in q_drift frame).
+ * The rotation is q_diff = conj(q_drift) ⊗ q_neutral — identity when
+ * there's no佩戴微调, full rotation when q_drift has snapped far away.
+ * Recomputed each tick (cost is two quat-vec rotations, ~100 flops at
+ * 50 Hz — negligible) so q_drift updates are reflected immediately without
+ * state-synchronisation bugs. Also used by the `p` command for diagnostics. */
+static void compute_effective_axes(const neutral_pose_aligned_t *np,
+                                   const float q_drift[4],
+                                   float out_nod[3],
+                                   float out_tilt[3])
+{
+    float qd_conj[4]; quat_conj(q_drift, qd_conj);
+    float q_diff[4];  quat_mul(qd_conj, np->q_neutral, q_diff);
+    quat_normalize(q_diff);
+    quat_rotate_vec(q_diff, np->nod_axis,  out_nod);
+    quat_rotate_vec(q_diff, np->tilt_axis, out_tilt);
+}
+
 /* Apply sign convention: flips the projection so that a positive value
  * always corresponds to the user's gesture of choice. */
 static inline float apply_sign_pitch(float rel, uint8_t sign_pitch)
@@ -193,6 +245,15 @@ esp_err_t gesture_detect_apply_params(const gesture_params_t *params)
         return ESP_ERR_INVALID_ARG;
     }
     s_gd.params = *params;
+    /* Phase 5: seed the sliding baseline from the freshly-applied neutral
+     * pose and force the detector to re-sync q_drift from the next DMP
+     * sample. Without the q_drift_valid reset the detector would still be
+     * using the old q_drift from the previous calibration run, and the
+     * very first tick would produce a huge r-vector (old baseline vs. new
+     * q_neutral) and either miss-fire or instantly snap to the wrong pose. */
+    memcpy(s_gd.q_drift, params->neutral.q_neutral, sizeof(s_gd.q_drift));
+    s_gd.q_drift_valid  = false;
+    s_gd.still_since_ms = 0;
     /* The neutral pose is packed; copy to an aligned mirror before passing
      * to log helpers. */
     neutral_pose_aligned_t np;
@@ -218,6 +279,37 @@ void gesture_detect_set_sign(bool positive_pitch_is_nod, bool positive_roll_is_r
 {
     s_gd.params.sign_pitch = positive_pitch_is_nod ? 1 : 0;
     s_gd.params.sign_roll  = positive_roll_is_right ? 1 : 0;
+}
+
+void gesture_detect_get_q_drift(float out[4])
+{
+    if (out == NULL) {
+        return;
+    }
+    memcpy(out, s_gd.q_drift, sizeof(s_gd.q_drift));
+}
+
+void gesture_detect_get_effective_axes(float out_nod[3], float out_tilt[3])
+{
+    if (out_nod == NULL || out_tilt == NULL) {
+        return;
+    }
+    neutral_pose_aligned_t np;
+    gesture_params_get_neutral_aligned(&np);
+    compute_effective_axes(&np, s_gd.q_drift, out_nod, out_tilt);
+}
+
+/**
+ * @brief Phase 5: force q_drift to re-sync from the next DMP sample.
+ *        Use when the device佩戴微调 has drifted far enough that the
+ *        still-snap will take too long to catch up (e.g. the user took
+ *        the device off and put it back on at a very different angle).
+ *        The next detector tick copies qcur into q_drift and the still
+ *        counter resets. nod/tilt axes are unchanged. */
+void gesture_detect_reset_q_drift(void)
+{
+    s_gd.q_drift_valid  = false;
+    s_gd.still_since_ms = 0;
 }
 
 /* ===== Event helper ====================================================== */
@@ -286,24 +378,26 @@ static bool step_axis(axis_ctx_t *ctx,
 
     switch (ctx->state) {
     case GD_AXIS_NEUTRAL:
+        /* Skip trigger check entirely during global cooldown — do NOT rewind
+         * to NEUTRAL (we're already there) and do NOT enter LOCKED. This
+         * prevents the suppressed axis from immediately re-competing on the
+         * very next tick after the dominant axis fired. */
+        if (now_ms < s_gd.cooldown_until_ms) {
+            break;
+        }
         if (absf(signed_rel) > trigger && abs_velocity > trigger_v) {
             ctx->state         = (signed_rel > 0) ? GD_AXIS_LOCKED_POS
                                                   : GD_AXIS_LOCKED_NEG;
             ctx->t_enter_ms    = now_ms;
             ctx->peak_abs_rel  = absf(signed_rel);
             ctx->peak_abs_vel  = abs_velocity;
-            /* Even when this is the "dominant" axis this tick, suppress
-             * the emit if we're inside the global cooldown from a recent
-             * prior fire. Suppressed locks rewind to NEUTRAL so the next
-             * genuine gesture isn't lost in a phantom lock. */
-            if (allow_fire && now_ms >= s_gd.cooldown_until_ms) {
+            if (allow_fire) {
                 emit_event((signed_rel > 0) ? pos_gesture : neg_gesture,
                            ctx->peak_abs_rel, ctx->peak_abs_vel);
                 return true;
             }
-            /* Suppressed by cross-axis mutex or global cooldown: rearm
-             * to NEUTRAL so this axis is ready to fire on the next
-             * genuine gesture. */
+            /* Suppressed by cross-axis mutex: rewind so this axis re-arms
+             * cleanly for the next genuine gesture. */
             ctx->state = GD_AXIS_NEUTRAL;
             ctx->peak_abs_rel = 0.0f;
             ctx->peak_abs_vel = 0.0f;
@@ -312,16 +406,12 @@ static bool step_axis(axis_ctx_t *ctx,
 
     case GD_AXIS_LOCKED_POS:
     case GD_AXIS_LOCKED_NEG:
-        /* Track peaks while still locked. */
         if (absf(signed_rel) > ctx->peak_abs_rel) {
             ctx->peak_abs_rel = absf(signed_rel);
         }
         if (abs_velocity > ctx->peak_abs_vel) {
             ctx->peak_abs_vel = abs_velocity;
         }
-        /* Return to NEUTRAL only when back inside the zone AND the
-         * debounce window has elapsed. The debounce guards against
-         * chatter on a borderline reading. */
         if (absf(signed_rel) < zone &&
             (now_ms - ctx->t_enter_ms) >= debounce) {
             ctx->state = GD_AXIS_NEUTRAL;
@@ -361,27 +451,53 @@ static void detector_task(void *arg)
 
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
+        /* Phase 5: first sample after apply_params() seeds q_drift from
+         * the current pose and skips processing for this tick — we have
+         * no prior projection state for the velocity estimate and r itself
+         * would be qcur-vs-qcur (zero) anyway. Subsequent ticks compute r
+         * against q_drift, which slowly tracks佩戴微调. */
+        if (!s_gd.q_drift_valid) {
+            memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
+            s_gd.q_drift_valid  = true;
+            s_gd.still_since_ms = 0;
+            prev_valid = false;
+            vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
+            continue;
+        }
+
         /* Pull a stack-local aligned copy of the neutral pose so the
          * quaternion/vector helpers can take its members as float* without
          * tripping -Werror=address-of-packed-member. The pose is stable
          * for the duration of one tick (calibration only writes when
-         * detector_task is between samples). */
+         * detector_task is between samples). The nod/tilt axes are still
+         * expressed in the q_neutral frame — that's fine as long as
+         * q_drift doesn't stray far from q_neutral, which the still-snap
+         * guarantees by keeping q_drift ≈ current pose whenever the user
+         * is at rest. */
         neutral_pose_aligned_t np;
         gesture_params_get_neutral_aligned(&np);
 
-        /* Relative rotation from the calibrated neutral pose, expressed as
-         * a rotation vector (axis * angle, degrees) in the neutral body
-         * frame. This is mounting-angle independent and free of the Euler
-         * singularities that plagued the old scalar-subtraction path. */
-        float qn_conj[4]; quat_conj(np.q_neutral, qn_conj);
-        float qrel[4];    quat_mul(qn_conj, qcur, qrel);
+        /* Relative rotation from the runtime baseline q_drift, expressed
+         * as a rotation vector (axis * angle, degrees). Replaces the old
+         * q_neutral-relative r — same projection math, but the baseline
+         * now follows佩戴微调 instead of being frozen at calibration. */
+        float qd_conj[4]; quat_conj(s_gd.q_drift, qd_conj);
+        float qrel[4];    quat_mul(qd_conj, qcur, qrel);
         quat_normalize(qrel);
         float r[3];       quat_to_rotvec_deg(qrel, r);
 
-        /* Project onto the calibrated gesture axes, then apply sign. The
-         * projection replaces the old rel_pitch / rel_roll channels. */
-        float proj_nod  = v3_dot(r, np.nod_axis);
-        float proj_tilt = v3_dot(r, np.tilt_axis);
+        /* Phase 6: rotate the calibrated nod/tilt axes into the current
+         * q_drift frame so the projection stays correct as q_drift drifts
+         * away from q_neutral. With no drift this is a no-op (q_diff =
+         * identity); after佩戴微调 the axes rotate by the same amount as
+         * q_drift, keeping the geometry consistent. */
+        float nod_axis_eff[3], tilt_axis_eff[3];
+        compute_effective_axes(&np, s_gd.q_drift, nod_axis_eff, tilt_axis_eff);
+
+        /* Project onto the (drift-rotated) gesture axes, then apply sign.
+         * The projection replaces the old rel_pitch / rel_roll channels. */
+        float proj_nod  = v3_dot(r, nod_axis_eff);
+        float proj_tilt = v3_dot(r, tilt_axis_eff);
         proj_nod  = apply_sign_pitch(proj_nod,  s_gd.params.sign_pitch);
         proj_tilt = apply_sign_roll (proj_tilt, s_gd.params.sign_roll);
 
@@ -450,7 +566,35 @@ static void detector_task(void *arg)
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
         }
-        bool nod_dominant = absf(vel_nod) >= absf(vel_tilt);
+
+        /* Dominance gate. A real nod/look-up carries a tilt crosstalk that can
+         * be 40-70% of the nod magnitude (a person doesn't nod on a perfect
+         * vertical axis). The old per-tick mutex picked whichever axis was
+         * faster, but a tilt axis can briefly cross its trigger threshold
+         * before the nod does on a nod motion, firing the wrong label.
+         *
+         * Require the dominant axis to exceed the other by 1.4× before any
+         * NEUTRAL→LOCKED transition. Mixed-direction motions (e.g. nodding
+         * with a clear left lean) get re-decided next tick when one axis
+         * clearly leads. */
+        const float DOMINANCE = 1.4f;
+        bool nod_dominant;
+        if (absf(vel_nod) < 1.0f && absf(vel_tilt) < 1.0f) {
+            nod_dominant = absf(vel_nod) >= absf(vel_tilt);
+        } else {
+            float ratio_nt = absf(vel_nod)  / (absf(vel_tilt) + 1e-3f);
+            float ratio_tn = absf(vel_tilt) / (absf(vel_nod)  + 1e-3f);
+            if (ratio_nt >= DOMINANCE) {
+                nod_dominant = true;
+            } else if (ratio_tn >= DOMINANCE) {
+                nod_dominant = false;
+            } else {
+                /* Neither axis dominates — mixed motion. Hold fire this tick
+                 * and let the per-axis velocity check resolve on the next one. */
+                vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
+                continue;
+            }
+        }
         if (nod_dominant) {
             step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
                       GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ true);
@@ -462,6 +606,37 @@ static void detector_task(void *arg)
                       GESTURE_TILT_RIGHT, GESTURE_TILT_LEFT, /* allow_fire = */ true);
             step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
                       GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ false);
+        }
+
+        /* Phase 5: sliding baseline snap. After STILL_DURATION_MS of rest
+         * (both projections inside the dead zone), snap q_drift to the
+         * current quaternion so佩戴微调 is absorbed. The snap respects
+         * the q/-q hemisphere to avoid the wrap-around the DMP occasionally
+         * produces across the ±π boundary. We also reset the still timer
+         * after each snap so the next snap requires another full window of
+         * stillness — otherwise a long stationary period would snap on
+         * every tick, which is harmless but noisy in the still_since_ms
+         * accounting. */
+        const uint32_t STILL_DURATION_MS = 500;
+        const float zone_for_still = s_gd.params.neutral_zone_deg;
+        bool is_still = (absf(proj_nod) < zone_for_still) &&
+                        (absf(proj_tilt) < zone_for_still);
+        if (is_still) {
+            if (s_gd.still_since_ms == 0) {
+                s_gd.still_since_ms = now_ms;
+            } else if ((now_ms - s_gd.still_since_ms) >= STILL_DURATION_MS) {
+                float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
+                          qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
+                if (d < 0.0f) {
+                    s_gd.q_drift[0] = -qcur[0]; s_gd.q_drift[1] = -qcur[1];
+                    s_gd.q_drift[2] = -qcur[2]; s_gd.q_drift[3] = -qcur[3];
+                } else {
+                    memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
+                }
+                s_gd.still_since_ms = now_ms;   /* re-arm the next still window */
+            }
+        } else {
+            s_gd.still_since_ms = 0;
         }
 
         vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
@@ -604,11 +779,16 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
     if (duration_ms < 500) {
         return ESP_ERR_INVALID_ARG;
     }
-    ESP_LOGI(TAG, "calibrating axes for %u ms — do a few slow, full nods...",
+    ESP_LOGI(TAG, "calibrating axes for %u ms — do a few slow, full nods "
+                  "(v3: q_neutral-relative r vectors, averaged)",
              (unsigned)duration_ms);
 
-    /* "up" in the neutral body frame = world up rotated back into body.
-     * Use the aligned mirror so we can pass its members to helpers. */
+    /* "up" in the q_neutral body frame: world up rotated into the device's
+     * body frame at the moment the user calibrated neutral. Used to project
+     * the averaged rotation vector onto the horizontal plane so nod_axis
+     * has no vertical component. The detector still consumes nod_axis in
+     * this same q_neutral-relative frame, so as long as q_neutral hasn't
+     * changed since calibration the projections will be correct. */
     const float world_up[3] = {0.0f, 0.0f, 1.0f};
     neutral_pose_aligned_t np;
     gesture_params_get_neutral_aligned(&np);
@@ -621,43 +801,62 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
 
     const uint32_t period_ms = 20;
     const uint32_t ticks     = duration_ms / period_ms;
-    float best_mag = 0.0f;
-    float best_r[3] = {0.0f, 0.0f, 0.0f};
-    uint32_t valid     = 0;
-    uint32_t rejected  = 0;   /* DMP samples with |w| too small (near 180°) */
-    uint32_t too_large = 0;   /* frames where rel-rotation exceeded 90° */
-
-    /* Reject thresholds:
-     *   - |w| < 0.05: DMP quaternion is near-singular (180° rotation). Even
-     *     after q ⊗ q^(-1) math, this propagates as |r| ≈ 180° and pollutes
-     *     peak. Human head cannot rotate 180° in 20 ms.
-     *   - single-frame |r| > 90°: same reason — physically impossible
-     *     rotation speed for a real nod. Caused by DMP transient /
-     *     gyro-integrator reset.
-     *
-     * Both counters used to be inflated by a FIFO race with the
-     * detector_task reading at 50 Hz in parallel (we'd see 100+
-     * too_large out of 200 samples). Suspending the detector for the
-     * whole capture drops these to the genuine baseline of
-     * ~0–5 per calibration. */
-    const float W_MIN = 0.05f;
+    const float W_MIN           = 0.05f;
     const float R_MAX_PER_FRAME = 90.0f;
+    const float R_MOTION_MIN    = 4.0f;   /* |r| above this counts as "in motion" */
+    const float R_PROJ_MIN      = 2.0f;   /* |proj_horizontal| above this counts as a nod-direction sample */
+    const float SUM_MAG_MIN_DEG = 10.0f;  /* sanity gate: total accumulated horizontal nod motion must exceed this */
 
-    /* Tell the detector to stay out of the FIFO — see calibrate_neutral. */
+    /* Capture buffer: r (rotvec from q_neutral) per valid sample, plus a copy
+     * of r projected onto the horizontal plane (so we don't recompute). */
+    typedef struct { float r[3]; float r_h[3]; float r_h_mag; } cal_sample_t;
+    cal_sample_t *samples = calloc(ticks, sizeof(cal_sample_t));
+    if (samples == NULL) {
+        ESP_LOGE(TAG, "axis calibration aborted: out of memory for %u samples",
+                 (unsigned)ticks);
+        return ESP_ERR_NO_MEM;
+    }
+
     s_gd.calibrating = true;
-    esp_err_t result = ESP_OK;
+
+    /* Provisional nod_axis = up × [1,0,0], normalized. Used only to gate which
+     * samples count as "the user was nodding" in the average; the average
+     * itself becomes the real nod_axis. */
+    float prov_nod[3] = { up[1]*0.0f - up[2]*0.0f,
+                          -up[2],
+                           up[1] };
+    if (v3_normalize(prov_nod) == 0.0f) {
+        prov_nod[0] = 1.0f; prov_nod[1] = 0.0f; prov_nod[2] = 0.0f;
+    }
+
+    uint32_t valid_q   = 0;
+    uint32_t rejected  = 0;
+    uint32_t too_large = 0;
 
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
         if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
-            if (w_abs < W_MIN) { rejected++; vTaskDelay(pdMS_TO_TICKS(period_ms)); continue; }
-            float qrel[4]; quat_mul(qn_conj, q, qrel); quat_normalize(qrel);
-            float r[3];    quat_to_rotvec_deg(qrel, r);
-            float mag = v3_norm(r);
-            if (mag > R_MAX_PER_FRAME) { too_large++; vTaskDelay(pdMS_TO_TICKS(period_ms)); continue; }
-            if (mag > best_mag) { best_mag = mag; memcpy(best_r, r, sizeof(best_r)); }
-            valid++;
+            if (w_abs < W_MIN) {
+                rejected++;
+            } else {
+                float qrel[4]; quat_mul(qn_conj, q, qrel); quat_normalize(qrel);
+                float r[3];    quat_to_rotvec_deg(qrel, r);
+                float mag = v3_norm(r);
+                if (mag > R_MAX_PER_FRAME) {
+                    too_large++;
+                } else {
+                    /* Always retain the sample — even "still" frames help
+                     * define the average. */
+                    memcpy(samples[valid_q].r, r, sizeof(r));
+                    float d_up = v3_dot(r, up);
+                    samples[valid_q].r_h[0] = r[0] - d_up*up[0];
+                    samples[valid_q].r_h[1] = r[1] - d_up*up[1];
+                    samples[valid_q].r_h[2] = r[2] - d_up*up[2];
+                    samples[valid_q].r_h_mag = v3_norm(samples[valid_q].r_h);
+                    valid_q++;
+                }
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(period_ms));
     }
@@ -669,48 +868,157 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
                  (unsigned)rejected, (unsigned)too_large);
     }
 
-    if (valid < ticks / 4) {
-        /* Require at least 25% of attempts to be sane. In the user's
-         * environment the on-device MPU6050 module produces ~50% DMP
-         * glitches (single-frame near-singular quaternions and
-         * out-of-range rotations) so the conservative 50% threshold
-         * fails too aggressively. 25% is enough to confirm the loop
-         * ran and we have a peak from real motion; we still gate on
-         * best_mag below to confirm the user actually nodded. */
-        ESP_LOGE(TAG, "axis calibration failed: too few samples (%u/%u) — keep head "
-                      "very still between nods and the device firmly mounted",
-                 (unsigned)valid, (unsigned)ticks);
-        return ESP_FAIL;
-    }
-    if (best_mag < 15.0f) {
-        ESP_LOGE(TAG, "axis calibration aborted: nod too small (peak %.1f°) — nod harder",
-                 best_mag);
+    if (valid_q < ticks / 4) {
+        ESP_LOGE(TAG, "axis calibration failed: too few valid samples (%u/%u) — "
+                      "keep head very still between nods and the device firmly mounted",
+                 (unsigned)valid_q, (unsigned)ticks);
+        free(samples);
         return ESP_FAIL;
     }
 
-    /* Horizontal component of the peak nod rotation → nod_axis. */
-    float d = v3_dot(best_r, up);
-    float nod[3] = { best_r[0] - d*up[0], best_r[1] - d*up[1], best_r[2] - d*up[2] };
-    if (v3_normalize(nod) < 5.0f) {
-        /* Peak was almost purely vertical — that's a yaw twist, not a nod. */
-        ESP_LOGE(TAG, "axis calibration aborted: motion had no horizontal (nod) component");
+    /* ----- nod_axis: mean direction of in-motion horizontal r_h's. -----
+     * We average signed-by-direction r_h's so that an up-phase (negative
+     * along prov_nod) and a down-phase (positive) collapse into a single
+     * direction that points "where the user actually moved". For a typical
+     * calibration this is close to the down-phase mean because users pause
+     * at the bottom of a nod. The sign convention is therefore "positive
+     * projection = chin-down = NOD", matching the sign_pitch=1 default. */
+    float  sum_nod[3]    = { 0.0f, 0.0f, 0.0f };
+    float  peak_r_h_mag = 0.0f;   /*!< max |r_h| over in-motion samples — what we use for trigger tuning */
+    uint32_t nod_used    = 0;
+    for (uint32_t k = 0; k < valid_q; k++) {
+        float r_h_mag = samples[k].r_h_mag;
+        if (r_h_mag < R_PROJ_MIN) continue;            /* still — don't dilute the average */
+        if (v3_norm(samples[k].r) < R_MOTION_MIN) continue;
+        /* Track peak (direction-agnostic) for trigger threshold tuning. The
+         * signed-by-direction sum_nod_mag that used to live here is wrong:
+         * it grows linearly with both intensity and duration (a 4-second
+         * vigorous calibration can hit 1000°+), so the trigger ends up
+         * unreachable. Peak is the unambiguous "how big is one nod". */
+        if (r_h_mag > peak_r_h_mag) peak_r_h_mag = r_h_mag;
+        float p = v3_dot(samples[k].r_h, prov_nod);
+        if (p == 0.0f) continue;
+        float sign = (p > 0.0f) ? 1.0f : -1.0f;
+        sum_nod[0] += sign * samples[k].r_h[0];
+        sum_nod[1] += sign * samples[k].r_h[1];
+        sum_nod[2] += sign * samples[k].r_h[2];
+        nod_used++;
+    }
+    if (nod_used < 3) {
+        ESP_LOGE(TAG, "axis calibration aborted: only %u nod-direction samples — "
+                      "do more pronounced nods", (unsigned)nod_used);
+        free(samples);
         return ESP_FAIL;
     }
-    float tilt[3]; v3_cross(up, nod, tilt);
+
+    float nod[3] = { sum_nod[0] / nod_used, sum_nod[1] / nod_used, sum_nod[2] / nod_used };
+    /* (Re-)project onto horizontal — averaging reintroduces a tiny up component. */
+    {
+        float d = v3_dot(nod, up);
+        nod[0] -= d*up[0]; nod[1] -= d*up[1]; nod[2] -= d*up[2];
+    }
+    if (v3_normalize(nod) == 0.0f) {
+        ESP_LOGE(TAG, "axis calibration aborted: motion had no horizontal (nod) component");
+        free(samples);
+        return ESP_FAIL;
+    }
+    if (peak_r_h_mag < SUM_MAG_MIN_DEG) {
+        ESP_LOGE(TAG, "axis calibration aborted: peak nod motion only %.1f° — nod harder",
+                 peak_r_h_mag);
+        free(samples);
+        return ESP_FAIL;
+    }
+
+    /* ----- tilt_axis: same approach on the up × nod plane. ----- */
+    float prov_tilt[3] = { up[1]*nod[2] - up[2]*nod[1],
+                           up[2]*nod[0] - up[0]*nod[2],
+                           up[0]*nod[1] - up[1]*nod[0] };
+    if (v3_normalize(prov_tilt) == 0.0f) {
+        ESP_LOGE(TAG, "axis calibration aborted: nod parallel to up");
+        free(samples);
+        return ESP_FAIL;
+    }
+    float  sum_tilt[3]  = { 0.0f, 0.0f, 0.0f };
+    float  sum_tilt_mag = 0.0f;
+    uint32_t tilt_used  = 0;
+    for (uint32_t k = 0; k < valid_q; k++) {
+        float r_h_mag = samples[k].r_h_mag;
+        if (r_h_mag < R_PROJ_MIN) continue;
+        if (v3_norm(samples[k].r) < R_MOTION_MIN) continue;
+        /* Drop the up and nod components so what's left is pure tilt. */
+        float d_up   = v3_dot(samples[k].r_h, up);
+        float d_nod  = v3_dot(samples[k].r_h, nod);
+        float r_t[3] = { samples[k].r_h[0] - d_up*up[0] - d_nod*nod[0],
+                         samples[k].r_h[1] - d_up*up[1] - d_nod*nod[1],
+                         samples[k].r_h[2] - d_up*up[2] - d_nod*nod[2] };
+        float r_t_mag = v3_norm(r_t);
+        if (r_t_mag < R_PROJ_MIN) continue;
+        float p = v3_dot(r_t, prov_tilt);
+        if (p == 0.0f) continue;
+        float sign = (p > 0.0f) ? 1.0f : -1.0f;
+        sum_tilt[0] += sign * r_t[0];
+        sum_tilt[1] += sign * r_t[1];
+        sum_tilt[2] += sign * r_t[2];
+        sum_tilt_mag += sign * r_t_mag;
+        tilt_used++;
+    }
+    float tilt[3];
+    if (tilt_used >= 3 && sum_tilt_mag >= SUM_MAG_MIN_DEG * 0.5f) {
+        tilt[0] = sum_tilt[0] / tilt_used;
+        tilt[1] = sum_tilt[1] / tilt_used;
+        tilt[2] = sum_tilt[2] / tilt_used;
+    } else {
+        /* Not enough tilt motion during a nod-only calibration. Fall back to
+         * the geometric up × nod. The user can run `ct` later to refine. */
+        ESP_LOGW(TAG, "tilt motion during nod calibration only %.1f° "
+                      "(from %u samples) — falling back to up×nod",
+                 sum_tilt_mag, (unsigned)tilt_used);
+        tilt[0] = up[1]*nod[2] - up[2]*nod[1];
+        tilt[1] = up[2]*nod[0] - up[0]*nod[2];
+        tilt[2] = up[0]*nod[1] - up[1]*nod[0];
+    }
     if (v3_normalize(tilt) == 0.0f) {
         ESP_LOGE(TAG, "axis calibration aborted: degenerate tilt axis");
+        free(samples);
         return ESP_FAIL;
     }
+    free(samples);
 
     memcpy(np.nod_axis,  nod,  sizeof(nod));
     memcpy(np.tilt_axis, tilt, sizeof(tilt));
     gesture_params_set_neutral_aligned(&np);
-    /* set_neutral_aligned already persists to NVS. */
+
+    /* Thresholds. peak_r_h_mag is the largest horizontal-rotation magnitude
+     * observed across all in-motion samples during calibration — i.e. how
+     * big a single nod actually was. Setting the trigger at ~35% of the
+     * typical peak means the user clears it roughly a quarter of the way
+     * into the gesture (responsive) but well above any still-frame noise
+     * floor (~1-2°). Velocity uses a fixed floor because we don't track
+     * per-frame velocity during calibration and inferring it from peak /
+     * time-to-peak is too noisy to be worth the complexity. */
+    float new_trig_deg = peak_r_h_mag * 0.35f;
+    if (new_trig_deg < 5.0f) new_trig_deg = 5.0f;
+    s_gd.params.trigger_deg            = new_trig_deg;
+    s_gd.params.trigger_velocity_deg_s = 40.0f;   /* fixed; nod peak vel ≈ 60-100°/s */
+    s_gd.params.neutral_zone_deg       = new_trig_deg * 0.30f;
+    gesture_params_save_to_nvs(&s_gd.params);
 
     s_gd.calibrated = true;
 
-    ESP_LOGI(TAG, "axes captured: nod=[%.2f %.2f %.2f] tilt=[%.2f %.2f %.2f] (peak %.1f°)",
-             nod[0], nod[1], nod[2], tilt[0], tilt[1], tilt[2], best_mag);
+    /* Diagnostic snapshot for `cd`. */
+    s_last_cap.valid        = valid_q;
+    s_last_cap.used         = nod_used;
+    s_last_cap.sum_mag_deg  = peak_r_h_mag;   /*!< semantic update: now means peak in-motion magnitude */
+    memcpy(s_last_cap.nod_axis,  nod,  sizeof(nod));
+    memcpy(s_last_cap.tilt_axis, tilt, sizeof(tilt));
+    s_last_cap.drift_deg    = 0.0f;
+
+    ESP_LOGI(TAG, "axes captured (r-avg): nod=[%.2f %.2f %.2f] tilt=[%.2f %.2f %.2f] "
+                  "nod_used=%u/%u peak_r_h=%.1f° → trigger=%.1f° vel=%.1f°/s zone=%.1f°",
+             nod[0], nod[1], nod[2], tilt[0], tilt[1], tilt[2],
+             (unsigned)nod_used, (unsigned)valid_q, peak_r_h_mag,
+             new_trig_deg, s_gd.params.trigger_velocity_deg_s,
+             s_gd.params.neutral_zone_deg);
     return ESP_OK;
 }
 
@@ -791,59 +1099,59 @@ esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms)
     const bool prior_calibrated = s_gd.calibrated;
     s_gd.calibrated = false;
 
-    float best_r_perp[3] = {0.0f, 0.0f, 0.0f};
-    float best_mag       = 0.0f;
-    uint32_t valid       = 0;
-    uint32_t rejected    = 0;   /* DMP samples with |w| too small (near 180°) */
-    uint32_t too_large   = 0;   /* frames where rel-rotation exceeded 90° */
-
-    /* Same sanity thresholds as calibrate_axes. A human head can't rotate
-     * 180° between samples, and can't reach 90°/frame on a slow tilt.
-     * These were inflated ~70% by a FIFO race with detector_task before
-     * suspend — see calibrate_neutral for the diagnosis. */
-    const float W_MIN = 0.05f;
+    /* v3: average the in-motion tilt-direction r_perp's instead of taking
+     * the single largest. Same approach as calibrate_axes' tilt pass. */
+    const float W_MIN           = 0.05f;
     const float R_MAX_PER_FRAME = 90.0f;
+    const float R_MOTION_MIN    = 4.0f;
+    const float R_PROJ_MIN      = 2.0f;
+    const float SUM_MAG_MIN_DEG = 10.0f;
 
-    /* Tell the detector to stay out of the FIFO — see calibrate_neutral
-     * for the full rationale. vTaskSuspend turned out to break FIFO
-     * reads entirely on this target (0/200 valid), so we use a flag
-     * and let the detector voluntarily skip its tick. */
+    float  sum_tilt[3]  = { 0.0f, 0.0f, 0.0f };
+    float  sum_tilt_mag = 0.0f;
+    uint32_t valid_q    = 0;
+    uint32_t tilt_used  = 0;
+    uint32_t rejected   = 0;
+    uint32_t too_large  = 0;
+
     s_gd.calibrating = true;
-    esp_err_t result = ESP_OK;
-
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
         if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
-            if (w_abs < W_MIN) { rejected++; vTaskDelay(pdMS_TO_TICKS(period_ms)); continue; }
-            float qrel[4]; quat_mul(qn_conj, q, qrel); quat_normalize(qrel);
-            float r[3];    quat_to_rotvec_deg(qrel, r);
-            float mag = v3_norm(r);
-            if (mag > R_MAX_PER_FRAME) { too_large++; vTaskDelay(pdMS_TO_TICKS(period_ms)); continue; }
-
-            /* Drop the along-up and along-nod components. The remainder is
-             * pure horizontal tilt perpendicular to nod. Note that `up` is
-             * NOT (0,0,1) in general — it's qn_conj ⊗ world_up, i.e. the
-             * world-Z axis transformed into the neutral body frame — so we
-             * must use v3_dot rather than reading r[2] directly. */
-            float d_up = v3_dot(r, up);
-            float r_h[3] = {
-                r[0] - d_up*up[0],
-                r[1] - d_up*up[1],
-                r[2] - d_up*up[2],
-            };
-            float d_nod = v3_dot(r_h, nod);
-            float r_perp[3] = {
-                r_h[0] - d_nod*nod[0],
-                r_h[1] - d_nod*nod[1],
-                r_h[2] - d_nod*nod[2],
-            };
-            float r_perp_mag = v3_norm(r_perp);
-            if (r_perp_mag > best_mag) {
-                best_mag = r_perp_mag;
-                memcpy(best_r_perp, r_perp, sizeof(best_r_perp));
+            if (w_abs < W_MIN) {
+                rejected++;
+            } else {
+                float qrel[4]; quat_mul(qn_conj, q, qrel); quat_normalize(qrel);
+                float r[3];    quat_to_rotvec_deg(qrel, r);
+                float mag = v3_norm(r);
+                if (mag > R_MAX_PER_FRAME) {
+                    too_large++;
+                } else if (mag >= R_MOTION_MIN) {
+                    /* Horizontal component (drop vertical), then drop nod. */
+                    float d_up  = v3_dot(r, up);
+                    float r_h[3] = { r[0] - d_up*up[0],
+                                     r[1] - d_up*up[1],
+                                     r[2] - d_up*up[2] };
+                    float d_nod = v3_dot(r_h, nod);
+                    float r_perp[3] = { r_h[0] - d_nod*nod[0],
+                                        r_h[1] - d_nod*nod[1],
+                                        r_h[2] - d_nod*nod[2] };
+                    float r_perp_mag = v3_norm(r_perp);
+                    if (r_perp_mag >= R_PROJ_MIN) {
+                        float p = v3_dot(r_perp, ref_right);
+                        if (p != 0.0f) {
+                            float sign = (p > 0.0f) ? 1.0f : -1.0f;
+                            sum_tilt[0] += sign * r_perp[0];
+                            sum_tilt[1] += sign * r_perp[1];
+                            sum_tilt[2] += sign * r_perp[2];
+                            sum_tilt_mag += sign * r_perp_mag;
+                            tilt_used++;
+                        }
+                    }
+                }
+                valid_q++;
             }
-            valid++;
         }
         vTaskDelay(pdMS_TO_TICKS(period_ms));
     }
@@ -855,47 +1163,61 @@ esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms)
                  (unsigned)rejected, (unsigned)too_large);
     }
 
-    /* Rebuild tilt_axis. We normalise; if the magnitude is below threshold
-     * the user didn't tilt hard enough (or only tilted in one direction
-     * with barely-detectable perpendicular component). */
-    if (valid < ticks / 4) {
-        /* See calibrate_axes — on this hardware the on-device MPU6050
-         * produces ~50% DMP glitches so 50% would reject too often.
-         * 25% lets through a calibration that has a real peak, which
-         * the next check (best magnitude) gates on. */
-        ESP_LOGE(TAG, "tilt calibration failed: too few samples (%u/%u) — keep head "
-                      "very still between tilts and the device firmly mounted",
-                 (unsigned)valid, (unsigned)ticks);
+    if (valid_q < ticks / 4) {
+        ESP_LOGE(TAG, "tilt calibration failed: too few valid samples (%u/%u) — "
+                      "keep head very still between tilts and the device firmly mounted",
+                 (unsigned)valid_q, (unsigned)ticks);
         s_gd.calibrated = prior_calibrated;
         return ESP_FAIL;
     }
-    if (v3_normalize(best_r_perp) < 10.0f) {
-        ESP_LOGE(TAG, "tilt calibration aborted: tilt too small (peak %.1f°) — tilt harder "
-                      "or more sideways (less forward/back)",
-                 best_mag);
+    if (tilt_used < 3) {
+        ESP_LOGE(TAG, "tilt calibration aborted: only %u tilt-direction samples — "
+                      "tilt more during the capture window", (unsigned)tilt_used);
+        s_gd.calibrated = prior_calibrated;
+        return ESP_FAIL;
+    }
+    if (sum_tilt_mag < SUM_MAG_MIN_DEG) {
+        ESP_LOGE(TAG, "tilt calibration aborted: total tilt motion only %.1f — "
+                      "tilt harder or more sideways (less forward/back)",
+                 sum_tilt_mag);
         s_gd.calibrated = prior_calibrated;
         return ESP_FAIL;
     }
 
-    /* Sign-correct so the measured axis aligns with the geometric
-     * "right" reference. If we got the sign backwards the user can just
-     * type `sr` to flip sign_roll. */
-    if (v3_dot(best_r_perp, ref_right) < 0.0f) {
-        best_r_perp[0] = -best_r_perp[0];
-        best_r_perp[1] = -best_r_perp[1];
-        best_r_perp[2] = -best_r_perp[2];
+    float tilt[3] = { sum_tilt[0] / tilt_used,
+                      sum_tilt[1] / tilt_used,
+                      sum_tilt[2] / tilt_used };
+    /* Sign-align with ref_right. The signed-by-direction average already
+     * collapses left/right into one direction; this is just safety. */
+    if (v3_dot(tilt, ref_right) < 0.0f) {
+        tilt[0] = -tilt[0]; tilt[1] = -tilt[1]; tilt[2] = -tilt[2];
+    }
+    if (v3_normalize(tilt) == 0.0f) {
+        ESP_LOGE(TAG, "tilt calibration aborted: degenerate tilt axis");
+        s_gd.calibrated = prior_calibrated;
+        return ESP_FAIL;
     }
 
-    memcpy(np.tilt_axis, best_r_perp, sizeof(best_r_perp));
+    memcpy(np.tilt_axis, tilt, sizeof(tilt));
     gesture_params_set_neutral_aligned(&np);
-    /* set_neutral_aligned already persists to NVS. */
 
     s_gd.calibrated = true;
 
-    ESP_LOGI(TAG, "tilt captured: tilt=[%.2f %.2f %.2f] (peak %.1f°, vs geometric "
-                  "up×nod=[%.2f %.2f %.2f])",
-             best_r_perp[0], best_r_perp[1], best_r_perp[2],
-             best_mag,
-             ref_right[0], ref_right[1], ref_right[2]);
+    ESP_LOGI(TAG, "tilt captured (r-avg): tilt=[%.2f %.2f %.2f] used=%u/%u sum_mag=%.1f",
+             tilt[0], tilt[1], tilt[2], (unsigned)tilt_used, (unsigned)valid_q,
+             sum_tilt_mag);
     return ESP_OK;
+}
+
+void gesture_detect_get_last_capture(gesture_detect_capture_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->valid       = s_last_cap.valid;
+    out->used        = s_last_cap.used;
+    out->sum_mag_deg = s_last_cap.sum_mag_deg;
+    out->drift_deg   = s_last_cap.drift_deg;
+    memcpy(out->nod_axis,  s_last_cap.nod_axis,  sizeof(out->nod_axis));
+    memcpy(out->tilt_axis, s_last_cap.tilt_axis, sizeof(out->tilt_axis));
 }

@@ -51,6 +51,32 @@ esp_err_t gesture_detect_start(QueueHandle_t event_queue);
 void gesture_detect_set_sign(bool positive_pitch_is_nod, bool positive_roll_is_right);
 
 /**
+ * @brief Phase 5: copy the current sliding baseline `q_drift` into
+ *        `out[4]` (w,x,y,z). The quaternion is in the same body frame as
+ *        `params.neutral.q_neutral` and is the actual reference the
+ *        detector projects motion against, so its angle-distance from
+ *        `q_neutral` indicates how much佩戴微调 has been absorbed since
+ *        calibration. Used by the `q` BLE console command for diagnostics.
+ */
+void gesture_detect_get_q_drift(float out[4]);
+
+/**
+ * @brief Phase 6: copy the nod_axis / tilt_axis rotated into the current
+ *        q_drift frame into `out_nod` / `out_tilt`. These are the actual
+ *        vectors the detector projects motion against — what the
+ *        q_neutral-frame nod_axis rotates to as q_drift drifts. With no
+ *        drift they equal `params.neutral.nod_axis` / `tilt_axis`. Used
+ *        by the `p` console command for diagnostics. */
+void gesture_detect_get_effective_axes(float out_nod[3], float out_tilt[3]);
+
+/**
+ * @brief Phase 5: force the sliding baseline to re-sync from the next
+ *        DMP sample. Use after佩戴微调 changes faster than the still-snap
+ *        can absorb (e.g. taking the device off and putting it back on
+ *        at a very different angle). See gesture_detect.c. */
+void gesture_detect_reset_q_drift(void);
+
+/**
  * @brief Block for `duration_ms` while sampling the DMP quaternion,
  *        average it, and store as the new neutral orientation
  *        (`q_neutral`). Aborts with ESP_FAIL if motion exceeds an internal
@@ -105,6 +131,24 @@ static inline esp_err_t gesture_detect_calibrate_baseline(uint32_t duration_ms)
 {
     return gesture_detect_calibrate_neutral(duration_ms);
 }
+
+/**
+ * @brief Diagnostic snapshot of the most recent axis calibration.
+ *
+ *        Populated by `gesture_detect_calibrate_axes()` (and the tilt pass
+ *        inside it). Read-only. Used by the `cd` console command to verify
+ *        that the v3 Δr-average algorithm produced a stable direction.
+ */
+typedef struct {
+    uint32_t valid;             /*!< samples kept after DMP-glitch rejection */
+    uint32_t used;              /*!< samples that contributed to the average */
+    float    nod_axis[3];       /*!< persisted nod_axis */
+    float    tilt_axis[3];      /*!< persisted tilt_axis */
+    float    sum_mag_deg;       /*!< peak horizontal magnitude reached during calibration (°); was Σ|Δr| in earlier schema — see gesture_detect.c */
+    float    drift_deg;         /*!< reserved (0 in v3) */
+} gesture_detect_capture_t;
+
+void gesture_detect_get_last_capture(gesture_detect_capture_t *out);
 
 #ifdef __cplusplus
 }
