@@ -329,7 +329,20 @@ void hidd_set_attr_value(uint16_t handle, uint16_t val_len, const uint8_t *value
 
 void hidd_get_attr_value(uint16_t handle, uint16_t *length, uint8_t **value);
 
-esp_err_t hidd_register_cb(void);
+/* Phase 7: the per-profile GATTS handler is now driven from the shared
+ * `ble_stack` dispatcher instead of this component registering its own global
+ * callback. Bluedroid keeps exactly ONE global GATTS callback, so the old
+ * `hidd_register_cb()` silently unregistered the NUS console's handler.
+ *
+ * Register this for HIDD_APP_ID only:
+ *     ble_stack_register_profile(HIDD_APP_ID, esp_hidd_prf_cb_hdl, NULL);
+ *
+ * NOT for BATTRAY_APP_ID — hidd_le_create_service() builds the battery
+ * attribute table on the HID gatts_if, so a separate battery app_id is dead
+ * weight and would double every CONNECT/DISCONNECT dispatch.
+ */
+void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
+                         esp_ble_gatts_cb_param_t *param);
 
 
 #endif  ///__HID_DEVICE_LE_PRF__

@@ -25,25 +25,18 @@
 
 esp_err_t esp_hidd_register_callbacks(esp_hidd_event_cb_t callbacks)
 {
-    esp_err_t hidd_status;
-
     if(callbacks != NULL) {
    	    hidd_le_env.hidd_cb = callbacks;
     } else {
         return ESP_FAIL;
     }
 
-    if((hidd_status = hidd_register_cb()) != ESP_OK) {
-        return hidd_status;
-    }
-
-    esp_ble_gatts_app_register(BATTRAY_APP_ID);
-
-    if((hidd_status = esp_ble_gatts_app_register(HIDD_APP_ID)) != ESP_OK) {
-        return hidd_status;
-    }
-
-    return hidd_status;
+    /* Phase 7: this used to call hidd_register_cb() (which grabbed the single
+     * global GATTS callback, clobbering the NUS console's) and then register
+     * BATTRAY_APP_ID / HIDD_APP_ID itself. Both jobs moved to the caller,
+     * which registers esp_hidd_prf_cb_hdl for those two app_ids through
+     * ble_stack_register_profile() before ble_stack_start(). */
+    return ESP_OK;
 }
 
 esp_err_t esp_hidd_profile_init(void)

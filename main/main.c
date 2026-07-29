@@ -1,18 +1,21 @@
 /*
- * main.c — boot sequence: NVS -> MPU/DMP -> gesture detector -> BLE console.
+ * main.c — boot sequence: NVS -> MPU/DMP -> gesture detector -> BLE stack
+ * (NUS console + HID) -> UART console.
  *
- * Calibration is triggered over BLE (Nordic-UART-Service style console): a
- * central (e.g. the Electron tool or nRF Connect) writes a one-line command
- * ("c"/"ca"/"ct"/"p"/"sp"/"sr") to the RX characteristic. Gesture events and
- * calibration prompts/results are streamed back over the TX notify
- * characteristic (and mirrored to the UART console for local debugging).
+ * Commands ("c"/"ca"/"ct"/"p"/"sp"/"sr"/"hs"/"ac"/"ak"/...) arrive on two
+ * channels that share one queue and one dispatcher:
+ *   - BLE: a central (the Electron tool or nRF Connect) writes a line to the
+ *     NUS RX characteristic. Results stream back over the TX notify char.
+ *   - UART: `hmbc <cmd...>` in the serial REPL. Added in Phase 7 so HID can be
+ *     smoke-tested without a BLE central attached.
+ * Both feed s_cmd_q; handle_command() is the single implementation.
  *
- * This replaces the old UART-command trigger from the reference firmware. The
- * BOOT button remains as an offline fallback trigger.
+ * The BOOT button remains as an offline fallback calibration trigger.
  */
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -20,6 +23,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_check.h"
+#include "esp_console.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 
@@ -27,12 +32,19 @@
 #include "inv_mpu.h"
 #include "gesture_detect.h"
 #include "ble_console.h"
+#include "ble_stack.h"
+#include "hid_output.h"
+#include "hid_dev.h"
 
 #define TAG "main"
 
+#define BLE_DEVICE_NAME "HMBC-Console"
+
 #define EVENT_QUEUE_LEN 8
 #define CMD_QUEUE_LEN   4
-#define CMD_MAX_LEN     16
+/* Phase 7: was 16. Commands now take arguments ("ak 8 4", "af 12"), and Step 4
+ * will add rule names, so the buffer needs room beyond a two-letter opcode. */
+#define CMD_MAX_LEN     32
 
 /* BOOT button (GPIO0 on most ESP32-S3 dev boards). Active-low. Hold to
  * trigger a full guided calibration without a BLE central attached. */
@@ -98,12 +110,92 @@ static void run_guided_calibration(void)
     ble_console_logf("calibration result: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
 }
 
-/* Execute one console command (dispatch mirrors the reference UART command
- * set). Runs in cal_worker_task, so blocking calibration is fine here. */
+/* Parse up to `max` whitespace-separated integers following the opcode.
+ * Returns how many were parsed. Accepts decimal or 0x-prefixed hex. */
+static int parse_args(const char *cmd, long *out, int max)
+{
+    int n = 0;
+    const char *p = cmd;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        char *end = NULL;
+        long v = strtol(p, &end, 0);
+        if (end == p) {          /* not a number — this is the opcode, skip it */
+            while (*p && *p != ' ' && *p != '\t') {
+                p++;
+            }
+            continue;
+        }
+        out[n++] = v;
+        p = end;
+    }
+    return n;
+}
+
+/* HID / output-layer commands. Handled before the sensor-ready gate below so
+ * HID stays testable when the MPU failed to come up (degraded mode).
+ * Returns true if the command was consumed. */
+static bool handle_hid_command(const char *cmd)
+{
+    long args[4];
+
+    if (strcmp(cmd, "hs") == 0) {
+        ble_console_logf("hid: connected=%u bonded=%u ready=%u conn_id=%u\n",
+                         (unsigned)ble_stack_is_connected(),
+                         (unsigned)ble_stack_is_bonded(),
+                         (unsigned)hid_output_is_ready(),
+                         (unsigned)hid_output_conn_id());
+        return true;
+    }
+
+    if (strncmp(cmd, "ac", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
+        /* ac <consumer_code> — e.g. `ac 205` = PLAY_PAUSE, `ac 233` = VOL_UP */
+        int n = parse_args(cmd, args, 1);
+        if (n < 1) {
+            ble_console_logf("usage: ac <code>  (%u=play/pause %u=vol+ %u=next)\n",
+                             (unsigned)HID_CONSUMER_PLAY_PAUSE,
+                             (unsigned)HID_CONSUMER_VOLUME_UP,
+                             (unsigned)HID_CONSUMER_SCAN_NEXT_TRK);
+            return true;
+        }
+        esp_err_t err = hid_output_send_consumer((uint8_t)args[0], 0);
+        ble_console_logf("consumer %ld -> %s\n", args[0], esp_err_to_name(err));
+        return true;
+    }
+
+    if (strncmp(cmd, "ak", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
+        /* ak <modifiers> <key> — e.g. `ak 8 4` = LeftGUI+A (Win+A) */
+        int n = parse_args(cmd, args, 2);
+        if (n < 2) {
+            ble_console_log("usage: ak <modifiers> <keycode>   e.g. 'ak 8 4' = Win+A\n"
+                            "  modifiers: 1=LCtrl 2=LShift 4=LAlt 8=LGui\n");
+            return true;
+        }
+        uint8_t keys[4] = { (uint8_t)args[1], 0, 0, 0 };
+        esp_err_t err = hid_output_send_keyboard((uint8_t)args[0], keys, 0);
+        ble_console_logf("keyboard mod=0x%02lx key=%ld -> %s\n",
+                         args[0], args[1], esp_err_to_name(err));
+        return true;
+    }
+
+    return false;
+}
+
+/* Execute one console command. Runs in cal_worker_task, so blocking
+ * calibration is fine here. */
 static void handle_command(const char *cmd)
 {
+    if (handle_hid_command(cmd)) {
+        return;
+    }
+
     if (!s_detector_ready) {
-        ble_console_log("sensor not initialised — commands unavailable\n");
+        ble_console_log("sensor not initialised — gesture commands unavailable\n");
         return;
     }
 
@@ -206,7 +298,10 @@ static void handle_command(const char *cmd)
         ble_console_logf("  tilt=[%.2f %.2f %.2f]\n",
                          cap.tilt_axis[0], cap.tilt_axis[1], cap.tilt_axis[2]);
     } else if (cmd[0] != '\0') {
-        ble_console_logf("unknown command: '%s' (try c, ca, ct, p, q, sp, sr, cd)\n", cmd);
+        ble_console_logf("unknown command: '%s'\n", cmd);
+        ble_console_log("  gestures: c ca ct p q 'q reset' sp sr cd\n");
+        ble_console_log("  hid     : hs | ac <code> | ak <mods> <key>\n");
+        ble_console_log("  prefix 'hmbc' optional on BLE (e.g. 'hmbc p')\n");
     }
 }
 
@@ -227,11 +322,107 @@ static void on_console_cmd(const char *cmd, size_t len)
 {
     (void)len;
     char buf[CMD_MAX_LEN];
-    strncpy(buf, cmd, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-    if (s_cmd_q != NULL) {
-        (void)xQueueSend(s_cmd_q, buf, 0);  /* drop if worker is busy */
+    size_t n = 0;
+    /* Phase 7.1: BLE NUS accepts both the bare command ("c", "p", ...) used
+     * by the Electron config tool and the `hmbc <cmd>` prefix used by the
+     * UART REPL. Strip the prefix if present so a single command set
+     * survives both transports — and so the user can keep using the same
+     * syntax when the UART console times out (e.g. idf.py monitor on a chip
+     * whose USB-Serial-JTAG is the monitor's default port while the app's
+     * REPL lives on UART0). */
+    while (n < sizeof(buf) - 1 && cmd[n] != '\0') {
+        buf[n] = cmd[n];
+        n++;
     }
+    buf[n] = '\0';
+    char *p = buf;
+    if (strncmp(p, "hmbc", 4) == 0) {
+        p += 4;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+    }
+    if (*p == '\0') {
+        return;  /* nothing left after stripping — ignore */
+    }
+    if (s_cmd_q != NULL) {
+        (void)xQueueSend(s_cmd_q, p, 0);  /* drop if worker is busy */
+    }
+}
+
+/* ── UART console: `hmbc <cmd...>` ───────────────────────────────────────────
+ *
+ * Phase 7 addition. Re-joins argv into the same one-line form the BLE RX path
+ * produces and posts it to the SAME queue, so handle_command() stays the only
+ * dispatcher. Posting (rather than calling directly) also keeps the ~11 s
+ * calibration off the REPL task, which would otherwise stop echoing.
+ *
+ * esp_console picks UART vs USB-Serial-JTAG from CONFIG_ESP_CONSOLE_*, so this
+ * works on both ESP32-S3 board wirings without a code change.
+ */
+static int cmd_hmbc(int argc, char **argv)
+{
+    char buf[CMD_MAX_LEN];
+    size_t pos = 0;
+
+    for (int i = 1; i < argc; i++) {
+        size_t need = strlen(argv[i]) + (pos ? 1 : 0);
+        if (pos + need >= sizeof(buf)) {
+            printf("command too long (max %d chars)\n", CMD_MAX_LEN - 1);
+            return 1;
+        }
+        if (pos) {
+            buf[pos++] = ' ';
+        }
+        strcpy(buf + pos, argv[i]);
+        pos += strlen(argv[i]);
+    }
+    buf[pos] = '\0';
+
+    if (pos == 0) {
+        printf("usage: hmbc <command>   e.g. 'hmbc hs', 'hmbc ac 205'\n");
+        return 1;
+    }
+    if (s_cmd_q == NULL || xQueueSend(s_cmd_q, buf, 0) != pdTRUE) {
+        printf("command queue full — worker busy\n");
+        return 1;
+    }
+    return 0;
+}
+
+static esp_err_t start_uart_console(void)
+{
+    esp_console_repl_t        *repl        = NULL;
+    esp_console_repl_config_t  repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    repl_config.prompt          = "hmbc>";
+    repl_config.max_cmdline_length = 128;
+
+    const esp_console_cmd_t cmd = {
+        .command = "hmbc",
+        .help    = "Send a command to the gesture/HID controller "
+                   "(hs | ac <code> | ak <mods> <key> | c | p | ...)",
+        .hint    = NULL,
+        .func    = &cmd_hmbc,
+    };
+
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    esp_console_dev_usb_serial_jtag_config_t dev_config =
+        ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_console_new_repl_usb_serial_jtag(&dev_config, &repl_config, &repl),
+                        TAG, "usb-serial-jtag repl");
+#elif defined(CONFIG_ESP_CONSOLE_USB_CDC)
+    esp_console_dev_usb_cdc_config_t dev_config = ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_console_new_repl_usb_cdc(&dev_config, &repl_config, &repl),
+                        TAG, "usb-cdc repl");
+#else
+    esp_console_dev_uart_config_t dev_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_console_new_repl_uart(&dev_config, &repl_config, &repl),
+                        TAG, "uart repl");
+#endif
+
+    ESP_RETURN_ON_ERROR(esp_console_cmd_register(&cmd), TAG, "register hmbc");
+    ESP_RETURN_ON_ERROR(esp_console_register_help_command(), TAG, "register help");
+    return esp_console_start_repl(repl);
 }
 
 /* BOOT-button task — offline fallback trigger. Posts "c" to the command
@@ -331,13 +522,29 @@ void app_main(void)
         s_detector_ready = true;
     }
 
-    /* 4. Command queue + BLE console. Comes up even in degraded mode, so the
-     *    failure is visible in the config tool instead of only on UART. */
+    /* 4. Command queue, then the BLE profiles, then the radio.
+     *
+     *    Order matters: ble_stack_start() registers each profile's app_id with
+     *    Bluedroid, so every ble_stack_register_profile() call (made from
+     *    hid_output_init / ble_console_init) has to happen first. This all
+     *    comes up even in degraded mode, so a sensor failure is visible in the
+     *    config tool instead of only on UART. */
     s_cmd_q = xQueueCreate(CMD_QUEUE_LEN, CMD_MAX_LEN);
     ESP_ERROR_CHECK(s_cmd_q == NULL ? ESP_ERR_NO_MEM : ESP_OK);
-    ESP_ERROR_CHECK(ble_console_init(on_console_cmd));
+
+    ESP_ERROR_CHECK(hid_output_init());                 /* app_id 0x1812 */
+    ESP_ERROR_CHECK(ble_console_init(on_console_cmd));  /* app_id 0x0055 */
+    ESP_ERROR_CHECK(ble_stack_start(BLE_DEVICE_NAME));
+
     xTaskCreate(cal_worker_task,  "cal_worker",  4096, NULL, 3, NULL);
     xTaskCreate(boot_button_task, "boot_button", 4096, NULL, 3, NULL);
+
+    /* 5. UART REPL — HID smoke tests without a BLE central. Started last so
+     *    its prompt lands after the noisy boot logs. */
+    esp_err_t cerr = start_uart_console();
+    if (cerr != ESP_OK) {
+        ESP_LOGW(TAG, "UART console unavailable: %s", esp_err_to_name(cerr));
+    }
 
     if (!s_detector_ready) {
         ble_console_logf("SENSOR FAIL: mpu_dmp_init=%u (%s)\n",
@@ -353,7 +560,7 @@ void app_main(void)
     ESP_LOGI(TAG, "wear device, connect over BLE (\"HMBC-Console\"), then send `c` "
                   "to calibrate — or hold BOOT 1 s");
 
-    /* 5. Event queue + detector + consumer. */
+    /* 6. Event queue + detector + consumer. */
     QueueHandle_t q = xQueueCreate(EVENT_QUEUE_LEN, sizeof(gesture_event_t));
     ESP_ERROR_CHECK(q == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(gesture_detect_start(q));

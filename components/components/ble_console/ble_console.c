@@ -2,13 +2,16 @@
  * ble_console.c — a minimal Nordic-UART-Service (NUS) style BLE GATT server
  * used as a wireless debug console for the head-gesture device.
  *
- * Self-contained: brings up the BT controller + Bluedroid + GAP advertising +
- * one GATT service (a single GATTS "profile"/app_id). No BLE HID here — that
- * can be added later as a second app_id.
- *
  *   Service : 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
  *   RX (Write / Write-No-Response, central -> device) : ...0002...
  *   TX (Notify, device -> central)                    : ...0003...  (+ CCCD)
+ *
+ * Phase 7: this file used to own the whole radio (controller + Bluedroid +
+ * the global GATTS/GAP callbacks + advertising). It no longer does. Bluedroid
+ * keeps a single global callback of each kind, so owning them here made it
+ * impossible to also run BLE HID — whichever component registered last won.
+ * `ble_stack` now owns all of that; this file is reduced to one profile in
+ * ble_stack's table (app_id 0x0055) plus the log TX plumbing.
  *
  * Attribute-table + create_attr_tab pattern mirrors
  * components/ble_hid/hid_device_le_prf.c; the send path uses the same
@@ -23,24 +26,20 @@
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
 #include "esp_log.h"
-#include "esp_bt.h"
-#include "esp_bt_main.h"
 #include "esp_bt_defs.h"
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
 #include "esp_gatt_defs.h"
-#include "esp_gatt_common_api.h"
 
+#include "ble_stack.h"
 #include "ble_console.h"
 
 #define TAG "ble_console"
 
-#define CONSOLE_DEVICE_NAME   "HMBC-Console"
 #define CONSOLE_APP_ID        0x0055
 #define CONSOLE_RX_MAX        128        /* max RX write payload we accept */
 #define CONSOLE_TX_STREAM_LEN 2048       /* log StreamBuffer capacity (bytes) */
 #define CONSOLE_TX_CHUNK_MAX  244        /* hard cap for one notification */
-#define CONSOLE_MTU_REQUEST   247
 
 /* ── 128-bit NUS UUIDs (little-endian byte order for the stack) ──────────── */
 static const uint8_t nus_svc_uuid[16] = {
@@ -99,43 +98,8 @@ static const esp_gatts_attr_db_t console_gatt_db[IDX_NB] = {
          sizeof(tx_ccc_val), sizeof(tx_ccc_val), (uint8_t *)tx_ccc_val}},
 };
 
-/* ── GAP advertising: name in adv, 128-bit service UUID in scan response ──── */
-#define ADV_CONFIG_FLAG      (1 << 0)
-#define SCAN_RSP_CONFIG_FLAG (1 << 1)
-static uint8_t s_adv_config_done = 0;
-
-static esp_ble_adv_data_t adv_data = {
-    .set_scan_rsp     = false,
-    .include_name     = true,
-    .include_txpower  = true,
-    .min_interval     = 0x0006,
-    .max_interval     = 0x0010,
-    .appearance       = 0x0000,
-    .manufacturer_len = 0,
-    .p_manufacturer_data = NULL,
-    .service_data_len = 0,
-    .p_service_data   = NULL,
-    .service_uuid_len = 0,
-    .p_service_uuid   = NULL,
-    .flag             = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
-};
-
-static esp_ble_adv_data_t scan_rsp_data = {
-    .set_scan_rsp     = true,
-    .include_name     = false,
-    .include_txpower  = true,
-    .service_uuid_len = sizeof(nus_svc_uuid),
-    .p_service_uuid   = (uint8_t *)nus_svc_uuid,
-};
-
-static esp_ble_adv_params_t adv_params = {
-    .adv_int_min       = 0x20,
-    .adv_int_max       = 0x40,
-    .adv_type          = ADV_TYPE_IND,
-    .own_addr_type     = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map       = ADV_CHNL_ALL,
-    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-};
+/* Advertising, the device name and the security parameters all moved to
+ * ble_stack — the NUS service UUID now lives in ble_stack's scan response. */
 
 /* ── Runtime state ───────────────────────────────────────────────────────── */
 static esp_gatt_if_t        s_gatts_if      = ESP_GATT_IF_NONE;
@@ -147,50 +111,15 @@ static volatile uint16_t    s_mtu           = 23;   /* default ATT MTU */
 static ble_console_cmd_cb_t s_cmd_cb        = NULL;
 static StreamBufferHandle_t s_tx_stream     = NULL;
 
-/* ── GAP event handler ───────────────────────────────────────────────────── */
-static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
-{
-    switch (event) {
-    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-        s_adv_config_done &= ~ADV_CONFIG_FLAG;
-        if (s_adv_config_done == 0) {
-            esp_ble_gap_start_advertising(&adv_params);
-        }
-        break;
-    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
-        s_adv_config_done &= ~SCAN_RSP_CONFIG_FLAG;
-        if (s_adv_config_done == 0) {
-            esp_ble_gap_start_advertising(&adv_params);
-        }
-        break;
-    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGE(TAG, "advertising start failed, status %d", param->adv_start_cmpl.status);
-        } else {
-            ESP_LOGI(TAG, "advertising as \"%s\"", CONSOLE_DEVICE_NAME);
-        }
-        break;
-    default:
-        break;
-    }
-}
-
-/* ── GATTS event handler (single profile) ────────────────────────────────── */
-static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
-                                esp_ble_gatts_cb_param_t *param)
+/* ── GATTS event handler — one profile in ble_stack's table ──────────────── */
+static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
+                             esp_ble_gatts_cb_param_t *param)
 {
     switch (event) {
     case ESP_GATTS_REG_EVT:
-        if (param->reg.status != ESP_GATT_OK) {
-            ESP_LOGE(TAG, "GATTS reg failed, status %d", param->reg.status);
-            return;
-        }
+        /* ble_stack already validated reg.status and claimed the slot; the
+         * device name and advertising are its business now. */
         s_gatts_if = gatts_if;
-        esp_ble_gap_set_device_name(CONSOLE_DEVICE_NAME);
-        s_adv_config_done |= ADV_CONFIG_FLAG;
-        esp_ble_gap_config_adv_data(&adv_data);
-        s_adv_config_done |= SCAN_RSP_CONFIG_FLAG;
-        esp_ble_gap_config_adv_data(&scan_rsp_data);
         esp_ble_gatts_create_attr_tab(console_gatt_db, gatts_if, IDX_NB, 0);
         break;
 
@@ -217,9 +146,10 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
     case ESP_GATTS_DISCONNECT_EVT:
         s_connected = false;
         s_notify_en = false;
-        ESP_LOGI(TAG, "central disconnected, reason 0x%x — re-advertising",
+        ESP_LOGI(TAG, "central disconnected, reason 0x%x",
                  param->disconnect.reason);
-        esp_ble_gap_start_advertising(&adv_params);
+        /* ble_stack owns the re-advertise — it gets one DISCONNECT_EVT per
+         * registered app_id and must not fire three start_advertising calls. */
         break;
 
     case ESP_GATTS_MTU_EVT:
@@ -327,42 +257,15 @@ esp_err_t ble_console_init(ble_console_cmd_cb_t on_cmd)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    if ((ret = esp_bt_controller_init(&bt_cfg)) != ESP_OK) {
-        ESP_LOGE(TAG, "bt controller init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    if ((ret = esp_bt_controller_enable(ESP_BT_MODE_BLE)) != ESP_OK) {
-        ESP_LOGE(TAG, "bt controller enable failed: %s", esp_err_to_name(ret));
+    /* Claim a slot in ble_stack's profile table. The radio itself is not
+     * touched here — the caller brings it up with ble_stack_start() once every
+     * profile has registered. No GAP callback: the console has no GAP-level
+     * business now that advertising lives in ble_stack. */
+    if ((ret = ble_stack_register_profile(CONSOLE_APP_ID, console_gatts_cb, NULL)) != ESP_OK) {
+        ESP_LOGE(TAG, "profile registration failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    esp_bluedroid_config_t cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
-    if ((ret = esp_bluedroid_init_with_cfg(&cfg)) != ESP_OK) {
-        ESP_LOGE(TAG, "bluedroid init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    if ((ret = esp_bluedroid_enable()) != ESP_OK) {
-        ESP_LOGE(TAG, "bluedroid enable failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    if ((ret = esp_ble_gatts_register_callback(gatts_event_handler)) != ESP_OK) {
-        ESP_LOGE(TAG, "gatts register cb failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    if ((ret = esp_ble_gap_register_callback(gap_event_handler)) != ESP_OK) {
-        ESP_LOGE(TAG, "gap register cb failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    if ((ret = esp_ble_gatts_app_register(CONSOLE_APP_ID)) != ESP_OK) {
-        ESP_LOGE(TAG, "gatts app register failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    esp_ble_gatt_set_local_mtu(CONSOLE_MTU_REQUEST);
-    ESP_LOGI(TAG, "ble_console initialised");
+    ESP_LOGI(TAG, "ble_console profile registered (app_id 0x%04x)", CONSOLE_APP_ID);
     return ESP_OK;
 }

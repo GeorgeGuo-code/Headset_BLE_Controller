@@ -679,49 +679,26 @@ bool hidd_clcb_dealloc (uint16_t conn_id)
     return false;
 }
 
-static struct gatts_profile_inst heart_rate_profile_tab[PROFILE_NUM] = {
-    [PROFILE_APP_IDX] = {
-        .gatts_cb = esp_hidd_prf_cb_hdl,
-        .gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
-    },
-
-};
-
-static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
-                                esp_ble_gatts_cb_param_t *param)
-{
-    /* If event is register event, store the gatts_if for each profile */
-    if (event == ESP_GATTS_REG_EVT) {
-        if (param->reg.status == ESP_GATT_OK) {
-            heart_rate_profile_tab[PROFILE_APP_IDX].gatts_if = gatts_if;
-        } else {
-            ESP_LOGI(HID_LE_PRF_TAG, "Reg app failed, app_id %04x, status %d",
-                    param->reg.app_id,
-                    param->reg.status);
-            return;
-        }
-    }
-
-    do {
-        int idx;
-        for (idx = 0; idx < PROFILE_NUM; idx++) {
-            if (gatts_if == ESP_GATT_IF_NONE || /* ESP_GATT_IF_NONE, not specify a certain gatt_if, need to call every profile cb function */
-                    gatts_if == heart_rate_profile_tab[idx].gatts_if) {
-                if (heart_rate_profile_tab[idx].gatts_cb) {
-                    heart_rate_profile_tab[idx].gatts_cb(event, gatts_if, param);
-                }
-            }
-        }
-    } while (0);
-}
-
-
-esp_err_t hidd_register_cb(void)
-{
-	esp_err_t status;
-	status = esp_ble_gatts_register_callback(gatts_event_handler);
-	return status;
-}
+/* Phase 7: the local heart_rate_profile_tab / gatts_event_handler /
+ * hidd_register_cb trio that used to live here has been deleted.
+ *
+ * Two reasons:
+ *  1. hidd_register_cb() called esp_ble_gatts_register_callback(), and
+ *     Bluedroid keeps exactly ONE global GATTS callback — so initialising HID
+ *     silently unregistered the NUS console's handler (and vice versa,
+ *     depending on init order).
+ *  2. Its ESP_GATTS_REG_EVT branch stored `gatts_if` into
+ *     heart_rate_profile_tab[PROFILE_APP_IDX] on *any* registration event,
+ *     without checking param->reg.app_id. With three app_ids in play
+ *     (console 0x0055, HID 0x1812, battery 0x180F) the first REG_EVT to
+ *     arrive would win and the HID slot would end up pointing at whichever
+ *     profile registered first.
+ *
+ * Dispatch now happens in components/components/ble_stack, which matches
+ * REG_EVT by app_id. `esp_hidd_prf_cb_hdl` (above) is the per-profile handler
+ * it calls; it is declared in hidd_le_prf_int.h. The HID profile tracks its
+ * own gatt_if in hidd_le_env.gatt_if, so no local table is needed.
+ */
 
 void hidd_set_attr_value(uint16_t handle, uint16_t val_len, const uint8_t *value)
 {
