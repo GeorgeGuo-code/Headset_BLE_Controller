@@ -37,7 +37,18 @@
 #define TAG "ble_console"
 
 #define CONSOLE_APP_ID        0x0055
-#define CONSOLE_RX_MAX        128        /* max RX write payload we accept */
+#define CONSOLE_RX_MAX        1024       /* max single RX write or a prepared-
+                                         * write reassembly buffer (bytes). The
+                                         * 32-byte default from Phase 7 was tuned
+                                         * for stub commands like "p" / "c"; the
+                                         * `o <path>` and `cfg <json>` commands
+                                         * from Phase 8 need 10× that. See the
+                                         * prepared-write handler below — single
+                                         * GATT writes are still capped at one
+                                         * MTU payload (~244 B), so a > 244-byte
+                                         * command must be sent as a series of
+                                         * prepared-write chunks followed by an
+                                         * execute-prepared-write request. */
 #define CONSOLE_TX_STREAM_LEN 2048       /* log StreamBuffer capacity (bytes) */
 #define CONSOLE_TX_CHUNK_MAX  244        /* hard cap for one notification */
 
@@ -111,6 +122,23 @@ static volatile uint16_t    s_mtu           = 23;   /* default ATT MTU */
 static ble_console_cmd_cb_t s_cmd_cb        = NULL;
 static StreamBufferHandle_t s_tx_stream     = NULL;
 
+/* Prepared-write reassembly. The central sends "prepare write" chunks (each
+ * ≤ MTU−3 bytes) and then "execute prepared writes" to commit. We buffer
+ * each chunk at `param->write.offset` and only forward to s_cmd_cb on the
+ * EXEC event. A single connection at a time keeps this state simple — the
+ * ESP32 only runs one NUS central anyway. */
+static struct {
+    char     buf[CONSOLE_RX_MAX + 1];
+    uint16_t len;
+    uint16_t conn_id;
+} s_prep = { 0 };
+
+static void prep_reset(void)
+{
+    s_prep.len     = 0;
+    s_prep.conn_id = 0xFFFF;
+}
+
 /* ── GATTS event handler — one profile in ble_stack's table ──────────────── */
 static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                              esp_ble_gatts_cb_param_t *param)
@@ -146,6 +174,7 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
     case ESP_GATTS_DISCONNECT_EVT:
         s_connected = false;
         s_notify_en = false;
+        prep_reset();
         ESP_LOGI(TAG, "central disconnected, reason 0x%x",
                  param->disconnect.reason);
         /* ble_stack owns the re-advertise — it gets one DISCONNECT_EVT per
@@ -159,7 +188,35 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
 
     case ESP_GATTS_WRITE_EVT:
         if (param->write.is_prep) {
-            break;  /* long writes not expected for short commands */
+            /* Prepared-write chunk: stash into s_prep.buf at the requested
+             * offset. The execute-prepared-write event (EXEC_WRITE_EVT below)
+             * is what finally dispatches the full command. AUTO_RSP handles
+             * the protocol response; we just don't ship the chunk as a
+             * command on its own. */
+            if (param->write.handle != s_handles[IDX_RX_VAL]) {
+                break;
+            }
+            if (param->write.offset == 0) {
+                /* offset 0 = start of a fresh reassembly sequence. Reset
+                 * even if the previous one was never executed — the only
+                 * race here is "central starts a new prepare without
+                 * EXEC'ing the old one", which is a malformed client we
+                 * don't need to be nice to. */
+                s_prep.len       = 0;
+                s_prep.conn_id   = param->write.conn_id;
+            }
+            if (param->write.offset + param->write.len > CONSOLE_RX_MAX) {
+                ESP_LOGE(TAG, "prep write overflow (%u + %u > %d) — discarding",
+                         (unsigned)param->write.offset,
+                         (unsigned)param->write.len,
+                         CONSOLE_RX_MAX);
+                prep_reset();
+                break;
+            }
+            memcpy(s_prep.buf + param->write.offset,
+                   param->write.value, param->write.len);
+            s_prep.len = param->write.offset + param->write.len;
+            break;
         }
         if (param->write.handle == s_handles[IDX_TX_CCC] && param->write.len == 2) {
             uint16_t cccd = param->write.value[0] | (param->write.value[1] << 8);
@@ -179,6 +236,30 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
             cmd[n] = '\0';
             s_cmd_cb(cmd, n);
         }
+        break;
+
+    case ESP_GATTS_EXEC_WRITE_EVT:
+        /* The central said "commit". EXEC dispatches the buffered chunks as
+         * one command; CANCEL just drops them. Either way the buffer is
+         * freed for the next prepared-write sequence. AUTO_RSP handles the
+         * protocol response. */
+        if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC &&
+            s_prep.len > 0 && s_cmd_cb != NULL) {
+            /* Strip trailing CR/LF (the central may have appended them to
+             * the last chunk) before NUL-terminating. */
+            uint16_t n = s_prep.len;
+            while (n > 0 &&
+                   (s_prep.buf[n - 1] == '\n' || s_prep.buf[n - 1] == '\r')) {
+                n--;
+            }
+            s_prep.buf[n] = '\0';
+            s_cmd_cb(s_prep.buf, n);
+        } else if (param->exec_write.exec_write_flag != ESP_GATT_PREP_WRITE_CANCEL) {
+            /* Unknown flag — treat defensively. */
+            ESP_LOGW(TAG, "exec_write with unknown flag %d",
+                     (int)param->exec_write.exec_write_flag);
+        }
+        prep_reset();
         break;
 
     default:

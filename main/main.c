@@ -2,7 +2,7 @@
  * main.c — boot sequence: NVS -> MPU/DMP -> gesture detector -> BLE stack
  * (NUS console + HID) -> UART console.
  *
- * Commands ("c"/"ca"/"ct"/"p"/"sp"/"sr"/"hs"/"ac"/"ak"/...) arrive on two
+ * Commands ("c"/"ca"/"ct"/"p"/"sp"/"sr"/"hs"/"ac"/"ak"/"o"/...) arrive on two
  * channels that share one queue and one dispatcher:
  *   - BLE: a central (the Electron tool or nRF Connect) writes a line to the
  *     NUS RX characteristic. Results stream back over the TX notify char.
@@ -44,7 +44,7 @@
 #define CMD_QUEUE_LEN   4
 /* Phase 7: was 16. Commands now take arguments ("ak 8 4", "af 12"), and Step 4
  * will add rule names, so the buffer needs room beyond a two-letter opcode. */
-#define CMD_MAX_LEN     32
+#define CMD_MAX_LEN     1024
 
 /* BOOT button (GPIO0 on most ESP32-S3 dev boards). Active-low. Hold to
  * trigger a full guided calibration without a BLE central attached. */
@@ -137,6 +137,48 @@ static int parse_args(const char *cmd, long *out, int max)
     return n;
 }
 
+/* Range-bounded integer parsers for the `seq` command. We can't strtol
+ * directly on [p, limit) because it's not NUL-terminated, so each integer
+ * is copied into a small stack buffer first. 16 bytes is plenty for any
+ * HID parameter we accept (max is 60000 ms sleep = 5 digits, plus sign). */
+#define SEQ_INT_BUF  16
+
+/* Parse one signed integer at p (after skipping leading whitespace), staying
+ * within [p, limit). On success, returns the pointer to the first char past
+ * the consumed integer (still inside [p, limit) or one-past-the-end). On
+ * failure (no integer found), returns NULL. */
+static const char *seq_parse_int(const char *p, const char *limit, long *out)
+{
+    while (p < limit && (*p == ' ' || *p == '\t')) p++;
+    if (p >= limit) return NULL;
+
+    char buf[SEQ_INT_BUF];
+    size_t n = limit - p;
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+
+    char *endp = NULL;
+    long v = strtol(buf, &endp, 0);
+    if (endp == buf) {
+        return NULL;  /* no digits */
+    }
+    *out = v;
+    return p + (endp - buf);
+}
+
+/* Parse two signed integers in sequence. On success, returns the pointer
+ * past the second one. On any failure, returns NULL — *a and *b are
+ * undefined. */
+static const char *seq_parse_two_ints(const char *p, const char *limit,
+                                      long *a, long *b)
+{
+    p = seq_parse_int(p, limit, a);
+    if (p == NULL) return NULL;
+    p = seq_parse_int(p, limit, b);
+    return p;
+}
+
 /* HID / output-layer commands. Handled before the sensor-ready gate below so
  * HID stays testable when the MPU failed to come up (degraded mode).
  * Returns true if the command was consumed. */
@@ -180,6 +222,175 @@ static bool handle_hid_command(const char *cmd)
         esp_err_t err = hid_output_send_keyboard((uint8_t)args[0], keys, 0);
         ble_console_logf("keyboard mod=0x%02lx key=%ld -> %s\n",
                          args[0], args[1], esp_err_to_name(err));
+        return true;
+    }
+
+    if (strncmp(cmd, "o", 1) == 0 && (cmd[1] == '\0' || cmd[1] == ' ')) {
+        /* o [path] — open Windows app via Win+R. No args = "notepad".
+         * Path is the rest of the line verbatim; spaces and ASCII punctuation
+         * are passed through unchanged. */
+        const char *path = cmd + 1;
+        while (*path == ' ' || *path == '\t') {
+            path++;
+        }
+        if (*path == '\0') {
+            path = "notepad";
+        }
+        esp_err_t err = hid_output_open_path(path);
+        ble_console_logf("open \"%s\" -> %s\n", path, esp_err_to_name(err));
+        return true;
+    }
+
+    if (strncmp(cmd, "seq", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' ')) {
+        /* seq <step>; <step>; ...   (Phase 8)
+         *
+         * The whole line after "seq" is split on ';' into steps. Each step
+         * starts with one of:
+         *   sleep <ms>          — worker-side delay, no HID traffic
+         *   key  <mod> <kc>     — keyboard press, hold HID_OUTPUT_DEFAULT_HOLD_MS, release
+         *   type <text>         — type ASCII (text is everything up to the next ';')
+         *   click left|right|middle|0..7  — mouse press+release
+         *   move <dx> <dy>      — single relative mouse report
+         *
+         * Notes:
+         *  - `type` deliberately eats the rest of the step (including spaces),
+         *    so a path with spaces must be split: `seq type hello world;` works.
+         *  - ';' inside `type` text is not escapable; for paths use `o` instead.
+         *  - The whole command is bounded by CMD_MAX_LEN (1024) — about 100
+         *    short steps, which is enough for the typical scripted open.
+         *  - GOTCHA: any `key` step that triggers an async window open (Win+R,
+         *    Win+E, Win+D, Win+L, ...) MUST be followed by a `sleep 350` (or
+         *    500 on slow hosts) before the next `type`/`key`. The Run dialog
+         *    takes ~150-250 ms to appear and grab focus, so the next step's
+         *    HID reports race the host's focus change. For "open app" use the
+         *    bundled `o <path>` command — it has the 350 ms wait built in. */
+        const char *p = cmd + 3;
+        while (*p == ' ' || *p == '\t') p++;
+
+        hid_seq_step_t steps[HID_SEQ_MAX_STEPS];
+        size_t n = 0;
+
+        while (*p && n < HID_SEQ_MAX_STEPS) {
+            /* End of this step = next ';' (exclusive) or end of string. */
+            const char *end = strchr(p, ';');
+            if (end == NULL) end = p + strlen(p);
+
+            /* Skip leading whitespace in the step. Empty steps (e.g. from a
+             * double ";;") are silently skipped — that way "seq sleep 100;;key 0 40"
+             * doesn't error out. */
+            const char *tok = p;
+            while (tok < end && (*tok == ' ' || *tok == '\t')) tok++;
+            if (tok >= end) {
+                p = (*end == ';') ? end + 1 : end;
+                continue;
+            }
+
+            /* Find end of first token. */
+            const char *tok_end = tok;
+            while (tok_end < end && *tok_end != ' ' && *tok_end != '\t') tok_end++;
+            size_t tlen = (size_t)(tok_end - tok);
+
+            if (tlen == 5 && strncmp(tok, "sleep", 5) == 0) {
+                long ms;
+                if (seq_parse_int(tok_end, end, &ms) == NULL || ms <= 0 || ms > 60000) {
+                    ble_console_logf("seq: bad sleep arg (want 1..60000 ms)\n");
+                    return true;
+                }
+                steps[n].kind      = HID_SEQ_SLEEP;
+                steps[n].u.sleep.ms = (uint16_t)ms;
+                n++;
+            } else if (tlen == 3 && strncmp(tok, "key", 3) == 0) {
+                long mod, kc;
+                if (seq_parse_two_ints(tok_end, end, &mod, &kc) == NULL) {
+                    ble_console_log("seq: usage: key <mod> <keycode>   e.g. 'key 8 4' = Win+A\n");
+                    return true;
+                }
+                steps[n].kind            = HID_SEQ_KEY;
+                steps[n].u.key.modifiers  = (uint8_t)mod;
+                steps[n].u.key.keycode    = (uint8_t)kc;
+                steps[n].u.key.hold_ms    = 0;   /* default */
+                n++;
+            } else if (tlen == 4 && strncmp(tok, "type", 4) == 0) {
+                /* `type` consumes the rest of the step, including any leading
+                 * whitespace after the token. This is what lets users type
+                 * "hello world" with a space inside the typed string. */
+                const char *text = tok_end;
+                while (text < end && (*text == ' ' || *text == '\t')) text++;
+                size_t text_len = (size_t)(end - text);
+                if (text_len == 0) {
+                    ble_console_log("seq: usage: type <text>   (text goes to next ';')\n");
+                    return true;
+                }
+                if (text_len > HID_SEQ_TEXT_MAX) {
+                    ble_console_logf("seq: type text too long (max %d, got %u) — "
+                                     "use multiple 'type' steps or 'o <path>'\n",
+                                     HID_SEQ_TEXT_MAX, (unsigned)text_len);
+                    return true;
+                }
+                steps[n].kind = HID_SEQ_TYPE;
+                memcpy(steps[n].u.type.text, text, text_len);
+                steps[n].u.type.text[text_len] = '\0';
+                steps[n].u.type.len = (uint8_t)text_len;
+                n++;
+            } else if (tlen == 5 && strncmp(tok, "click", 5) == 0) {
+                const char *arg = tok_end;
+                while (arg < end && (*arg == ' ' || *arg == '\t')) arg++;
+                size_t alen = (size_t)(end - arg);
+                uint8_t btn = 0;
+                if      (alen == 4 && strncmp(arg, "left",   4) == 0) btn = 1;
+                else if (alen == 5 && strncmp(arg, "right",  5) == 0) btn = 2;
+                else if (alen == 6 && strncmp(arg, "middle", 6) == 0) btn = 4;
+                else {
+                    /* Numeric fallback: 1=left, 2=right, 4=middle, or any combo. */
+                    long nb;
+                    if (seq_parse_int(arg, end, &nb) != NULL && nb >= 0 && nb <= 7) {
+                        btn = (uint8_t)nb;
+                    } else {
+                        ble_console_log("seq: usage: click <left|right|middle|0..7>\n");
+                        return true;
+                    }
+                }
+                steps[n].kind            = HID_SEQ_CLICK;
+                steps[n].u.click.buttons = btn;
+                n++;
+            } else if (tlen == 4 && strncmp(tok, "move", 4) == 0) {
+                long dx, dy;
+                if (seq_parse_two_ints(tok_end, end, &dx, &dy) == NULL) {
+                    ble_console_log("seq: usage: move <dx> <dy>   (-128..127)\n");
+                    return true;
+                }
+                if (dx < -128 || dx > 127 || dy < -128 || dy > 127) {
+                    ble_console_logf("seq: move dx/dy out of range (-128..127), got %ld %ld\n",
+                                     dx, dy);
+                    return true;
+                }
+                steps[n].kind       = HID_SEQ_MOVE;
+                steps[n].u.move.dx  = (int8_t)dx;
+                steps[n].u.move.dy  = (int8_t)dy;
+                n++;
+            } else {
+                ble_console_logf("seq: unknown step '%.*s'\n", (int)tlen, tok);
+                ble_console_log("  known: sleep <ms> | key <mod> <kc> | type <text> | "
+                                "click <btn> | move <dx> <dy>\n");
+                return true;
+            }
+
+            p = (*end == ';') ? end + 1 : end;
+        }
+
+        if (n == 0) {
+            ble_console_log("seq: no valid steps. usage: seq sleep 100; key 0 40; type hello; "
+                            "click left; move 10 20\n");
+            return true;
+        }
+        if (*p) {
+            /* We filled the array before consuming all input. */
+            ble_console_logf("seq: too many steps (max %d, more remain)\n", HID_SEQ_MAX_STEPS);
+            return true;
+        }
+
+        esp_err_t err = hid_output_send_seq(steps, n);
+        ble_console_logf("seq: %u steps -> %s\n", (unsigned)n, esp_err_to_name(err));
         return true;
     }
 
@@ -300,7 +511,8 @@ static void handle_command(const char *cmd)
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);
         ble_console_log("  gestures: c ca ct p q 'q reset' sp sr cd\n");
-        ble_console_log("  hid     : hs | ac <code> | ak <mods> <key>\n");
+        ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
+        ble_console_log("  seq     : sleep <ms>; key <mod> <kc>; type <text>; click <btn>; move <dx> <dy>\n");
         ble_console_log("  prefix 'hmbc' optional on BLE (e.g. 'hmbc p')\n");
     }
 }
@@ -400,7 +612,7 @@ static esp_err_t start_uart_console(void)
     const esp_console_cmd_t cmd = {
         .command = "hmbc",
         .help    = "Send a command to the gesture/HID controller "
-                   "(hs | ac <code> | ak <mods> <key> | c | p | ...)",
+                   "(hs | ac <code> | ak <mods> <key> | o [path] | seq <steps> | c | p | ...)",
         .hint    = NULL,
         .func    = &cmd_hmbc,
     };

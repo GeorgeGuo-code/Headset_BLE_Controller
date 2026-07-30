@@ -78,7 +78,8 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 .devcontainer
 reference/
-SESSION_STATE.md
+# SESSION_STATE.md
+docs/
 
 # coding assistance
 .claude
