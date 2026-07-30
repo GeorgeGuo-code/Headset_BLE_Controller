@@ -694,7 +694,7 @@ bool hidd_clcb_dealloc (uint16_t conn_id)
  *     arrive would win and the HID slot would end up pointing at whichever
  *     profile registered first.
  *
- * Dispatch now happens in components/components/ble_stack, which matches
+ * Dispatch now happens in components/ble_stack, which matches
  * REG_EVT by app_id. `esp_hidd_prf_cb_hdl` (above) is the per-profile handler
  * it calls; it is declared in hidd_le_prf_int.h. The HID profile tracks its
  * own gatt_if in hidd_le_env.gatt_if, so no local table is needed.
