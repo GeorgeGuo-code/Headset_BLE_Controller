@@ -30,8 +30,52 @@ function createWindow () {
     return { path: filePath }
   })
 
-  // Chromium 边扫描边回调，前几次 deviceList 常常是空的。空列表不要直接推给
-  // 渲染进程（否则界面立刻显示“未发现设备”），改为等真的有设备、或超时后再推。
+  // 保存配置到 JSON 文件
+  ipcMain.removeHandler('save-configs')
+  ipcMain.handle('save-configs', async (_event, json) => {
+    const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+      defaultPath: '我的配置.json',
+      filters: [{ name: 'JSON 配置文件', extensions: ['json'] }]
+    })
+    if (canceled || !filePath) return { canceled: true }
+    await fs.writeFile(filePath, String(json), 'utf-8')
+    return { path: filePath }
+  })
+
+  // 从 JSON 文件加载配置
+  ipcMain.removeHandler('load-configs')
+  ipcMain.handle('load-configs', async () => {
+    const { canceled, filePath } = await dialog.showOpenDialog(mainWindow, {
+      filters: [{ name: 'JSON 配置文件', extensions: ['json'] }],
+      properties: ['openFile']
+    })
+    if (canceled || !filePath || !filePath[0]) return { canceled: true }
+    try {
+      const data = await fs.readFile(filePath[0], 'utf-8')
+      return { data }
+    } catch (e) {
+      return { error: e.message }
+    }
+  })
+
+  // 选择 .exe 文件（用于"运行程序"步骤）
+  ipcMain.removeHandler('open-exe-dialog')
+  ipcMain.handle('open-exe-dialog', async () => {
+    console.log('[main] open-exe-dialog handler called')
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      filters: [
+        { name: '可执行文件', extensions: ['exe', 'bat', 'cmd', 'lnk'] },
+        { name: '所有文件', extensions: ['*'] }
+      ],
+      properties: ['openFile']
+    })
+    console.log('[main] open-exe-dialog result:', { canceled, filePaths })
+    if (canceled || !filePaths || filePaths.length === 0) return { canceled: true }
+    return { path: filePaths[0] }
+  })
+
+  // Chromium 边扫描边回调，每次有新设备都推给渲染进程（渲染端去重累积）。
+  // 10 秒后仍为空才报告”未发现设备”。
   let emptyScanTimer = null
 
   mainWindow.webContents.on('select-bluetooth-device', (event, deviceList, callback) => {
@@ -41,15 +85,15 @@ function createWindow () {
 
     if (emptyScanTimer) { clearTimeout(emptyScanTimer); emptyScanTimer = null }
 
-    if (deviceList && deviceList.length > 0) {
-      mainWindow.webContents.send('bluetooth-device-list', deviceList)
-      return
+    // 始终把当前列表推给渲染进程（渲染端按 deviceId 去重累积）
+    mainWindow.webContents.send('bluetooth-device-list', deviceList || [])
+
+    if (!deviceList || deviceList.length === 0) {
+      emptyScanTimer = setTimeout(() => {
+        emptyScanTimer = null
+        mainWindow.webContents.send('bluetooth-device-list', [])
+      }, 10000)
     }
-    // 还没扫到东西：保持“搜索中”，10 s 后仍为空才报告。
-    emptyScanTimer = setTimeout(() => {
-      emptyScanTimer = null
-      mainWindow.webContents.send('bluetooth-device-list', [])
-    }, 10000)
   })
 
   ipcMain.removeAllListeners('cancel-bluetooth-request')

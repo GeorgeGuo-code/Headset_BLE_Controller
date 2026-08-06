@@ -9,5 +9,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   bluetoothPairingRequest: (callback) =>
     ipcRenderer.on('bluetooth-pairing-request', (_event, details) => callback(details)),
   bluetoothPairingResponse: (response) => ipcRenderer.send('bluetooth-pairing-response', response),
-  saveLog: (text) => ipcRenderer.invoke('save-log', text)
+  saveLog: (text) => ipcRenderer.invoke('save-log', text),
+  saveConfigs: (json) => ipcRenderer.invoke('save-configs', json),
+  loadConfigs: () => ipcRenderer.invoke('load-configs'),
+  openExeDialog: () => ipcRenderer.invoke('open-exe-dialog')
 })

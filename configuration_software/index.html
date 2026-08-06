@@ -59,6 +59,19 @@
       </section>
 
       <section class="panel span2">
+        <h2>命令配置</h2>
+        <div class="row">
+          <button id="btn-cfg-new" class="primary">新建配置</button>
+          <button id="btn-cfg-sync" class="need-conn" disabled>同步到设备</button>
+          <button id="btn-cfg-read" class="need-conn" disabled>从设备读取</button>
+          <button id="btn-cfg-save">保存配置文件</button>
+          <button id="btn-cfg-load">加载配置文件</button>
+        </div>
+        <div id="cfg-list"></div>
+        <p id="cfg-empty" class="hint">暂无配置。点击"新建配置"创建，或"加载配置文件"导入。</p>
+      </section>
+
+      <section class="panel span2">
         <h2>日志 <span id="log-count" class="hint"></span></h2>
         <div class="row">
           <input id="log-filter" placeholder="过滤关键字">
@@ -75,6 +88,39 @@
         </div>
       </section>
     </main>
+
+    <!-- Key capture dialog -->
+    <div id="key-dialog" class="dialog-overlay hidden">
+      <div class="dialog dialog-sm">
+        <h3>按键录入</h3>
+        <p id="key-status" class="dialog-center-text hint">
+          请按下键盘按键…
+        </p>
+        <div id="key-result" class="dialog-center hidden">
+          <div id="key-display" class="dialog-key-display"></div>
+          <div id="key-detail" class="hint dialog-key-detail"></div>
+        </div>
+        <div class="row mt12 dialog-center">
+          <button id="key-dialog-ok" class="primary" disabled>确认</button>
+          <button id="key-dialog-cancel">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sleep duration dialog -->
+    <div id="sleep-dialog" class="dialog-overlay hidden">
+      <div class="dialog dialog-sm">
+        <h3>等待时间</h3>
+        <div class="dialog-center mt12">
+          <input id="sleep-input" type="number" min="1" max="60000" value="350" placeholder="毫秒">
+          <span class="hint">毫秒</span>
+        </div>
+        <div class="row mt12 dialog-center">
+          <button id="sleep-dialog-ok" class="primary">确认</button>
+          <button id="sleep-dialog-cancel">取消</button>
+        </div>
+      </div>
+    </div>
 
     <script src="./renderer.js"></script>
   </body>

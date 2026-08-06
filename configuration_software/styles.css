@@ -86,7 +86,7 @@ input:focus { outline: none; border-color: var(--accent); }
 .chk input { min-width: auto; }
 
 .hint { color: var(--dim); font-size: 12px; margin: 4px 0 0; }
-.hidden { display: none; }
+.hidden { display: none !important; }
 
 /* calibration steps */
 #steps { list-style: none; margin: 10px 0; padding: 0; }
@@ -151,3 +151,125 @@ input:focus { outline: none; border-color: var(--accent); }
 
 #device-list { margin-top: 12px; }
 #device-list button { display: block; margin: 4px 0; min-width: 260px; text-align: left; }
+
+/* config panel — card list */
+#cfg-list { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+
+/* config header: name input + new command button */
+.cfg-config-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.cfg-name-input {
+  flex: 1; background: #10141a; border: 1px solid var(--line); border-radius: 4px;
+  color: var(--fg); font-size: 14px; font-weight: 500; padding: 6px 8px; outline: none;
+}
+.cfg-name-input:focus { border-color: var(--accent); }
+
+/* command card */
+.cfg-card {
+  background: #10141a; border: 1px solid var(--line); border-radius: 6px;
+  padding: 12px; font-size: 13px;
+}
+.cfg-card-row1 {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;
+}
+.cfg-cmd-num {
+  color: var(--dim); font-family: Consolas, monospace; font-size: 13px; font-weight: 600;
+}
+.cfg-card-row1 .btn-del {
+  background: transparent; border: none; color: var(--dim); cursor: pointer;
+  font-size: 12px; padding: 2px 8px; border-radius: 4px;
+}
+.cfg-card-row1 .btn-del:hover { color: var(--err); background: #2a1518; }
+
+/* trigger row */
+.cfg-card-row2 {
+  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; flex-wrap: wrap;
+}
+.cfg-row-label {
+  color: var(--dim); font-size: 12px; min-width: 70px; padding-top: 5px;
+}
+.cfg-trig-field {
+  display: flex; flex-wrap: wrap; gap: 4px; min-height: 28px; flex: 1;
+  background: #1c2128; border: 1px solid var(--line); border-radius: 4px;
+  padding: 4px 6px; align-items: center;
+}
+.cfg-trig-hint { color: #55606e; font-size: 12px; }
+.cfg-tag {
+  display: inline-flex; align-items: center; gap: 2px;
+  background: var(--accent); color: #fff; border-radius: 3px;
+  padding: 2px 6px; font-size: 11px; cursor: default;
+}
+.cfg-tag-x { cursor: pointer; opacity: 0.7; font-weight: bold; }
+.cfg-tag-x:hover { opacity: 1; }
+.cfg-trig-btns { display: flex; gap: 4px; flex-wrap: wrap; }
+.cfg-trig-btns button {
+  padding: 4px 8px; font-size: 11px; border-radius: 4px;
+  background: #1c2128; border: 1px solid var(--line); color: var(--fg); cursor: pointer;
+}
+.cfg-trig-btns button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* steps list */
+.cfg-card-row3 {
+  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; flex-wrap: wrap;
+}
+.cfg-target-field {
+  display: flex; flex-direction: column; gap: 4px; flex: 1;
+  background: #1c2128; border: 1px solid var(--line); border-radius: 4px;
+  padding: 4px 6px; min-height: 28px;
+}
+.cfg-steps { margin: 4px 0; padding-left: 0; list-style: none; }
+.cfg-step {
+  display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+  border-radius: 4px; font-size: 12px; font-family: Consolas, monospace;
+}
+.cfg-step:hover { background: #1c2128; }
+.cfg-step .step-num { color: var(--dim); min-width: 18px; text-align: right; }
+.cfg-step .step-desc { flex: 1; color: var(--fg); }
+.cfg-step .step-del {
+  background: transparent; border: none; color: var(--dim); cursor: pointer;
+  font-size: 14px; padding: 0 4px; border-radius: 3px; opacity: 0;
+}
+.cfg-step:hover .step-del { opacity: 1; }
+.cfg-step .step-del:hover { color: var(--err); }
+
+/* step builder buttons */
+.cfg-add-steps {
+  display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;
+  padding-top: 6px; border-top: 1px solid var(--line);
+}
+.cfg-add-steps button {
+  padding: 4px 10px; font-size: 12px; border-radius: 4px;
+  background: #1c2128; border: 1px solid var(--line); color: var(--fg); cursor: pointer;
+}
+.cfg-add-steps button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* dialog overlay */
+.dialog-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+}
+.dialog {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 20px; min-width: 460px; max-width: 560px;
+}
+.dialog h3 { margin: 0 0 14px; font-size: 15px; }
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+.field input, .field select, .field textarea {
+  width: 100%; background: #10141a; border: 1px solid var(--line);
+  border-radius: 4px; color: var(--fg); padding: 6px 8px; font-size: 13px;
+}
+.field textarea { font-family: Consolas, monospace; resize: vertical; }
+.field input:focus, .field select:focus, .field textarea:focus { outline: none; border-color: var(--accent); }
+.mt8 { margin-top: 8px; }
+.mt12 { margin-top: 12px; }
+button.small { padding: 4px 10px; font-size: 12px; }
+
+/* dialog helpers */
+.dialog-sm { min-width: 360px; }
+.dialog-center { text-align: center; }
+.dialog-center-text { text-align: center; font-size: 14px; margin: 16px 0; }
+.dialog-key-display { font-size: 20px; font-family: Consolas, monospace; margin: 8px 0; }
+.dialog-key-detail { margin: 4px 0; }
+.dialog-status-warn { color: var(--warn); }

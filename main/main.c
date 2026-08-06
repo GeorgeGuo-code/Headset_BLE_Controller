@@ -35,6 +35,9 @@
 #include "ble_stack.h"
 #include "hid_output.h"
 #include "hid_dev.h"
+#include "cmd_config.h"
+#include "touch_sensor.h"
+#include "driver/touch_sens.h"
 
 #define TAG "main"
 
@@ -83,6 +86,9 @@ static void gesture_bridge_task(void *arg)
         ble_console_logf("GESTURE %s ts=%u peak=%.1f vel=%.1f\n",
                          name, (unsigned)ev.timestamp_ms,
                          ev.peak_angle_deg, ev.peak_velocity_deg_s);
+
+        /* Execute any configs triggered by this gesture. */
+        cmd_config_execute_by_trigger(TRIGGER_GESTURE, (uint16_t)ev.type);
     }
 }
 
@@ -394,6 +400,211 @@ static bool handle_hid_command(const char *cmd)
         return true;
     }
 
+    /* ── command config management ────────────────────────────────────── */
+
+#ifdef ENABLE_SERIAL_TRIGGER
+    if (strncmp(cmd, "command ", 8) == 0) {
+        /* command <id> — shorthand for "cmd run <id>" (debug build only) */
+        long id;
+        const char *p = cmd + 8;
+        while (*p == ' ') p++;
+        char *endp;
+        id = strtol(p, &endp, 10);
+        if (endp == p || id < 1 || id > CMD_CFG_MAX) {
+            ble_console_logf("usage: command <id>  (1..%d)\n", CMD_CFG_MAX);
+            return true;
+        }
+        esp_err_t err = cmd_config_execute((uint8_t)id);
+        ble_console_logf("cmd %ld -> %s\n", id, esp_err_to_name(err));
+        return true;
+    }
+#endif
+
+    if (strncmp(cmd, "cmd ", 4) == 0) {
+        const char *p = cmd + 4;
+        while (*p == ' ') p++;
+
+        /* cmd list */
+        if (strncmp(p, "list", 4) == 0 && (p[4] == '\0' || p[4] == ' ')) {
+            char buf[2048];
+            esp_err_t err = cmd_config_list(buf, sizeof(buf));
+            if (err == ESP_OK) {
+                ble_console_log(buf);
+            } else {
+                ble_console_log("cmd list: buffer too small\n");
+            }
+            return true;
+        }
+
+        /* cmd get <id> */
+        if (strncmp(p, "get ", 4) == 0) {
+            long id;
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd get <id>  (1..%d)\n", CMD_CFG_MAX);
+                return true;
+            }
+            const cmd_config_t *cfg = cmd_config_get((uint8_t)id);
+            if (!cfg) {
+                ble_console_logf("cmd get %ld: not found\n", id);
+                return true;
+            }
+            const char *tname = "none";
+            if (cfg->trigger_type == TRIGGER_GESTURE) {
+                switch (cfg->trigger_value) {
+                case GESTURE_NOD:        tname = "gesture:nod";       break;
+                case GESTURE_LOOK_UP:    tname = "gesture:look_up";   break;
+                case GESTURE_TILT_LEFT:  tname = "gesture:tilt_left"; break;
+                case GESTURE_TILT_RIGHT: tname = "gesture:tilt_right"; break;
+                default:                 tname = "gesture:?";         break;
+                }
+            }
+#ifdef ENABLE_SERIAL_TRIGGER
+            else if (cfg->trigger_type == TRIGGER_COMMAND) {
+                static char tbuf[24];
+                snprintf(tbuf, sizeof(tbuf), "command:%u", (unsigned)cfg->trigger_value);
+                tname = tbuf;
+            }
+#endif
+            ble_console_logf("cfg: id=%u name=\"%s\" trigger=%s n_steps=%u\n",
+                             (unsigned)cfg->id, cfg->name, tname, (unsigned)cfg->n_steps);
+            char seq_buf[512];
+            if (cmd_config_format_seq(cfg, seq_buf, sizeof(seq_buf)) == ESP_OK) {
+                ble_console_logf("cfg: steps=%s\n", seq_buf);
+            }
+            return true;
+        }
+
+        /* cmd set <id> <name> <type> <value> <seq_text...> */
+        if (strncmp(p, "set ", 4) == 0) {
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+
+            long id;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd set <id> <name> <type> <value> <seq>\n"
+                                 "  type: none / gesture / command\n"
+                                 "  gesture values: 1=nod 2=look_up 3=tilt_left 4=tilt_right\n");
+                return true;
+            }
+            q = endp;
+
+            /* parse name (next token, no spaces) */
+            while (*q == ' ') q++;
+            const char *name_start = q;
+            while (*q && *q != ' ') q++;
+            size_t name_len = (size_t)(q - name_start);
+            if (name_len == 0 || name_len >= CMD_CFG_NAME_MAX) {
+                ble_console_log("cmd set: invalid name\n");
+                return true;
+            }
+
+            /* parse trigger type */
+            while (*q == ' ') q++;
+            const char *type_start = q;
+            while (*q && *q != ' ') q++;
+            size_t type_len = (size_t)(q - type_start);
+
+            cmd_trigger_type_t ttype = TRIGGER_NONE;
+            uint16_t tvalue = 0;
+            if (type_len == 4 && strncmp(type_start, "none", 4) == 0) {
+                ttype = TRIGGER_NONE;
+            } else if (type_len == 7 && strncmp(type_start, "gesture", 7) == 0) {
+                ttype = TRIGGER_GESTURE;
+            }
+#ifdef ENABLE_SERIAL_TRIGGER
+            else if (type_len == 7 && strncmp(type_start, "command", 7) == 0) {
+                ttype = TRIGGER_COMMAND;
+            }
+#endif
+            else {
+                ble_console_log("cmd set: trigger type must be none/gesture"
+#ifdef ENABLE_SERIAL_TRIGGER
+                                "/command"
+#endif
+                                "\n");
+                return true;
+            }
+
+            /* parse trigger value */
+            while (*q == ' ') q++;
+            long tval = 0;
+            if (ttype != TRIGGER_NONE) {
+                tval = strtol(q, &endp, 10);
+                if (endp == q) {
+                    ble_console_log("cmd set: invalid trigger value\n");
+                    return true;
+                }
+                q = endp;
+            }
+
+            /* parse seq text (rest of line) */
+            while (*q == ' ') q++;
+
+            cmd_config_t cfg;
+            memset(&cfg, 0, sizeof(cfg));
+            cfg.id = (uint8_t)id;
+            memcpy(cfg.name, name_start, name_len);
+            cfg.name[name_len] = '\0';
+            cfg.trigger_type = ttype;
+            cfg.trigger_value = (uint16_t)tval;
+
+            if (*q) {
+                esp_err_t err = cmd_config_parse_seq(q, cfg.steps, (size_t *)&cfg.n_steps);
+                if (err != ESP_OK) {
+                    ble_console_logf("cmd set: bad seq text: %s\n", esp_err_to_name(err));
+                    return true;
+                }
+            }
+
+            esp_err_t err = cmd_config_set(&cfg);
+            ble_console_logf("cmd set id=%u -> %s\n", (unsigned)id, esp_err_to_name(err));
+            return true;
+        }
+
+        /* cmd del <id> */
+        if (strncmp(p, "del ", 4) == 0) {
+            long id;
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd del <id>  (1..%d)\n", CMD_CFG_MAX);
+                return true;
+            }
+            esp_err_t err = cmd_config_delete((uint8_t)id);
+            ble_console_logf("cmd del %ld -> %s\n", id, esp_err_to_name(err));
+            return true;
+        }
+
+        /* cmd run <id> */
+        if (strncmp(p, "run ", 4) == 0) {
+            long id;
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd run <id>  (1..%d)\n", CMD_CFG_MAX);
+                return true;
+            }
+            esp_err_t err = cmd_config_execute((uint8_t)id);
+            ble_console_logf("cmd run %ld -> %s\n", id, esp_err_to_name(err));
+            return true;
+        }
+
+        /* unknown cmd subcommand */
+        ble_console_log("cmd: list | get <id> | set <id> <name> <type> <value> <seq> | del <id> | run <id>\n");
+        ble_console_log("  type: none / gesture / command\n");
+        return true;
+    }
+
     return false;
 }
 
@@ -512,6 +723,10 @@ static void handle_command(const char *cmd)
         ble_console_logf("unknown command: '%s'\n", cmd);
         ble_console_log("  gestures: c ca ct p q 'q reset' sp sr cd\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
+        ble_console_log("  configs : cmd list|get|set|del|run\n");
+#ifdef ENABLE_SERIAL_TRIGGER
+        ble_console_log("            command <id> (debug)\n");
+#endif
         ble_console_log("  seq     : sleep <ms>; key <mod> <kc>; type <text>; click <btn>; move <dx> <dy>\n");
         ble_console_log("  prefix 'hmbc' optional on BLE (e.g. 'hmbc p')\n");
     }
@@ -704,6 +919,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* 1b. Command configs — loaded from NVS, used by `cmd`/`command` handler. */
+    cmd_config_init();
+
     /* 2. MPU6050 + DMP, BEFORE the BLE stack comes up.
      *
      *    Order matters: bringing Bluedroid up first starves the I2C driver
@@ -757,6 +975,13 @@ void app_main(void)
     if (cerr != ESP_OK) {
         ESP_LOGW(TAG, "UART console unavailable: %s", esp_err_to_name(cerr));
     }
+
+    /* 5b. Touch sensor → mouse-left button. Default channel is T2 (GPIO2 on
+     *     ESP32-S3). Placed after the BLE stack starts so the press/release
+     *     worker can find a valid conn_id, and after the UART console so
+     *     the REPL prompt is reachable during the ~6 s initial scan.
+     *     Independent of the MPU — runs in both healthy and degraded mode. */
+    ESP_ERROR_CHECK(touch_sensor_init(TOUCH_MIN_CHAN_ID + 1));
 
     if (!s_detector_ready) {
         ble_console_logf("SENSOR FAIL: mpu_dmp_init=%u (%s)\n",
