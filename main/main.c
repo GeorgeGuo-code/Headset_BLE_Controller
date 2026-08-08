@@ -38,6 +38,7 @@
 #include "cmd_config.h"
 #include "touch_sensor.h"
 #include "driver/touch_sens.h"
+#include "battery_quantity_detection.h"
 
 #define TAG "main"
 
@@ -1003,6 +1004,11 @@ void app_main(void)
     ESP_ERROR_CHECK(gesture_detect_start(q));
 
     xTaskCreate(gesture_bridge_task, "gesture_bridge", 3072, q, 4, NULL);
+
+    /* 7. Battery quantity detection — ADC-based battery level monitoring with
+     *     3-LED indicator. Initialized last so all other hardware is ready
+     *     before the indicator lights up. init内部会立即读取并点亮LED. */
+    ESP_ERROR_CHECK(bat_quantity_detection_init());
 
     ble_console_log("boot complete — gestures stream here; send `c` to calibrate\n");
 }

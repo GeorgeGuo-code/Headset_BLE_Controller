@@ -78,6 +78,8 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 .devcontainer
 reference/
+config_test/
+
 # SESSION_STATE.md
 docs/
 
