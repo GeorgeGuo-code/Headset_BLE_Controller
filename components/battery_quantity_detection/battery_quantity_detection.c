@@ -70,6 +70,9 @@ static const gpio_num_t bat_pins[BAT_QUANTITY_MAX_LEVEL] = {
     LED_HIGH_PIN
 };
 
+/** @brief 定期检测周期 (ms) */
+#define BAT_MONITOR_INTERVAL_MS  30000  // 30秒检测一次
+
 /*============================================================================
  * 内部函数
  *============================================================================*/
@@ -138,6 +141,43 @@ static void update_battery_level(int level)
 
     bat_level_cache = level;
     ESP_LOGI(TAG, "Battery level updated: %d", level);
+}
+
+/**
+ * @brief 电量定期检测任务
+ */
+static void bat_monitor_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(BAT_MONITOR_INTERVAL_MS));
+
+        int voltage_mv = read_battery_voltage_mv();
+        float filtered_voltage = apply_moving_average_filter((float)voltage_mv);
+
+        int level = 0;
+        if (filtered_voltage >= 3850) {
+            level = 3;
+        } else if (filtered_voltage >= 3650) {
+            level = 2;
+        } else {
+            level = 1;
+        }
+
+        // 去抖动处理
+        int64_t current_time = esp_timer_get_time() / 1000;
+        if (level != bat_level_cache) {
+            if (debounce_counter == 0) {
+                debounce_counter++;
+                debounce_timestamp = current_time;
+            } else if (current_time - debounce_timestamp >= BAT_QUANTITY_DEBOUNCE_TIME) {
+                update_battery_level(level);
+                debounce_counter = 0;
+            }
+        } else {
+            debounce_counter = 0;
+        }
+    }
 }
 
 /*============================================================================
@@ -219,6 +259,9 @@ int bat_quantity_detection_init(void)
     }
     update_battery_level(level);
 
+    // 启动定期检测任务
+    xTaskCreate(bat_monitor_task, "bat_monitor", 2048, NULL, 3, NULL);
+
     return 0;
 }
 
@@ -234,9 +277,9 @@ int bat_quantity_detection_get_level(void)
 
     // 根据电压确定电量等级 (3级: 低/中/高)
     int level = 0;
-    if (filtered_voltage >= 3600) {
+    if (filtered_voltage >= 3850) {
         level = 3;  // 高电量
-    } else if (filtered_voltage >= 3400) {
+    } else if (filtered_voltage >= 3650) {
         level = 2;  // 中电量
     } else {
         level = 1;  // 低电量
