@@ -2,16 +2,23 @@
  * ble_stack.c — single owner of the BLE radio, the global GATTS/GAP callbacks
  * and the merged advertising payload. See include/ble_stack.h for the why.
  *
- * Phase 7.3: advertising switched from legacy esp_ble_gap_config_adv_data() /
- * esp_ble_gap_start_advertising() to BLE 5.0 extended advertising
- * (esp_ble_gap_ext_adv_*). Legacy ADV_IND stops automatically on the first
- * CONNECT_EVT, which made it impossible to host more than one central at a
- * time — Windows auto-pairing as a HID keyboard would consume the only
- * connection slot and lock out the Electron config tool. BLE 5.0 extended
- * advertising keeps broadcasting while connections exist, so multiple
- * centrals can coexist (up to BT_ACL_CONNECTIONS, default 4). Advertising
- * payload is now raw-encoded AD elements; the BASE_UUID trick needed for
- * legacy 16-bit service UUIDs is no longer required.
+ * Phase 7.5: dual advertising sets to solve the Windows HID + config tool
+ * coexistence problem.
+ *
+ * The core issue: legacy ADV_IND stops broadcasting on the first CONNECT_EVT.
+ * When Windows auto-pairs as a HID keyboard, it consumes the only advertising
+ * set, making the device invisible to the Electron config tool.
+ *
+ * Solution: two legacy ADV_IND advertising sets:
+ *   Instance 0 (HID):  appearance 0x03C0 + HID UUID 0x1812 + device name
+ *                       → Windows auto-pairs as keyboard
+ *   Instance 1 (NUS):  device name (ADV) + NUS 128-bit UUID (scan response)
+ *                       → Electron config tool discovers and connects
+ *
+ * Each instance is a separate legacy ADV_IND. When one central connects to
+ * instance 0, it stops — but instance 1 keeps broadcasting. The other
+ * central (config tool) can still discover and connect via instance 1.
+ * Both connections coexist on the same BLE controller (BT_ACL_CONNECTIONS).
  */
 
 #include <string.h>
@@ -47,136 +54,188 @@ static bool           s_started       = false;
 /* ── Runtime link state ──────────────────────────────────────────────────── */
 static volatile bool     s_bonded     = false;
 static volatile bool     s_connected  = false;
-static volatile uint8_t  s_conn_count = 0;   /* Phase 7.3: tracks live connections
-                                              * for multi-connection support */
+static volatile uint8_t  s_conn_count = 0;
 
-/* ── Advertising (BLE 5.0 extended, non-legacy) ──────────────────────────── */
-#define ADV_INSTANCE 0
+/* ── Dual advertising instances ──────────────────────────────────────────── */
+#define HID_INSTANCE  0       /* Windows HID auto-pair */
+#define NUS_INSTANCE  1       /* Electron config tool */
 
-/* Raw-encoded ADV payload (25 B):
- *   flags(3) + appearance(4) + complete uuid16 HID(4) + complete local name(14)
- * 0x03C0 HID Generic is intentionally restored here — see the design note in
- * docs/PHASE7_ACTION_HID_DESIGN.md: dropping it in Phase 7.2 stopped Windows
- * from auto-pairing, but also stopped the device from being usable as a HID
- * keyboard at all without a manual Settings → Bluetooth flow. With ext_adv
- * we get both: Windows auto-pairs AND the config tool can connect
- * simultaneously (BT_ACL_CONNECTIONS, default 4). */
-static const uint8_t s_adv_raw[] = {
-    0x02, 0x01, 0x06,                                              /* Flags: GEN_DISC | BREDR_NOT_SPT */
-    0x03, 0x19, 0xC0, 0x03,                                        /* Appearance: 0x03C0 HID Generic */
-    0x03, 0x02, 0x12, 0x18,                                        /* Complete List 16-bit UUIDs: HID 0x1812 */
-    0x0D, 0x09, 'H','M','B','C','-','C','o','n','s','o','l','e',   /* Complete Local Name */
+/* Shared device name — must fit in 31-byte ADV budget with other AD elements. */
+#define DEV_NAME_AD_LEN  14   /* length of "HMBC-Console" + type byte */
+#define DEV_NAME_STR     'H','M','B','C','-','C','o','n','s','o','l','e'
+
+/* ── Instance 0 (HID) — for Windows auto-pairing ────────────────────────── */
+
+/* ADV payload (25 B): flags + appearance(HID Generic) + UUID16(HID) + name */
+static const uint8_t s_hid_adv_raw[] = {
+    0x02, 0x01, 0x06,                         /* Flags: GEN_DISC | BREDR_NOT_SPT */
+    0x03, 0x19, 0xC0, 0x03,                   /* Appearance: 0x03C0 HID Generic */
+    0x03, 0x02, 0x12, 0x18,                   /* Complete List 16-bit UUIDs: HID 0x1812 */
+    0x0D, 0x09, DEV_NAME_STR,                 /* Complete Local Name */
 };
 
-/* Raw-encoded scan response (18 B):
- *   complete 128-bit NUS UUID. Active scanners (nRF Connect, the Electron
- * config tool) see this so they can pick us out among other "HMBC-Console"
- * devices by service. */
-static const uint8_t s_scan_rsp_raw[] = {
+static const esp_ble_gap_ext_adv_params_t s_hid_adv_params = {
+    .type           = ESP_BLE_GAP_SET_EXT_ADV_PROP_CONNECTABLE |
+                      ESP_BLE_GAP_SET_EXT_ADV_PROP_SCANNABLE |
+                      ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY,
+    .interval_min   = 0x20,            /* 20 ms */
+    .interval_max   = 0x40,            /* 40 ms */
+    .channel_map    = ADV_CHNL_ALL,
+    .own_addr_type  = BLE_ADDR_TYPE_PUBLIC,
+    .filter_policy  = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    .tx_power       = 0,
+    .primary_phy    = ESP_BLE_GAP_PRI_PHY_1M,
+    .max_skip       = 0,
+    .secondary_phy  = ESP_BLE_GAP_PHY_1M,
+    .sid            = HID_INSTANCE,
+    .scan_req_notif = false,
+};
+
+static const esp_ble_gap_ext_adv_t s_hid_adv_start = {
+    .instance   = HID_INSTANCE,
+    .duration   = 0,
+    .max_events = 0,
+};
+
+/* ── Instance 1 (NUS) — for Electron config tool ────────────────────────── */
+
+/* ADV payload (17 B): flags + name.
+ * NUS UUID goes in scan response so active scanners (Electron, nRF Connect)
+ * see it via scan request. */
+static const uint8_t s_nus_adv_raw[] = {
+    0x02, 0x01, 0x06,                         /* Flags: GEN_DISC | BREDR_NOT_SPT */
+    0x0D, 0x09, DEV_NAME_STR,                 /* Complete Local Name */
+};
+
+/* Scan response (18 B): complete 128-bit NUS service UUID. */
+static const uint8_t s_nus_scan_rsp_raw[] = {
     0x11, 0x07,
     0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
     0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E,
 };
 
-/* LEGACY + CONNECTABLE + SCANNABLE = legacy ADV_IND, the standard
- * connectable+scannable PDU type. All scanners (Windows, nRF Connect,
- * the Electron config tool) see this; the previous attempt to drop
- * SCANNABLE alone failed because non-LEGACY ext_adv has the
- * CONNECTABLE-/-SCANNABLE-exclusion rule, and the LEGACY-/-CONNECTABLE-
- * alone combination has no legacy PDU type to map to (the controller
- * rejected with HCI 0x12 "Invalid Param"). The full triple is the only
- * way to keep both `connectable` and `scannable` semantics in legacy mode.
- *
- * BLE 5.0 ext_adv rule: BTM (not the controller) rejects CONNECTABLE +
- * SCANNABLE without LEGACY — see `btm_ble_ext_adv_params_validate`. With
- * LEGACY set, the constraint flips to "CONNECTABLE requires SCANNABLE",
- * which is exactly what ADV_IND encodes.
- *
- * Trade-off: legacy ADV_IND stops at the controller level on the first
- * CONNECT_EVT (re-armed on DISCONNECT_EVT below). Two centrals (Windows
- * HID + config tool) can no longer coexist; Phase 7.3's multi-connection
- * goal is deferred — would need two advertising sets to recover. */
-static const esp_ble_gap_ext_adv_params_t s_ext_adv_params = {
+static const esp_ble_gap_ext_adv_params_t s_nus_adv_params = {
     .type           = ESP_BLE_GAP_SET_EXT_ADV_PROP_CONNECTABLE |
                       ESP_BLE_GAP_SET_EXT_ADV_PROP_SCANNABLE |
                       ESP_BLE_GAP_SET_EXT_ADV_PROP_LEGACY,
-    .interval_min   = 0x20,            /* 32 * 0.625 ms = 20 ms */
-    .interval_max   = 0x40,            /* 64 * 0.625 ms = 40 ms */
+    .interval_min   = 0x30,            /* 30 ms — slightly slower than HID */
+    .interval_max   = 0x60,            /* 60 ms */
     .channel_map    = ADV_CHNL_ALL,
     .own_addr_type  = BLE_ADDR_TYPE_PUBLIC,
     .filter_policy  = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-    .tx_power       = 0,               /* controller default */
+    .tx_power       = 0,
     .primary_phy    = ESP_BLE_GAP_PRI_PHY_1M,
     .max_skip       = 0,
     .secondary_phy  = ESP_BLE_GAP_PHY_1M,
-    .sid            = 0,
+    .sid            = NUS_INSTANCE,
     .scan_req_notif = false,
 };
 
-static const esp_ble_gap_ext_adv_t s_ext_adv_start = {
-    .instance   = ADV_INSTANCE,
-    .duration   = 0,        /* 0 = advertise indefinitely */
-    .max_events = 0,        /* 0 = unlimited */
+static const esp_ble_gap_ext_adv_t s_nus_adv_start = {
+    .instance   = NUS_INSTANCE,
+    .duration   = 0,
+    .max_events = 0,
 };
 
-/* True once ESP_GAP_BLE_EXT_ADV_START_COMPLETE_EVT comes back SUCCESS.
- * With ext_adv we don't need the old "pending vs active" pair — each
- * ext_adv step is its own command with its own completion event, and the
- * state machine in stack_gap_cb chains them in order. We only need this
- * flag so /hs/ can report "we're actually broadcasting" rather than
- * "we asked the controller to start". */
-static volatile bool s_adv_active = false;
+/* ── Advertising state machine ─────────────────────────────────────────────
+ * The two chains run sequentially: HID first, then NUS. Each chain is
+ * four steps: set_params → set_data → set_scan_rsp → start.
+ * The GAP callback advances the chain based on instance ID. */
+static volatile bool s_hid_adv_active = false;
+static volatile bool s_nus_adv_active = false;
 
-/* Kick off the four-step setup: set_params → set_data → set_scan_rsp →
- * start. Called once from ble_stack_start(); the GAP completion events
- * advance the chain. The same chain is re-triggered on DISCONNECT_EVT
- * because legacy ADV_IND stops at the controller level on connect. */
-static void start_ext_adv_chain(void)
+/* Forward declaration — the GAP callback references this. */
+static void start_nus_adv_chain(void);
+
+static void start_hid_adv_chain(void)
 {
-    esp_err_t ret = esp_ble_gap_ext_adv_set_params(ADV_INSTANCE, &s_ext_adv_params);
+    esp_err_t ret = esp_ble_gap_ext_adv_set_params(HID_INSTANCE, &s_hid_adv_params);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ext_adv_set_params failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "HID ext_adv_set_params failed: %s", esp_err_to_name(ret));
     }
+}
+
+static void start_nus_adv_chain(void)
+{
+    esp_err_t ret = esp_ble_gap_ext_adv_set_params(NUS_INSTANCE, &s_nus_adv_params);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "NUS ext_adv_set_params failed: %s", esp_err_to_name(ret));
+    }
+}
+
+/* Re-arm both advertising sets on disconnect. */
+static void rearm_all_advertising(void)
+{
+    s_hid_adv_active = false;
+    s_nus_adv_active = false;
+    start_hid_adv_chain();
 }
 
 /* ── Global GAP callback ─────────────────────────────────────────────────── */
 static void stack_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event) {
+    /* ── set_params completion ─────────────────────────────────────────── */
     case ESP_GAP_BLE_EXT_ADV_SET_PARAMS_COMPLETE_EVT:
         if (param->ext_adv_set_params.status == ESP_BT_STATUS_SUCCESS) {
-            esp_ble_gap_config_ext_adv_data_raw(ADV_INSTANCE,
-                                                sizeof(s_adv_raw), s_adv_raw);
+            uint8_t inst = param->ext_adv_set_params.instance;
+            const uint8_t *data = (inst == HID_INSTANCE) ? s_hid_adv_raw : s_nus_adv_raw;
+            size_t len = (inst == HID_INSTANCE) ? sizeof(s_hid_adv_raw) : sizeof(s_nus_adv_raw);
+            esp_ble_gap_config_ext_adv_data_raw(inst, len, data);
         } else {
-            ESP_LOGE(TAG, "ext_adv_set_params status %d",
+            ESP_LOGE(TAG, "ext_adv_set_params[%d] status %d",
+                     param->ext_adv_set_params.instance,
                      param->ext_adv_set_params.status);
         }
         break;
 
+    /* ── adv_data completion ───────────────────────────────────────────── */
     case ESP_GAP_BLE_EXT_ADV_DATA_SET_COMPLETE_EVT:
         if (param->ext_adv_data_set.status == ESP_BT_STATUS_SUCCESS) {
-            esp_ble_gap_config_ext_scan_rsp_data_raw(ADV_INSTANCE,
-                                                    sizeof(s_scan_rsp_raw),
-                                                    s_scan_rsp_raw);
+            uint8_t inst = param->ext_adv_data_set.instance;
+            if (inst == HID_INSTANCE) {
+                /* HID instance has no scan response — go straight to start. */
+                esp_ble_gap_ext_adv_start(1, &s_hid_adv_start);
+            } else {
+                /* NUS instance has scan response with NUS UUID. */
+                esp_ble_gap_config_ext_scan_rsp_data_raw(NUS_INSTANCE,
+                                                         sizeof(s_nus_scan_rsp_raw),
+                                                         s_nus_scan_rsp_raw);
+            }
         } else {
-            ESP_LOGE(TAG, "ext_adv_data_set status %d",
+            ESP_LOGE(TAG, "ext_adv_data_set[%d] status %d",
+                     param->ext_adv_data_set.instance,
                      param->ext_adv_data_set.status);
         }
         break;
 
+    /* ── scan_rsp completion (NUS instance only) ───────────────────────── */
     case ESP_GAP_BLE_EXT_SCAN_RSP_DATA_SET_COMPLETE_EVT:
         if (param->scan_rsp_set.status == ESP_BT_STATUS_SUCCESS) {
-            esp_ble_gap_ext_adv_start(1, &s_ext_adv_start);
+            /* NUS scan response is ready — start NUS advertising. */
+            esp_ble_gap_ext_adv_start(1, &s_nus_adv_start);
         } else {
-            ESP_LOGE(TAG, "ext_scan_rsp_set status %d",
+            ESP_LOGE(TAG, "ext_scan_rsp_set[%d] status %d",
+                     param->scan_rsp_set.instance,
                      param->scan_rsp_set.status);
         }
         break;
 
+    /* ── ext_adv_start completion ──────────────────────────────────────── */
     case ESP_GAP_BLE_EXT_ADV_START_COMPLETE_EVT:
         if (param->ext_adv_start.status == ESP_BT_STATUS_SUCCESS) {
-            s_adv_active = true;
-            ESP_LOGI(TAG, "advertising");
+            /* ext_adv_start reports num_set (count of started sets) but not
+             * which instance. We infer: if HID was not yet active, this is
+             * HID; otherwise it's NUS. */
+            if (!s_hid_adv_active) {
+                s_hid_adv_active = true;
+                ESP_LOGI(TAG, "HID advertising started (instance %d)", HID_INSTANCE);
+                /* Now kick off the NUS chain. */
+                start_nus_adv_chain();
+            } else {
+                s_nus_adv_active = true;
+                ESP_LOGI(TAG, "NUS advertising started (instance %d)", NUS_INSTANCE);
+            }
         } else {
             ESP_LOGE(TAG, "ext_adv_start status %d",
                      param->ext_adv_start.status);
@@ -215,9 +274,6 @@ static void stack_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
 static void stack_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                            esp_ble_gatts_cb_param_t *param)
 {
-    /* Claim the gatts_if for the slot whose app_id matches. Matching on app_id
-     * (not on table index like the IDF demo does) is what lets three profiles
-     * coexist — see the header comment. */
     if (event == ESP_GATTS_REG_EVT) {
         if (param->reg.status != ESP_GATT_OK) {
             ESP_LOGE(TAG, "app_id 0x%04x registration failed, status %d",
@@ -234,15 +290,9 @@ static void stack_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         }
     }
 
-    /* Phase 7.3 wrote this off because non-legacy ext_adv keeps broadcasting
-     * across connects — the controller doesn't stop on CONNECT_EVT. That's
-     * no longer true now that LEGACY is set: legacy ADV_IND stops at the
-     * controller level on the first CONNECT_EVT, so the device becomes
-     * invisible again the moment the central disconnects. Re-arm the chain
-     * on every disconnect so paired hosts can reconnect without a reboot.
-     * s_adv_active is set back to false so the EXT_ADV_START_COMPLETE_EVT
-     * that follows can flip it back to true (and so /hs/ accurately reports
-     * "not currently broadcasting" during the brief re-arm window). */
+    /* Dual advertising: each legacy ADV_IND instance stops independently
+     * when a central connects to it. We re-arm ALL instances on disconnect
+     * so the device is fully discoverable again. */
     if (event == ESP_GATTS_CONNECT_EVT) {
         if (s_conn_count < 0xFF) s_conn_count++;
         s_connected = true;
@@ -251,8 +301,7 @@ static void stack_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         if (s_conn_count == 0) {
             s_connected = false;
             s_bonded    = false;
-            s_adv_active = false;
-            start_ext_adv_chain();
+            rearm_all_advertising();
         }
     }
 
@@ -339,9 +388,7 @@ esp_err_t ble_stack_start(const char *dev_name)
         return ret;
     }
 
-    /* Security: bond with the central, no IO capability (Just Works). HID
-     * report characteristics are permission-gated on an encrypted link, so
-     * without this the host silently drops every report. */
+    /* Security: bond with the central, no IO capability (Just Works). */
     esp_ble_auth_req_t auth_req = ESP_LE_AUTH_BOND;
     esp_ble_io_cap_t   iocap    = ESP_IO_CAP_NONE;
     uint8_t            key_size = 16;
@@ -359,8 +406,7 @@ esp_err_t ble_stack_start(const char *dev_name)
         esp_ble_gap_set_device_name(dev_name);
     }
 
-    /* Register every profile. Each produces one ESP_GATTS_REG_EVT, which
-     * stack_gatts_cb routes to the matching slot. */
+    /* Register every profile. */
     for (int i = 0; i < BLE_STACK_MAX_PROFILES; i++) {
         if (!s_profiles[i].used) {
             continue;
@@ -372,14 +418,14 @@ esp_err_t ble_stack_start(const char *dev_name)
         }
     }
 
-    /* Phase 7.3: kick off the four-step BLE 5.0 ext_adv setup chain. The
-     * GAP callback advances set_data → set_scan_rsp → start on each
-     * completion event. */
-    start_ext_adv_chain();
+    /* Phase 7.5: start dual advertising chains. HID first, then NUS
+     * (NUS is kicked off by the GAP callback when HID completes). */
+    start_hid_adv_chain();
 
     s_started = true;
-    ESP_LOGI(TAG, "started with %d profile(s), name \"%s\"",
-             s_profile_count, dev_name ? dev_name : "(unset)");
+    ESP_LOGI(TAG, "started with %d profile(s), name \"%s\" (dual adv: HID=%d NUS=%d)",
+             s_profile_count, dev_name ? dev_name : "(unset)",
+             HID_INSTANCE, NUS_INSTANCE);
     return ESP_OK;
 }
 

@@ -327,6 +327,55 @@ async function connect () {
   const useAll = $('chk-all').checked
   scanDevices = []  // 重置扫描列表
   setStatus('搜索设备…', 'busy')
+
+  /* Try reconnecting to a previously authorized device first.
+   * navigator.bluetooth.getDevices() returns devices the origin has
+   * previously called requestDevice() for (cached across app restarts).
+   * This avoids the scan popup when the device is already known. */
+  if (!useAll) {
+    try {
+      if (navigator.bluetooth.getDevices) {
+        const knownDevices = await navigator.bluetooth.getDevices()
+        pushLog(`getDevices: 找到 ${knownDevices.length} 个已授权设备`, 'sys')
+        const match = knownDevices.find(
+          (d) => d.name && d.name.startsWith(DEVICE_NAME_PREFIX))
+        if (match) {
+          pushLog(`发现已授权设备 ${match.name || match.id}，正在重连…`, 'sys')
+          setStatus('重连中…', 'busy')
+          try {
+            device = match
+            device.addEventListener('gattserverdisconnected', onDisconnected)
+            const server = await device.gatt.connect()
+            const service = await server.getPrimaryService(NUS_SERVICE)
+            rxChar = await service.getCharacteristic(NUS_RX)
+            txChar = await service.getCharacteristic(NUS_TX)
+            await txChar.startNotifications()
+            txChar.addEventListener('characteristicvaluechanged', onTxChunk)
+            $('device-list').classList.add('hidden')
+            setStatus(`已连接 ${device.name || device.id}`, 'on')
+            setConnected(true)
+            pushLog('已订阅日志通道', 'sys')
+            sendCmd('p', true)
+            return
+          } catch (reconnErr) {
+            pushLog(`已授权设备连接失败：${reconnErr.message}，回退到扫描…`, 'sys')
+            if (device) {
+              device.removeEventListener('gattserverdisconnected', onDisconnected)
+              device = null
+            }
+          }
+        } else {
+          pushLog('未找到 HMBC 已授权设备，将进行扫描', 'sys')
+        }
+      } else {
+        pushLog('getDevices 不支持，将进行扫描', 'sys')
+      }
+    } catch (getDevErr) {
+      pushLog(`getDevices 出错：${getDevErr.message}，使用扫描`, 'sys')
+    }
+  }
+
+  /* Fallback: normal requestDevice() scan with popup. */
   try {
     device = await navigator.bluetooth.requestDevice(
       useAll
@@ -448,10 +497,11 @@ function onDeviceListUpdate (devices) {
         const tip = document.createElement('p')
         tip.className = 'hint'
         tip.textContent =
-          '10 秒内没扫到广播。请检查：① 设备已上电且未被其它中心设备占用；' +
+          '10 秒内没扫到广播。请检查：① 设备已上电；' +
           `② 广播名应为 ${DEVICE_NAME_PREFIX}-Console，若固件改过名字请勾选”显示所有设备”；` +
           '③ Electron 必须运行在原生 Windows/Linux 主机上，WSL 里没有蓝牙适配器；' +
-          '④ Windows 上先确认系统蓝牙已开启。'
+          '④ Windows 上先确认系统蓝牙已开启。' +
+          '⑤ 如曾连接过，可尝试点击"连接设备"直接重连已授权设备。'
         box.appendChild(tip)
         pushLog('扫描超时：未发现任何 BLE 设备', 'err')
         setStatus('未发现设备', null)
