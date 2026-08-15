@@ -32,6 +32,10 @@ static const char *TAG = "gesture_detect";
 #define GD_TASK_STACK_WORDS  4096
 #define GD_TASK_PRIORITY     5
 
+/* 1 = log every fire / suppress / cooldown / dominance-skip / snap decision.
+ * Very useful for tuning thresholds; set to 0 for production builds. */
+#define GD_DEBUG_FIRING      1
+
 /* ===== Module state ====================================================== */
 
 typedef enum {
@@ -71,6 +75,15 @@ typedef struct {
     float           q_drift[4];          /*!< runtime "neutral" pose (w,x,y,z) */
     bool            q_drift_valid;       /*!< false until detector has a fresh sample after apply_params */
     uint32_t        still_since_ms;      /*!< ms tick at which stillness began; 0 = not still */
+
+    /* ===== Smoothed velocity for dominance gate ===========================
+     * Raw frame-to-frame velocity is noisy — a single DMP glitch can
+     * produce a large spike on the tilt axis during a nod, causing the
+     * dominance gate to pick the wrong axis. Exponential moving average
+     * (α=0.3) smooths out spikes while staying responsive (~100ms
+     * time constant at 50 Hz). */
+    float           smooth_vel_nod;      /*!< EMA-smoothed |proj_nod| velocity */
+    float           smooth_vel_tilt;     /*!< EMA-smoothed |proj_tilt| velocity */
 } gd_t;
 
 /* Diagnostic snapshot of the most recent axis calibration, exposed via the
@@ -254,6 +267,8 @@ esp_err_t gesture_detect_apply_params(const gesture_params_t *params)
     memcpy(s_gd.q_drift, params->neutral.q_neutral, sizeof(s_gd.q_drift));
     s_gd.q_drift_valid  = false;
     s_gd.still_since_ms = 0;
+    s_gd.smooth_vel_nod  = 0.0f;
+    s_gd.smooth_vel_tilt = 0.0f;
     /* The neutral pose is packed; copy to an aligned mirror before passing
      * to log helpers. */
     neutral_pose_aligned_t np;
@@ -310,6 +325,8 @@ void gesture_detect_reset_q_drift(void)
 {
     s_gd.q_drift_valid  = false;
     s_gd.still_since_ms = 0;
+    s_gd.smooth_vel_nod  = 0.0f;
+    s_gd.smooth_vel_tilt = 0.0f;
 }
 
 /* ===== Event helper ====================================================== */
@@ -383,6 +400,13 @@ static bool step_axis(axis_ctx_t *ctx,
          * prevents the suppressed axis from immediately re-competing on the
          * very next tick after the dominant axis fired. */
         if (now_ms < s_gd.cooldown_until_ms) {
+#if GD_DEBUG_FIRING
+            if (absf(signed_rel) > trigger && abs_velocity > trigger_v) {
+                ESP_LOGI(TAG, "DBG-COOL proj=%+.1f vel=%.1f remaining=%ums",
+                         signed_rel, abs_velocity,
+                         (unsigned)(s_gd.cooldown_until_ms - now_ms));
+            }
+#endif
             break;
         }
         if (absf(signed_rel) > trigger && abs_velocity > trigger_v) {
@@ -392,10 +416,23 @@ static bool step_axis(axis_ctx_t *ctx,
             ctx->peak_abs_rel  = absf(signed_rel);
             ctx->peak_abs_vel  = abs_velocity;
             if (allow_fire) {
-                emit_event((signed_rel > 0) ? pos_gesture : neg_gesture,
-                           ctx->peak_abs_rel, ctx->peak_abs_vel);
+                gesture_type_t gt = (signed_rel > 0) ? pos_gesture : neg_gesture;
+#if GD_DEBUG_FIRING
+                ESP_LOGI(TAG, "DBG-FIRE type=%d proj=%+.1f vel=%.1f "
+                         "peak_a=%.1f peak_v=%.1f "
+                         "trig=%.1f trig_v=%.1f zone=%.1f deb=%u",
+                         (int)gt, signed_rel, abs_velocity,
+                         ctx->peak_abs_rel, ctx->peak_abs_vel,
+                         trigger, trigger_v, zone, (unsigned)debounce);
+#endif
+                emit_event(gt, ctx->peak_abs_rel, ctx->peak_abs_vel);
                 return true;
             }
+#if GD_DEBUG_FIRING
+            ESP_LOGI(TAG, "DBG-SUPP proj=%+.1f vel=%.1f "
+                     "(dominant axis took priority)",
+                     signed_rel, abs_velocity);
+#endif
             /* Suppressed by cross-axis mutex: rewind so this axis re-arms
              * cleanly for the next genuine gesture. */
             ctx->state = GD_AXIS_NEUTRAL;
@@ -484,7 +521,76 @@ static void detector_task(void *arg)
         float qd_conj[4]; quat_conj(s_gd.q_drift, qd_conj);
         float qrel[4];    quat_mul(qd_conj, qcur, qrel);
         quat_normalize(qrel);
-        float r[3];       quat_to_rotvec_deg(qrel, r);
+
+        /* Yaw decomposition: remove the rotation around the world vertical
+         * axis before converting to a rotation vector. Without this, a
+         * combined yaw+nod produces a nonlinear rotation vector whose
+         * projection leaks into the tilt axis (e.g. 90° yaw + 10° nod
+         * gives proj_nod ≈ proj_tilt ≈ 8°). By extracting the yaw
+         * quaternion qyaw and computing qnotyaw = conj(qyaw) ⊗ qrel,
+         * only the pitch/roll residual enters the rotation vector. */
+        float world_up[3] = {0.0f, 0.0f, 1.0f};
+        float up_body[3]; quat_rotate_vec(qd_conj, world_up, up_body);
+        float r[3];
+        if (v3_normalize(up_body) > 1e-6f) {
+            float v_dot_up = qrel[1]*up_body[0] + qrel[2]*up_body[1] + qrel[3]*up_body[2];
+            float yaw_half = atan2f(v_dot_up, qrel[0]);
+            float qyaw[4] = { cosf(yaw_half),
+                              sinf(yaw_half)*up_body[0],
+                              sinf(yaw_half)*up_body[1],
+                              sinf(yaw_half)*up_body[2] };
+            float qyaw_conj[4]; quat_conj(qyaw, qyaw_conj);
+            float qnotyaw[4]; quat_mul(qyaw_conj, qrel, qnotyaw);
+            quat_normalize(qnotyaw);
+            quat_to_rotvec_deg(qnotyaw, r);
+        } else {
+            quat_to_rotvec_deg(qrel, r);
+        }
+
+        /* Runtime glitch filter: reject DMP samples where the relative
+         * rotation exceeds what a human head can physically produce.
+         * At 50 Hz, 45°/frame = 2250°/s, already 10× the human limit
+         * (~200°/s). Anything above this is either a DMP FIFO glitch
+         * (single-frame spike) or a q_drift that has drifted far from
+         * the current pose (persistent large |r|). We distinguish the
+         * two with a streak counter: a real glitch is 1-2 frames, a
+         * drift is 5+ consecutive frames. On drift, snap q_drift to
+         * qcur to recover instead of rejecting forever. */
+        const float R_MAX_RUNTIME = 45.0f;
+        const uint32_t GLITCH_RESYNC_FRAMES = 5;
+        static uint32_t s_glitch_streak = 0;
+        float r_mag = v3_norm(r);
+        if (r_mag > R_MAX_RUNTIME) {
+            s_glitch_streak++;
+            if (s_glitch_streak >= GLITCH_RESYNC_FRAMES) {
+                /* Persistent offset: q_drift has drifted from the actual
+                 * device orientation. Snap q_drift to qcur (same as
+                 * `q reset` but automatic) so detection can resume. */
+                float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
+                          qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
+                if (d < 0.0f) {
+                    s_gd.q_drift[0] = -qcur[0]; s_gd.q_drift[1] = -qcur[1];
+                    s_gd.q_drift[2] = -qcur[2]; s_gd.q_drift[3] = -qcur[3];
+                } else {
+                    memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
+                }
+                s_glitch_streak = 0;
+                prev_valid = false;
+#if GD_DEBUG_FIRING
+                ESP_LOGW(TAG, "DBG-RESYNC q_drift→qcur after %u stale frames (|r| was %.1f°)",
+                         (unsigned)GLITCH_RESYNC_FRAMES, r_mag);
+#endif
+            } else {
+                prev_valid = false;
+#if GD_DEBUG_FIRING
+                ESP_LOGW(TAG, "DBG-GLITCH |r|=%.1f° (max %.0f°) streak=%u",
+                         r_mag, R_MAX_RUNTIME, (unsigned)s_glitch_streak);
+#endif
+            }
+            vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
+            continue;
+        }
+        s_glitch_streak = 0;
 
         /* Phase 6: rotate the calibrated nod/tilt axes into the current
          * q_drift frame so the projection stays correct as q_drift drifts
@@ -501,12 +607,41 @@ static void detector_task(void *arg)
         proj_nod  = apply_sign_pitch(proj_nod,  s_gd.params.sign_pitch);
         proj_tilt = apply_sign_roll (proj_tilt, s_gd.params.sign_roll);
 
-        /* Derivative-based velocity (degrees/sec). First sample uses 0. */
+        /* Derivative-based velocity (degrees/sec). First sample uses 0.
+         * Apply EMA smoothing (α=0.3) to suppress single-frame noise
+         * spikes that cause the dominance gate to pick the wrong axis.
+         *
+         * DMP noise can produce frame-to-frame projection jumps of 30°+
+         * even when |r| < 45° (the glitch filter threshold), yielding
+         * velocities of 1500°/s+. These extreme spikes contaminate the
+         * EMA for many ticks. Filter them out: only feed the EMA when
+         * the raw velocity is within a human-possible range (~200°/s
+         * peak, use 400°/s ceiling for safety). */
         float vel_nod = 0.0f, vel_tilt = 0.0f;
+        const float VEL_ALPHA = 0.3f;
+        const float VEL_MAX   = 400.0f;   /* °/s — skip EMA update above this */
         if (prev_valid) {
             float dt = (float)GD_TASK_PERIOD_MS / 1000.0f;
             vel_nod  = (proj_nod  - prev_nod)  / dt;
             vel_tilt = (proj_tilt - prev_tilt) / dt;
+            if (absf(vel_nod) <= VEL_MAX) {
+                s_gd.smooth_vel_nod  = VEL_ALPHA * absf(vel_nod)
+                                     + (1.0f - VEL_ALPHA) * s_gd.smooth_vel_nod;
+            }
+#if GD_DEBUG_FIRING
+            else {
+                ESP_LOGW(TAG, "DBG-VEL-CLAMP nod vel=%.0f°/s (max %.0f)", vel_nod, VEL_MAX);
+            }
+#endif
+            if (absf(vel_tilt) <= VEL_MAX) {
+                s_gd.smooth_vel_tilt = VEL_ALPHA * absf(vel_tilt)
+                                     + (1.0f - VEL_ALPHA) * s_gd.smooth_vel_tilt;
+            }
+#if GD_DEBUG_FIRING
+            else {
+                ESP_LOGW(TAG, "DBG-VEL-CLAMP tilt vel=%.0f°/s (max %.0f)", vel_tilt, VEL_MAX);
+            }
+#endif
         }
         prev_nod   = proj_nod;
         prev_tilt  = proj_tilt;
@@ -529,8 +664,9 @@ static void detector_task(void *arg)
                 if (absf(proj_nod)  > dbg_peak_nod)  dbg_peak_nod  = absf(proj_nod);
                 if (absf(proj_tilt) > dbg_peak_tilt) dbg_peak_tilt = absf(proj_tilt);
                 if ((now_ms - last_dbg_ms) >= 100) {
-                    ESP_LOGI(TAG, "DBG t=%u nod=%+.1f(v%+.0f) tilt=%+.1f(v%+.0f) peak:nod=%.1f tilt=%.1f",
-                             now_ms, proj_nod, vel_nod, proj_tilt, vel_tilt,
+                    ESP_LOGI(TAG, "DBG t=%u nod=%+.1f(v%+.0f s%.0f) tilt=%+.1f(v%+.0f s%.0f) peak:nod=%.1f tilt=%.1f",
+                             now_ms, proj_nod, vel_nod, s_gd.smooth_vel_nod,
+                             proj_tilt, vel_tilt, s_gd.smooth_vel_tilt,
                              dbg_peak_nod, dbg_peak_tilt);
                     last_dbg_ms = now_ms;
                 }
@@ -573,17 +709,19 @@ static void detector_task(void *arg)
          * faster, but a tilt axis can briefly cross its trigger threshold
          * before the nod does on a nod motion, firing the wrong label.
          *
-         * Require the dominant axis to exceed the other by 1.4× before any
-         * NEUTRAL→LOCKED transition. Mixed-direction motions (e.g. nodding
-         * with a clear left lean) get re-decided next tick when one axis
-         * clearly leads. */
+         * Use EMA-smoothed velocity instead of raw frame-to-frame derivative
+         * to suppress noise spikes that cause the wrong axis to appear
+         * dominant for a single tick. Require the dominant axis to exceed
+         * the other by 1.4× before any NEUTRAL→LOCKED transition. */
         const float DOMINANCE = 1.4f;
         bool nod_dominant;
-        if (absf(vel_nod) < 1.0f && absf(vel_tilt) < 1.0f) {
-            nod_dominant = absf(vel_nod) >= absf(vel_tilt);
+        float sv_nod  = s_gd.smooth_vel_nod;
+        float sv_tilt = s_gd.smooth_vel_tilt;
+        if (sv_nod < 1.0f && sv_tilt < 1.0f) {
+            nod_dominant = sv_nod >= sv_tilt;
         } else {
-            float ratio_nt = absf(vel_nod)  / (absf(vel_tilt) + 1e-3f);
-            float ratio_tn = absf(vel_tilt) / (absf(vel_nod)  + 1e-3f);
+            float ratio_nt = sv_nod  / (sv_tilt + 1e-3f);
+            float ratio_tn = sv_tilt / (sv_nod  + 1e-3f);
             if (ratio_nt >= DOMINANCE) {
                 nod_dominant = true;
             } else if (ratio_tn >= DOMINANCE) {
@@ -591,22 +729,37 @@ static void detector_task(void *arg)
             } else {
                 /* Neither axis dominates — mixed motion. Hold fire this tick
                  * and let the per-axis velocity check resolve on the next one. */
+#if GD_DEBUG_FIRING
+                ESP_LOGI(TAG, "DBG-DOM-SKIP proj_nod=%+.1f proj_tilt=%+.1f "
+                         "sv_nod=%.1f sv_tilt=%.1f r_nt=%.2f r_tn=%.2f (need %.1f)",
+                         proj_nod, proj_tilt, sv_nod, sv_tilt,
+                         ratio_nt, ratio_tn, DOMINANCE);
+#endif
                 vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
                 continue;
             }
         }
+        bool fired_this_tick = false;
         if (nod_dominant) {
-            step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
+            fired_this_tick = step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
                       GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ true);
             step_axis(&s_gd.roll,  proj_tilt, absf(vel_tilt), now_ms,
                       GESTURE_TILT_RIGHT, GESTURE_TILT_LEFT,
                       /* allow_fire = */ false);
         } else {
-            step_axis(&s_gd.roll,  proj_tilt, absf(vel_tilt), now_ms,
+            fired_this_tick = step_axis(&s_gd.roll,  proj_tilt, absf(vel_tilt), now_ms,
                       GESTURE_TILT_RIGHT, GESTURE_TILT_LEFT, /* allow_fire = */ true);
             step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
                       GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ false);
         }
+#if GD_DEBUG_FIRING
+        if (fired_this_tick) {
+            ESP_LOGI(TAG, "DBG-CTX proj_nod=%+.1f proj_tilt=%+.1f "
+                     "sv_nod=%.1f sv_tilt=%.1f dom=%s",
+                     proj_nod, proj_tilt, sv_nod, sv_tilt,
+                     nod_dominant ? "NOD" : "TILT");
+        }
+#endif
 
         /* Phase 5: sliding baseline snap. After STILL_DURATION_MS of rest
          * (both projections inside the dead zone), snap q_drift to the
@@ -634,6 +787,11 @@ static void detector_task(void *arg)
                     memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
                 }
                 s_gd.still_since_ms = now_ms;   /* re-arm the next still window */
+#if GD_DEBUG_FIRING
+                ESP_LOGI(TAG, "DBG-SNAP q_drift=[%.3f %.3f %.3f %.3f]",
+                         s_gd.q_drift[0], s_gd.q_drift[1],
+                         s_gd.q_drift[2], s_gd.q_drift[3]);
+#endif
             }
         } else {
             s_gd.still_since_ms = 0;
@@ -802,7 +960,7 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
     const uint32_t period_ms = 20;
     const uint32_t ticks     = duration_ms / period_ms;
     const float W_MIN           = 0.05f;
-    const float R_MAX_PER_FRAME = 90.0f;
+    const float R_MAX_PER_FRAME = 45.0f;   /* lowered from 90°: 45°/frame = 2250°/s, still 10× human limit */
     const float R_MOTION_MIN    = 4.0f;   /* |r| above this counts as "in motion" */
     const float R_PROJ_MIN      = 2.0f;   /* |proj_horizontal| above this counts as a nod-direction sample */
     const float SUM_MAG_MIN_DEG = 10.0f;  /* sanity gate: total accumulated horizontal nod motion must exceed this */
@@ -1102,7 +1260,7 @@ esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms)
     /* v3: average the in-motion tilt-direction r_perp's instead of taking
      * the single largest. Same approach as calibrate_axes' tilt pass. */
     const float W_MIN           = 0.05f;
-    const float R_MAX_PER_FRAME = 90.0f;
+    const float R_MAX_PER_FRAME = 45.0f;   /* lowered from 90°: same threshold as calibrate_axes */
     const float R_MOTION_MIN    = 4.0f;
     const float R_PROJ_MIN      = 2.0f;
     const float SUM_MAG_MIN_DEG = 10.0f;
