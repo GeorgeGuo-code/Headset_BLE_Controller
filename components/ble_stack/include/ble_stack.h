@@ -97,6 +97,18 @@ bool ble_stack_is_bonded(void);
 /** @brief True between ESP_GATTS_CONNECT_EVT and ESP_GATTS_DISCONNECT_EVT. */
 bool ble_stack_is_connected(void);
 
+/**
+ * @brief  Temporarily switch auth mode to ESP_LE_AUTH_BOND so that the next
+ *         esp_ble_set_encryption() call requests bonding (required by HID over
+ *         GATT on Windows).  The mode is automatically restored to
+ *         ESP_LE_AUTH_NO_BOND when ESP_GAP_BLE_AUTH_CMPL_EVT fires.
+ *
+ *         Call this from the HID profile's CONNECT handler, BEFORE
+ *         esp_ble_set_encryption().  NUS connections are unaffected because
+ *         they never call this function — they stay in NO_BOND mode.
+ */
+void ble_stack_request_bonding(void);
+
 #ifdef __cplusplus
 }
 #endif

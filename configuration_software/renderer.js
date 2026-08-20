@@ -423,10 +423,26 @@ function disconnect () {
   else onDisconnected()
 }
 
+const BLE_CHUNK_SIZE = 18   /* safe payload for MTU 23 (20 − 2 headroom) */
+
 async function sendCmd (cmd, quiet) {
   if (!rxChar) { pushLog('未连接，无法发送命令', 'err'); return }
+  const data = new TextEncoder().encode(cmd + '\n')
   try {
-    await rxChar.writeValue(new TextEncoder().encode(cmd + '\n'))
+    if (data.length <= BLE_CHUNK_SIZE) {
+      /* Short command — single write */
+      await rxChar.writeValue(data)
+    } else {
+      /* Long command — chunk into BLE_CHUNK_SIZE pieces.
+       * The firmware reassembles on its side (buffer until '\\n'). */
+      for (let off = 0; off < data.length; off += BLE_CHUNK_SIZE) {
+        const chunk = data.slice(off, Math.min(off + BLE_CHUNK_SIZE, data.length))
+        await rxChar.writeValue(chunk)
+        if (off + BLE_CHUNK_SIZE < data.length) {
+          await new Promise((r) => setTimeout(r, 30))
+        }
+      }
+    }
     if (!quiet) pushLog('> ' + cmd, 'tx')
   } catch (err) {
     pushLog(`发送 "${cmd}" 失败：${err.message || err}`, 'err')
@@ -821,7 +837,7 @@ function addRunProgram (cmd) {
     console.log('[addRunProgram] adding steps for path:', res.path)
     if (!cmd.steps) cmd.steps = []
     cmd.steps.push(
-      { kind: 'key', mod: 0, kc: 4 },       // Win+R
+      { kind: 'key', mod: 8, kc: 21 },       // Win+R (mod 8=Win, kc 21=R)
       { kind: 'sleep', ms: 350 },
       { kind: 'type', text: res.path },
       { kind: 'key', mod: 0, kc: 40 }        // Enter

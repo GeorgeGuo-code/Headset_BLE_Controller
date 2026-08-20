@@ -7,6 +7,7 @@
 #include "hidd_le_prf_int.h"
 #include <string.h>
 #include "esp_log.h"
+#include "ble_stack.h"
 
 /// characteristic presentation information
 struct prf_char_pres_fmt
@@ -570,6 +571,10 @@ void esp_hidd_prf_cb_hdl(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
 			memcpy(cb_param.connect.remote_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
             cb_param.connect.conn_id = param->connect.conn_id;
             hidd_clcb_alloc(param->connect.conn_id, param->connect.remote_bda);
+            /* Switch to BOND mode so that the security request includes the
+             * bonding flag (required by Windows HID).  The mode is restored
+             * to NO_BOND automatically when AUTH_CMPL_EVT fires. */
+            ble_stack_request_bonding();
             esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
             if(hidd_le_env.hidd_cb != NULL) {
                 (hidd_le_env.hidd_cb)(ESP_HIDD_EVENT_BLE_CONNECT, &cb_param);

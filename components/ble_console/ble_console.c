@@ -122,6 +122,14 @@ static volatile uint16_t    s_mtu           = 23;   /* default ATT MTU */
 static ble_console_cmd_cb_t s_cmd_cb        = NULL;
 static StreamBufferHandle_t s_tx_stream     = NULL;
 
+/* Chunked-write reassembly buffer. When the central sends a command that
+ * exceeds the BLE MTU, the client splits it into multiple small writes.
+ * We accumulate chunks here until we see a '\n', then dispatch the full
+ * command to s_cmd_cb. This complements the prepared-write (Long Write)
+ * path which handles the standard GATT Prepare/Execute mechanism. */
+static char     s_rx_asmb[CONSOLE_RX_MAX + 1];
+static uint16_t s_rx_asmb_len = 0;
+
 /* Prepared-write reassembly. The central sends "prepare write" chunks (each
  * ≤ MTU−3 bytes) and then "execute prepared writes" to commit. We buffer
  * each chunk at `param->write.offset` and only forward to s_cmd_cb on the
@@ -174,6 +182,7 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
     case ESP_GATTS_DISCONNECT_EVT:
         s_connected = false;
         s_notify_en = false;
+        s_rx_asmb_len = 0;
         prep_reset();
         ESP_LOGI(TAG, "central disconnected, reason 0x%x",
                  param->disconnect.reason);
@@ -223,18 +232,46 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
             s_notify_en = (cccd & 0x0001) != 0;
             ESP_LOGI(TAG, "TX notifications %s", s_notify_en ? "enabled" : "disabled");
         } else if (param->write.handle == s_handles[IDX_RX_VAL] && s_cmd_cb != NULL) {
-            char cmd[CONSOLE_RX_MAX + 1];
+            /* Chunked-write reassembly: the client may split a long command
+             * into multiple small writes (each ≤ MTU-3 bytes). We accumulate
+             * them in s_rx_asmb and only dispatch when we see '\n'. */
             uint16_t n = param->write.len;
-            if (n > CONSOLE_RX_MAX) {
-                n = CONSOLE_RX_MAX;
+            if (s_rx_asmb_len + n > CONSOLE_RX_MAX) {
+                ESP_LOGE(TAG, "rx reassembly overflow (%u + %u > %d) — discarding",
+                         (unsigned)s_rx_asmb_len, (unsigned)n, CONSOLE_RX_MAX);
+                s_rx_asmb_len = 0;
+                break;
             }
-            memcpy(cmd, param->write.value, n);
-            /* strip trailing CR/LF then NUL-terminate */
-            while (n > 0 && (cmd[n - 1] == '\n' || cmd[n - 1] == '\r')) {
-                n--;
+            memcpy(s_rx_asmb + s_rx_asmb_len, param->write.value, n);
+            s_rx_asmb_len += n;
+
+            /* Scan for '\n' — may be at the end of this chunk or inside it. */
+            while (s_rx_asmb_len > 0) {
+                /* Find the first '\n' in the buffer. */
+                uint16_t nl_pos = 0;
+                while (nl_pos < s_rx_asmb_len && s_rx_asmb[nl_pos] != '\n') {
+                    nl_pos++;
+                }
+                if (nl_pos >= s_rx_asmb_len) {
+                    /* No '\n' yet — wait for more data. */
+                    break;
+                }
+                /* Found '\n' at nl_pos. Extract the command (0..nl_pos-1). */
+                uint16_t cmd_len = nl_pos;
+                /* Strip trailing CR. */
+                while (cmd_len > 0 &&
+                       (s_rx_asmb[cmd_len - 1] == '\r')) {
+                    cmd_len--;
+                }
+                s_rx_asmb[cmd_len] = '\0';
+                s_cmd_cb(s_rx_asmb, cmd_len);
+                /* Shift remaining data to front. */
+                uint16_t rem = s_rx_asmb_len - (nl_pos + 1);
+                if (rem > 0) {
+                    memmove(s_rx_asmb, s_rx_asmb + nl_pos + 1, rem);
+                }
+                s_rx_asmb_len = rem;
             }
-            cmd[n] = '\0';
-            s_cmd_cb(cmd, n);
         }
         break;
 

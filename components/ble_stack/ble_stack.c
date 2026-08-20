@@ -256,6 +256,14 @@ static void stack_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
             ESP_LOGE(TAG, "pairing failed, reason 0x%x",
                      param->ble_security.auth_cmpl.fail_reason);
         }
+        /* Restore NO_BOND mode so that NUS (config-tool) connections do not
+         * trigger a security request.  See ble_stack_request_bonding(). */
+        {
+            esp_ble_auth_req_t no_bond = ESP_LE_AUTH_NO_BOND;
+            esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE,
+                                           &no_bond, sizeof(no_bond));
+            ESP_LOGI(TAG, "auth mode restored to NO_BOND");
+        }
         break;
 
     default:
@@ -388,8 +396,13 @@ esp_err_t ble_stack_start(const char *dev_name)
         return ret;
     }
 
-    /* Security: bond with the central, no IO capability (Just Works). */
-    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_BOND;
+    /* Security: NO_BOND mode — the device does NOT force pairing on every
+     * connection.  HID still gets encrypted because hid_device_le_prf.c
+     * explicitly calls esp_ble_set_encryption() on connect (line 573),
+     * which makes Windows initiate pairing.  The NUS config-tool connection
+     * stays unencrypted, which avoids the Web-Bluetooth bonding failures
+     * that caused every GATT write to fail and the link to drop. */
+    esp_ble_auth_req_t auth_req = ESP_LE_AUTH_NO_BOND;
     esp_ble_io_cap_t   iocap    = ESP_IO_CAP_NONE;
     uint8_t            key_size = 16;
     uint8_t            init_key = ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK;
@@ -437,4 +450,12 @@ bool ble_stack_is_bonded(void)
 bool ble_stack_is_connected(void)
 {
     return s_connected;
+}
+
+void ble_stack_request_bonding(void)
+{
+    esp_ble_auth_req_t bond = ESP_LE_AUTH_BOND;
+    esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE,
+                                   &bond, sizeof(bond));
+    ESP_LOGI(TAG, "auth mode temporarily set to BOND (for HID pairing)");
 }
