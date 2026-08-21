@@ -387,9 +387,13 @@ async function connect () {
     setStatus('连接中…', 'busy')
 
     const server = await device.gatt.connect()
+    pushLog(`[CONN] GATT server connected`, 'sys')
     const service = await server.getPrimaryService(NUS_SERVICE)
+    pushLog(`[CONN] got service ${NUS_SERVICE}`, 'sys')
     rxChar = await service.getCharacteristic(NUS_RX)
     txChar = await service.getCharacteristic(NUS_TX)
+    pushLog(`[CONN] RX props: ${JSON.stringify(rxChar.properties)}`, 'sys')
+    pushLog(`[CONN] TX props: ${JSON.stringify(txChar.properties)}`, 'sys')
 
     await txChar.startNotifications()
     txChar.addEventListener('characteristicvaluechanged', onTxChunk)
@@ -428,23 +432,30 @@ const BLE_CHUNK_SIZE = 18   /* safe payload for MTU 23 (20 − 2 headroom) */
 async function sendCmd (cmd, quiet) {
   if (!rxChar) { pushLog('未连接，无法发送命令', 'err'); return }
   const data = new TextEncoder().encode(cmd + '\n')
+  pushLog(`[TX] cmd len=${cmd.length}, encoded=${data.length} bytes, chunks=${Math.ceil(data.length / BLE_CHUNK_SIZE)}`, 'sys')
   try {
     if (data.length <= BLE_CHUNK_SIZE) {
       /* Short command — single write */
+      pushLog(`[TX] single write ${data.length} bytes`, 'sys')
       await rxChar.writeValue(data)
     } else {
       /* Long command — chunk into BLE_CHUNK_SIZE pieces.
        * The firmware reassembles on its side (buffer until '\\n'). */
+      const totalChunks = Math.ceil(data.length / BLE_CHUNK_SIZE)
       for (let off = 0; off < data.length; off += BLE_CHUNK_SIZE) {
         const chunk = data.slice(off, Math.min(off + BLE_CHUNK_SIZE, data.length))
+        const seq = Math.floor(off / BLE_CHUNK_SIZE) + 1
+        pushLog(`[TX] chunk ${seq}/${totalChunks}: ${chunk.length} bytes`, 'sys')
         await rxChar.writeValue(chunk)
         if (off + BLE_CHUNK_SIZE < data.length) {
           await new Promise((r) => setTimeout(r, 30))
         }
       }
     }
+    pushLog(`[TX] OK: "${cmd.substring(0, 60)}${cmd.length > 60 ? '...' : ''}"`, 'ok')
     if (!quiet) pushLog('> ' + cmd, 'tx')
   } catch (err) {
+    pushLog(`[TX] FAILED: ${err.message || err}`, 'err')
     pushLog(`发送 "${cmd}" 失败：${err.message || err}`, 'err')
   }
 }
@@ -694,9 +705,15 @@ function renderConfigs () {
     const delBtn = document.createElement('button')
     delBtn.className = 'btn-del'
     delBtn.textContent = '✕ 删除'
-    delBtn.addEventListener('click', () => {
+    delBtn.addEventListener('click', async () => {
+      // 从本地列表移除
       commands = commands.filter((x) => x.id !== cmd.id)
       renderConfigs()
+      // 如果已连接，也从设备删除
+      if (rxChar) {
+        pushLog(`正在从设备删除配置 #${cmd.id}…`, 'sys')
+        await sendCmd(`cmd del ${cmd.id}`)
+      }
     })
     row1.append(numSpan, delBtn)
 
@@ -1038,12 +1055,15 @@ $('key-dialog').addEventListener('click', (e) => {
 
 async function syncConfigsToDevice () {
   if (!rxChar) { pushLog('未连接', 'err'); return }
-  pushLog(`正在同步 ${commands.length} 个命令到设备…`, 'sys')
+  pushLog(`[SYNC] 同步 ${commands.length} 个命令到设备…`, 'sys')
   for (const cmd of commands) {
     const bitmask = triggersToBitmask(cmd.triggers)
     const seq = commandToSeqText(cmd)
     const c = `cmd set ${cmd.id} ${configName || 'cmd' + cmd.id} gesture ${bitmask} ${seq}`
+    pushLog(`[SYNC] 命令 #${cmd.id}: triggers=${JSON.stringify(cmd.triggers)} bitmask=${bitmask}`, 'sys')
+    pushLog(`[SYNC] seq: ${seq}`, 'sys')
     await sendCmd(c, true)
+    pushLog(`[SYNC] 等待 100ms...`, 'sys')
     await new Promise((r) => setTimeout(r, 100))
   }
   pushLog('同步完成', 'ok')
@@ -1055,6 +1075,40 @@ async function readConfigsFromDevice () {
   pushLog('正在从设备读取配置…', 'sys')
   await sendCmd('cmd list', true)
   setTimeout(() => processConfigList(), 500)
+}
+
+async function deleteConfigFromDevice (id) {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  cfgResponseBuf = []
+  pushLog(`正在删除配置 #${id}…`, 'sys')
+  await sendCmd(`cmd del ${id}`)
+  // 等待响应
+  await new Promise((r) => setTimeout(r, 300))
+  // 重新读取配置列表
+  await readConfigsFromDevice()
+}
+
+async function deleteAllConfigsFromDevice () {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  if (!confirm('确定要删除设备上的所有配置吗？此操作不可撤销。')) return
+  pushLog('正在删除设备所有配置…', 'sys')
+  // 先读取当前配置
+  cfgResponseBuf = []
+  await sendCmd('cmd list', true)
+  await new Promise((r) => setTimeout(r, 500))
+  // 解析并删除每个配置
+  for (const line of cfgResponseBuf) {
+    const m = line.match(/cfg: id=(\d+)/)
+    if (m) {
+      const id = m[1]
+      pushLog(`删除配置 #${id}…`, 'sys')
+      await sendCmd(`cmd del ${id}`)
+      await new Promise((r) => setTimeout(r, 100))
+    }
+  }
+  commands = []
+  renderConfigs()
+  pushLog('已删除所有配置', 'ok')
 }
 
 function trackConfigResponse (line) {
@@ -1153,6 +1207,7 @@ async function loadConfigsFromFile () {
 $('btn-cfg-new').addEventListener('click', addNewConfig)
 $('btn-cfg-sync').addEventListener('click', syncConfigsToDevice)
 $('btn-cfg-read').addEventListener('click', readConfigsFromDevice)
+$('btn-cfg-del-all').addEventListener('click', deleteAllConfigsFromDevice)
 $('btn-cfg-save').addEventListener('click', saveConfigsToFile)
 $('btn-cfg-load').addEventListener('click', loadConfigsFromFile)
 

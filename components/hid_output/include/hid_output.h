@@ -114,15 +114,14 @@ esp_err_t hid_output_open_path(const char *path);
 
 /* ── Multi-step sequences (Phase 8) ──────────────────────────────────────── */
 
-/** Max characters in a single `type` step's payload. ASCII paths, short
- *  search queries, etc. Longer strings are the job of the dedicated `o`
- *  command (hid_output_open_path), which has no in-band length limit. */
-#define HID_SEQ_TEXT_MAX  32
+/** Max characters in a single `type` step's payload. 64 bytes covers most
+ *  Windows paths including CJK characters (3 bytes each in UTF-8). */
+#define HID_SEQ_TEXT_MAX  64
 
-/** Max steps in a single `seq` command. The whole sequence is one queue
- *  item; this caps the per-item memory budget at ~640 B. 16 is enough for
- *  realistic scripts ("open app → wait → type → enter" = 4 steps). */
-#define HID_SEQ_MAX_STEPS 16
+/** Max steps in a single `seq` command. 8 steps is enough for realistic
+ *  scripts ("open app → wait → type → enter" = 4 steps). Kept small to
+ *  keep hid_req_t under 1024 B with HID_SEQ_TEXT_MAX = 64. */
+#define HID_SEQ_MAX_STEPS 8
 
 /** Step kinds inside a `seq` sequence. */
 typedef enum {

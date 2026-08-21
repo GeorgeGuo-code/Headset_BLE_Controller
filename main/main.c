@@ -556,11 +556,20 @@ static bool handle_hid_command(const char *cmd)
             cfg.trigger_value = (uint16_t)tval;
 
             if (*q) {
-                esp_err_t err = cmd_config_parse_seq(q, cfg.steps, (size_t *)&cfg.n_steps);
+                size_t n_steps = 0;
+                esp_err_t err = cmd_config_parse_seq(q, cfg.steps, &n_steps);
+                cfg.n_steps = (uint8_t)n_steps;
                 if (err != ESP_OK) {
                     ble_console_logf("cmd set: bad seq text: %s\n", esp_err_to_name(err));
                     return true;
                 }
+            }
+
+            /* Debug: hex dump steps AFTER parse, BEFORE set */
+            for (uint8_t i = 0; i < cfg.n_steps; i++) {
+                const uint8_t *raw = (const uint8_t *)&cfg.steps[i];
+                ESP_LOGI("cmd_set", "[AFTER_PARSE] step[%u] raw[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X",
+                         (unsigned)i, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
             }
 
             esp_err_t err = cmd_config_set(&cfg);
@@ -967,7 +976,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ble_console_init(on_console_cmd));  /* app_id 0x0055 */
     ESP_ERROR_CHECK(ble_stack_start(BLE_DEVICE_NAME));
 
-    xTaskCreate(cal_worker_task,  "cal_worker",  4096, NULL, 3, NULL);
+    xTaskCreate(cal_worker_task,  "cal_worker",  8192, NULL, 3, NULL);
     xTaskCreate(boot_button_task, "boot_button", 4096, NULL, 3, NULL);
 
     /* 5. UART REPL — HID smoke tests without a BLE central. Started last so

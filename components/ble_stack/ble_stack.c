@@ -245,11 +245,17 @@ static void stack_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
     /* HID over GATT mandates an encrypted link; accept the central's pairing
      * request. Mirrors reference/ble_hidd_demo_main.c. */
     case ESP_GAP_BLE_SEC_REQ_EVT:
+        ESP_LOGI(TAG, "[SEC] SEC_REQ from "ESP_BD_ADDR_STR"",
+                 ESP_BD_ADDR_HEX(param->ble_security.ble_req.bd_addr));
         esp_ble_gap_security_rsp(param->ble_security.ble_req.bd_addr, true);
         break;
 
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
         s_bonded = param->ble_security.auth_cmpl.success;
+        ESP_LOGI(TAG, "[SEC] AUTH_CMPL: success=%d fail_reason=0x%x addr="ESP_BD_ADDR_STR"",
+                 (int)param->ble_security.auth_cmpl.success,
+                 param->ble_security.auth_cmpl.fail_reason,
+                 ESP_BD_ADDR_HEX(param->ble_security.auth_cmpl.bd_addr));
         if (s_bonded) {
             ESP_LOGI(TAG, "pairing OK — link encrypted, HID reports enabled");
         } else {
@@ -262,7 +268,7 @@ static void stack_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *p
             esp_ble_auth_req_t no_bond = ESP_LE_AUTH_NO_BOND;
             esp_ble_gap_set_security_param(ESP_BLE_SM_AUTHEN_REQ_MODE,
                                            &no_bond, sizeof(no_bond));
-            ESP_LOGI(TAG, "auth mode restored to NO_BOND");
+            ESP_LOGI(TAG, "[SEC] auth mode restored to NO_BOND");
         }
         break;
 
@@ -304,7 +310,13 @@ static void stack_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
     if (event == ESP_GATTS_CONNECT_EVT) {
         if (s_conn_count < 0xFF) s_conn_count++;
         s_connected = true;
+        ESP_LOGI(TAG, "[CONN] CONNECT conn_id=%u gatts_if=%d addr="ESP_BD_ADDR_STR" count=%d",
+                 (unsigned)param->connect.conn_id, (int)gatts_if,
+                 ESP_BD_ADDR_HEX(param->connect.remote_bda), (int)s_conn_count);
     } else if (event == ESP_GATTS_DISCONNECT_EVT) {
+        ESP_LOGI(TAG, "[CONN] DISCONNECT conn_id=%u reason=0x%x count=%d",
+                 (unsigned)param->disconnect.conn_id,
+                 param->disconnect.reason, (int)s_conn_count - 1);
         if (s_conn_count > 0) s_conn_count--;
         if (s_conn_count == 0) {
             s_connected = false;

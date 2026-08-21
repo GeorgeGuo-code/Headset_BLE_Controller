@@ -176,23 +176,24 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         s_conn_id   = param->connect.conn_id;
         s_connected = true;
         s_mtu       = 23;
-        ESP_LOGI(TAG, "central connected, conn_id = %d", s_conn_id);
+        ESP_LOGI(TAG, "[CONN] NUS central connected, conn_id=%d", s_conn_id);
         break;
 
     case ESP_GATTS_DISCONNECT_EVT:
+        ESP_LOGI(TAG, "[CONN] NUS central disconnected, conn_id=%d reason=0x%x",
+                 s_conn_id, param->disconnect.reason);
         s_connected = false;
         s_notify_en = false;
         s_rx_asmb_len = 0;
         prep_reset();
-        ESP_LOGI(TAG, "central disconnected, reason 0x%x",
-                 param->disconnect.reason);
         /* ble_stack owns the re-advertise — it gets one DISCONNECT_EVT per
          * registered app_id and must not fire three start_advertising calls. */
         break;
 
     case ESP_GATTS_MTU_EVT:
         s_mtu = param->mtu.mtu;
-        ESP_LOGI(TAG, "MTU negotiated = %d", s_mtu);
+        ESP_LOGI(TAG, "[CONN] MTU negotiated = %d (max RX payload = %d bytes)",
+                 s_mtu, s_mtu > 3 ? s_mtu - 3 : 20);
         break;
 
     case ESP_GATTS_WRITE_EVT:
@@ -236,6 +237,17 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
              * into multiple small writes (each ≤ MTU-3 bytes). We accumulate
              * them in s_rx_asmb and only dispatch when we see '\n'. */
             uint16_t n = param->write.len;
+            ESP_LOGI(TAG, "[RX] write: handle=%u len=%u is_prep=%d offset=%u",
+                     (unsigned)param->write.handle, (unsigned)n,
+                     (int)param->write.is_prep, (unsigned)param->write.offset);
+            /* Log first few bytes as hex for debugging */
+            char hexbuf[81];
+            int hpos = 0;
+            for (int i = 0; i < n && i < 20 && hpos < (int)sizeof(hexbuf) - 4; i++) {
+                hpos += snprintf(hexbuf + hpos, sizeof(hexbuf) - hpos, "%02X ", param->write.value[i]);
+            }
+            ESP_LOGI(TAG, "[RX] data(hex): %s", hexbuf);
+
             if (s_rx_asmb_len + n > CONSOLE_RX_MAX) {
                 ESP_LOGE(TAG, "rx reassembly overflow (%u + %u > %d) — discarding",
                          (unsigned)s_rx_asmb_len, (unsigned)n, CONSOLE_RX_MAX);
@@ -244,6 +256,7 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
             }
             memcpy(s_rx_asmb + s_rx_asmb_len, param->write.value, n);
             s_rx_asmb_len += n;
+            ESP_LOGI(TAG, "[RX] asmb now %u bytes", (unsigned)s_rx_asmb_len);
 
             /* Scan for '\n' — may be at the end of this chunk or inside it. */
             while (s_rx_asmb_len > 0) {
@@ -254,6 +267,7 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                 }
                 if (nl_pos >= s_rx_asmb_len) {
                     /* No '\n' yet — wait for more data. */
+                    ESP_LOGI(TAG, "[RX] no \\n yet, waiting for more data");
                     break;
                 }
                 /* Found '\n' at nl_pos. Extract the command (0..nl_pos-1). */
@@ -264,6 +278,7 @@ static void console_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                     cmd_len--;
                 }
                 s_rx_asmb[cmd_len] = '\0';
+                ESP_LOGI(TAG, "[RX] dispatch cmd (%u bytes): %.80s", (unsigned)cmd_len, s_rx_asmb);
                 s_cmd_cb(s_rx_asmb, cmd_len);
                 /* Shift remaining data to front. */
                 uint16_t rem = s_rx_asmb_len - (nl_pos + 1);

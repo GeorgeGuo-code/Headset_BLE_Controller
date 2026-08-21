@@ -94,6 +94,8 @@ esp_err_t cmd_config_parse_seq(const char *text, hid_seq_step_t *steps, size_t *
         while (te < end && *te != ' ' && *te != '\t') te++;
         size_t tlen = (size_t)(te - tok);
 
+        ESP_LOGI(TAG, "[PARSE] step %u: keyword='%.8s' tlen=%u", (unsigned)n, tok, (unsigned)tlen);
+
         if (tlen == 5 && strncmp(tok, "sleep", 5) == 0) {
             long ms;
             if (spi(te, end, &ms) == NULL || ms <= 0 || ms > 60000) {
@@ -102,6 +104,7 @@ esp_err_t cmd_config_parse_seq(const char *text, hid_seq_step_t *steps, size_t *
             }
             steps[n].kind      = HID_SEQ_SLEEP;
             steps[n].u.sleep.ms = (uint16_t)ms;
+            ESP_LOGI(TAG, "[PARSE] -> SLEEP %lu ms", ms);
             n++;
         } else if (tlen == 3 && strncmp(tok, "key", 3) == 0) {
             long mod, kc;
@@ -109,10 +112,16 @@ esp_err_t cmd_config_parse_seq(const char *text, hid_seq_step_t *steps, size_t *
                 ESP_LOGW(TAG, "parse: bad key args");
                 return ESP_ERR_INVALID_ARG;
             }
+            ESP_LOGI(TAG, "[PARSE] BEFORE assign: steps[%u].kind=%d", (unsigned)n, (int)steps[n].kind);
             steps[n].kind             = HID_SEQ_KEY;
+            ESP_LOGI(TAG, "[PARSE] AFTER kind=KEY: steps[%u].kind=%d", (unsigned)n, (int)steps[n].kind);
             steps[n].u.key.modifiers  = (uint8_t)mod;
+            ESP_LOGI(TAG, "[PARSE] AFTER modifiers: steps[%u].kind=%d", (unsigned)n, (int)steps[n].kind);
             steps[n].u.key.keycode    = (uint8_t)kc;
+            ESP_LOGI(TAG, "[PARSE] AFTER keycode: steps[%u].kind=%d", (unsigned)n, (int)steps[n].kind);
             steps[n].u.key.hold_ms    = 0;
+            ESP_LOGI(TAG, "[PARSE] AFTER hold_ms: steps[%u].kind=%d", (unsigned)n, (int)steps[n].kind);
+            ESP_LOGI(TAG, "[PARSE] -> KEY mod=%lu kc=%lu", mod, kc);
             n++;
         } else if (tlen == 4 && strncmp(tok, "type", 4) == 0) {
             const char *text_start = te;
@@ -180,8 +189,14 @@ esp_err_t cmd_config_format_seq(const cmd_config_t *cfg, char *out, size_t out_s
     size_t pos = 0;
 
     for (uint8_t i = 0; i < cfg->n_steps && i < HID_SEQ_MAX_STEPS; i++) {
-        char buf[128];
+        char buf[HID_SEQ_TEXT_MAX + 16];  /* "type " prefix (5) + text + NUL */
         const hid_seq_step_t *s = &cfg->steps[i];
+
+        /* Hex dump first 8 bytes to compare with SET */
+        const uint8_t *raw = (const uint8_t *)s;
+        ESP_LOGI(TAG, "[FMT] step %u: kind=%d raw[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X",
+                 (unsigned)i, (int)s->kind,
+                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
 
         switch (s->kind) {
         case HID_SEQ_SLEEP:
@@ -249,6 +264,9 @@ esp_err_t cmd_config_init(void)
         cmd_config_t cfg;
         size_t size = sizeof(cfg);
         err = nvs_get_blob(h, key, &cfg, &size);
+        ESP_LOGI(TAG, "[INIT] load cfg_%u: err=%s size=%u expected=%u id=%u",
+                 (unsigned)(i + 1), esp_err_to_name(err),
+                 (unsigned)size, (unsigned)sizeof(cfg), (unsigned)cfg.id);
         if (err == ESP_OK && cfg.id == (i + 1) && size == sizeof(cfg)) {
             s_configs[i] = cfg;
         } else {
@@ -265,12 +283,25 @@ const cmd_config_t *cmd_config_get(uint8_t id)
 {
     if (id < 1 || id > CMD_CFG_MAX) return NULL;
     if (s_configs[id - 1].id == 0) return NULL;
-    return &s_configs[id - 1];
+    const cmd_config_t *cfg = &s_configs[id - 1];
+    ESP_LOGI(TAG, "[GET] id=%u n_steps=%u steps[0].kind=%d",
+             (unsigned)cfg->id, (unsigned)cfg->n_steps, (int)cfg->steps[0].kind);
+    return cfg;
 }
 
 esp_err_t cmd_config_set(const cmd_config_t *cfg)
 {
     if (!cfg || cfg->id < 1 || cfg->id > CMD_CFG_MAX) return ESP_ERR_INVALID_ARG;
+
+    ESP_LOGI(TAG, "[SET] id=%u name='%s' n_steps=%u sizeof(cmd_config_t)=%u",
+             (unsigned)cfg->id, cfg->name, (unsigned)cfg->n_steps,
+             (unsigned)sizeof(cmd_config_t));
+    /* Hex dump first 8 bytes of each step to verify kind field */
+    for (uint8_t i = 0; i < cfg->n_steps && i < HID_SEQ_MAX_STEPS; i++) {
+        const uint8_t *raw = (const uint8_t *)&cfg->steps[i];
+        ESP_LOGI(TAG, "[SET]   step[%u] raw[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X",
+                 (unsigned)i, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+    }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_configs[cfg->id - 1] = *cfg;
