@@ -27,6 +27,12 @@
 
 /* Forward decl: defined later in this file, used by the REQ_SEQ branch. */
 static bool ascii_to_hid(char c, uint8_t *mod, uint8_t *keycode);
+static int  utf8_decode(const char *p, uint32_t *out);
+
+/* How long to wait between Win+R and the first path char. Windows pops the
+ * Run dialog in ~150–250 ms on a fresh boot; 350 ms is enough headroom for
+ * older machines without making the path-open feel sluggish. */
+#define HID_RUN_DIALOG_OPEN_MS 350
 
 typedef enum {
     REQ_KEYBOARD,
@@ -199,19 +205,114 @@ static void hid_worker_task(void *arg)
                 }
 
                 case HID_SEQ_TYPE:
-                    /* Press → 30 ms → release per char. Unmappable bytes
-                     * (non-ASCII) are skipped with a per-char warn, matching
-                     * hid_output_type_string()'s user-visible behaviour. */
-                    for (uint8_t j = 0; j < s->u.type.len; j++) {
-                        uint8_t mod = 0, kc = 0;
-                        if (!ascii_to_hid(s->u.type.text[j], &mod, &kc)) {
-                            ESP_LOGW(TAG, "seq type: skip byte 0x%02x", (unsigned)s->u.type.text[j]);
-                            continue;
+                    /* Check if text contains non-ASCII characters */
+                    {
+                        bool has_non_ascii = false;
+                        for (uint8_t j = 0; j < s->u.type.len; j++) {
+                            if ((uint8_t)s->u.type.text[j] >= 0x80) {
+                                has_non_ascii = true;
+                                break;
+                            }
                         }
-                        uint8_t k[4] = { kc, 0, 0, 0 };
-                        esp_hidd_send_keyboard_value(id, mod, k, 1);
-                        vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
-                        esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+
+                        if (!has_non_ascii) {
+                            /* Pure ASCII: type normally via HID keyboard */
+                            const char *tp = s->u.type.text;
+                            const char *tend = tp + s->u.type.len;
+                            while (tp < tend) {
+                                uint8_t mod = 0, kc = 0;
+                                if (ascii_to_hid(*tp, &mod, &kc)) {
+                                    uint8_t k[4] = { kc, 0, 0, 0 };
+                                    esp_hidd_send_keyboard_value(id, mod, k, 1);
+                                    vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+                                    esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+                                }
+                                tp++;
+                            }
+                        } else {
+                            /* Non-ASCII: use clipboard method.
+                             * 1. Build PowerShell command with \uXXXX escapes (all ASCII)
+                             * 2. Type command → Enter → wait for PS
+                             * 3. Win+R → new Run dialog → Ctrl+V to paste */
+                            ESP_LOGI(TAG, "seq type: non-ASCII detected, using clipboard method");
+
+                            /* Build: powershell -c "Add-Type -A System.Windows.Forms;[System.Windows.Forms.Clipboard]::SetText([regex]::Unescape('...'))" */
+                            char cmd[384];
+                            int pos = snprintf(cmd, sizeof(cmd),
+                                "powershell -c \"Add-Type -A System.Windows.Forms;"
+                                "[System.Windows.Forms.Clipboard]::SetText("
+                                "[regex]::Unescape('");
+
+                            const char *tp = s->u.type.text;
+                            const char *tend = tp + s->u.type.len;
+                            while (tp < tend && pos < (int)(sizeof(cmd) - 30)) {
+                                uint32_t cp = 0xFFFD;
+                                int blen = utf8_decode(tp, &cp);
+                                if (blen == 0) break;
+                                if (cp == '\\' || cp == '\'') {
+                                    /* Escape backslash and single quote for regex */
+                                    cmd[pos++] = '\\';
+                                    cmd[pos++] = (char)cp;
+                                } else if (cp >= 0x20 && cp < 0x7F) {
+                                    cmd[pos++] = (char)cp;
+                                } else if (cp < 0x10000) {
+                                    pos += snprintf(cmd + pos, sizeof(cmd) - pos,
+                                                    "\\u%04X", (unsigned)cp);
+                                } else {
+                                    /* Surrogate pair for codepoints >= U+10000 */
+                                    uint32_t u = cp - 0x10000;
+                                    uint16_t hi = (uint16_t)(0xD800 + (u >> 10));
+                                    uint16_t lo = (uint16_t)(0xDC00 + (u & 0x3FF));
+                                    pos += snprintf(cmd + pos, sizeof(cmd) - pos,
+                                                    "\\u%04X\\u%04X", hi, lo);
+                                }
+                                tp += blen;
+                            }
+                            pos += snprintf(cmd + pos, sizeof(cmd) - pos, "'))\"");
+
+                            ESP_LOGI(TAG, "clipboard cmd (%d chars): %s", pos, cmd);
+
+                            /* Type the PowerShell command (all ASCII) */
+                            for (int ci = 0; ci < pos; ci++) {
+                                uint8_t mod = 0, kc = 0;
+                                if (ascii_to_hid(cmd[ci], &mod, &kc)) {
+                                    uint8_t k[4] = { kc, 0, 0, 0 };
+                                    esp_hidd_send_keyboard_value(id, mod, k, 1);
+                                    vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+                                    esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+                                }
+                            }
+
+                            /* Press Enter to execute PowerShell */
+                            {
+                                uint8_t k[4] = { HID_KEY_RETURN, 0, 0, 0 };
+                                esp_hidd_send_keyboard_value(id, 0, k, 1);
+                                vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+                                esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+                            }
+
+                            /* Wait for PowerShell to load + execute */
+                            vTaskDelay(pdMS_TO_TICKS(1200));
+
+                            /* Win+R to open a new Run dialog */
+                            {
+                                uint8_t k[4] = { HID_KEY_R, 0, 0, 0 };
+                                esp_hidd_send_keyboard_value(id, LEFT_GUI_KEY_MASK, k, 1);
+                                vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+                                esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+                            }
+
+                            /* Wait for Run dialog to appear */
+                            vTaskDelay(pdMS_TO_TICKS(HID_RUN_DIALOG_OPEN_MS));
+
+                            /* Ctrl+V to paste from clipboard */
+                            {
+                                uint8_t k[4] = { HID_KEY_V, 0, 0, 0 };
+                                esp_hidd_send_keyboard_value(id, LEFT_CONTROL_KEY_MASK, k, 1);
+                                vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+                                esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+                            }
+                        }
                     }
                     break;
 
@@ -435,6 +536,40 @@ static bool ascii_to_hid(char c, uint8_t *mod, uint8_t *keycode)
     }
 }
 
+/* ── UTF-8 → Unicode codepoint decoder ──────────────────────────────────────
+ * Decodes one UTF-8 character from *p, writes the codepoint to *out,
+ * and returns the number of bytes consumed (1-4). Returns 0 on error. */
+static int utf8_decode(const char *p, uint32_t *out)
+{
+    uint8_t b0 = (uint8_t)*p;
+    int len;
+    uint32_t cp;
+
+    if (b0 < 0x80) {
+        *out = b0;
+        return 1;
+    } else if ((b0 & 0xE0) == 0xC0) {
+        cp = b0 & 0x1F; len = 2;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        cp = b0 & 0x0F; len = 3;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        cp = b0 & 0x07; len = 4;
+    } else {
+        *out = 0xFFFD;
+        return 1;  /* invalid leading byte, skip 1 */
+    }
+    for (int i = 1; i < len; i++) {
+        uint8_t c = (uint8_t)p[i];
+        if ((c & 0xC0) != 0x80) {
+            *out = 0xFFFD;
+            return i;  /* truncated sequence */
+        }
+        cp = (cp << 6) | (c & 0x3F);
+    }
+    *out = cp;
+    return len;
+}
+
 /* The worker does press → hold (HID_OUTPUT_DEFAULT_HOLD_MS = 30 ms) →
  * release, so back-to-back calls already give ~30 ms inter-char gap without
  * the caller waiting. Runs of `o <path>` feel snappy at this rate. */
@@ -444,30 +579,103 @@ esp_err_t hid_output_type_string(const char *str)
     if (!hid_output_is_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
-    while (*str) {
-        uint8_t mod = 0, keycode = 0;
-        if (!ascii_to_hid(*str, &mod, &keycode)) {
-            /* Unmappable byte (e.g. non-ASCII / control). Skip rather than
-             * abort — paths can contain CJK that the host user types
-             * directly later anyway. */
-            ESP_LOGW(TAG, "type_string: skip unmappable byte 0x%02x", (unsigned)*str);
-            str++;
-            continue;
-        }
-        uint8_t key[4] = { keycode, 0, 0, 0 };
-        esp_err_t err = hid_output_send_keyboard(mod, key, 0);
-        if (err != ESP_OK) {
-            return err;
-        }
-        str++;
+
+    /* Check if string contains non-ASCII */
+    bool has_non_ascii = false;
+    for (const char *p = str; *p; p++) {
+        if ((uint8_t)*p >= 0x80) { has_non_ascii = true; break; }
     }
+
+    if (!has_non_ascii) {
+        /* Pure ASCII: use queue-based keyboard reports */
+        while (*str) {
+            uint8_t mod = 0, keycode = 0;
+            if (!ascii_to_hid(*str, &mod, &keycode)) {
+                str++;
+                continue;
+            }
+            uint8_t key[4] = { keycode, 0, 0, 0 };
+            esp_err_t err = hid_output_send_keyboard(mod, key, 0);
+            if (err != ESP_OK) return err;
+            str++;
+        }
+        return ESP_OK;
+    }
+
+    /* Non-ASCII: build PowerShell clipboard command, type it, paste.
+     * This must be synchronous since we need delays between steps. */
+    char cmd[384];
+    int pos = snprintf(cmd, sizeof(cmd),
+        "powershell -c \"Add-Type -A System.Windows.Forms;"
+        "[System.Windows.Forms.Clipboard]::SetText("
+        "[regex]::Unescape('");
+
+    const char *tp = str;
+    while (*tp && pos < (int)(sizeof(cmd) - 30)) {
+        uint32_t cp = 0xFFFD;
+        int blen = utf8_decode(tp, &cp);
+        if (blen == 0) break;
+        if (cp == '\\' || cp == '\'') {
+            cmd[pos++] = '\\';
+            cmd[pos++] = (char)cp;
+        } else if (cp >= 0x20 && cp < 0x7F) {
+            cmd[pos++] = (char)cp;
+        } else if (cp < 0x10000) {
+            pos += snprintf(cmd + pos, sizeof(cmd) - pos, "\\u%04X", (unsigned)cp);
+        } else {
+            uint32_t u = cp - 0x10000;
+            pos += snprintf(cmd + pos, sizeof(cmd) - pos, "\\u%04X\\u%04X",
+                            (unsigned)(0xD800 + (u >> 10)),
+                            (unsigned)(0xDC00 + (u & 0x3FF)));
+        }
+        tp += blen;
+    }
+    pos += snprintf(cmd + pos, sizeof(cmd) - pos, "'))\"");
+
+    ESP_LOGI(TAG, "type_string clipboard cmd (%d chars)", pos);
+
+    uint8_t id = (uint8_t)s_conn_id;
+
+    /* Type the PowerShell command */
+    for (int ci = 0; ci < pos; ci++) {
+        uint8_t mod = 0, kc = 0;
+        if (ascii_to_hid(cmd[ci], &mod, &kc)) {
+            uint8_t k[4] = { kc, 0, 0, 0 };
+            esp_hidd_send_keyboard_value(id, mod, k, 1);
+            vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+            esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+        }
+    }
+
+    /* Enter to execute */
+    {
+        uint8_t k[4] = { HID_KEY_RETURN, 0, 0, 0 };
+        esp_hidd_send_keyboard_value(id, 0, k, 1);
+        vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+        esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    /* Win+R → new Run dialog */
+    {
+        uint8_t k[4] = { HID_KEY_R, 0, 0, 0 };
+        esp_hidd_send_keyboard_value(id, LEFT_GUI_KEY_MASK, k, 1);
+        vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+        esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+    }
+    vTaskDelay(pdMS_TO_TICKS(HID_RUN_DIALOG_OPEN_MS));
+
+    /* Ctrl+V to paste */
+    {
+        uint8_t k[4] = { HID_KEY_V, 0, 0, 0 };
+        esp_hidd_send_keyboard_value(id, LEFT_CONTROL_KEY_MASK, k, 1);
+        vTaskDelay(pdMS_TO_TICKS(HID_OUTPUT_DEFAULT_HOLD_MS));
+        esp_hidd_send_keyboard_value(id, 0, NULL, 0);
+    }
+
     return ESP_OK;
 }
 
-/* How long to wait between Win+R and the first path char. Windows pops the
- * Run dialog in ~150–250 ms on a fresh boot; 350 ms is enough headroom for
- * older machines without making the path-open feel sluggish. */
-#define HID_RUN_DIALOG_OPEN_MS 350
 
 esp_err_t hid_output_open_path(const char *path)
 {

@@ -565,13 +565,6 @@ static bool handle_hid_command(const char *cmd)
                 }
             }
 
-            /* Debug: hex dump steps AFTER parse, BEFORE set */
-            for (uint8_t i = 0; i < cfg.n_steps; i++) {
-                const uint8_t *raw = (const uint8_t *)&cfg.steps[i];
-                ESP_LOGI("cmd_set", "[AFTER_PARSE] step[%u] raw[0..7]: %02X %02X %02X %02X %02X %02X %02X %02X",
-                         (unsigned)i, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
-            }
-
             esp_err_t err = cmd_config_set(&cfg);
             ble_console_logf("cmd set id=%u -> %s\n", (unsigned)id, esp_err_to_name(err));
             return true;

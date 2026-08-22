@@ -245,7 +245,19 @@ esp_err_t gesture_detect_init(void)
                  loaded.trigger_deg, loaded.trigger_velocity_deg_s,
                  loaded.neutral_zone_deg, (unsigned)loaded.debounce_ms);
     }
-    return gesture_detect_apply_params(&loaded);
+    esp_err_t ret = gesture_detect_apply_params(&loaded);
+
+    /* If NVS had valid params with a real nod axis (not the placeholder
+     * [0,1,0]), skip the calibration requirement — the device was
+     * previously calibrated and the stored axes are usable. */
+    if (err == ESP_OK &&
+        (loaded.neutral.nod_axis[0] != 0.0f ||
+         loaded.neutral.nod_axis[1] != 1.0f ||
+         loaded.neutral.nod_axis[2] != 0.0f)) {
+        s_gd.calibrated = true;
+        ESP_LOGI(TAG, "previous calibration restored — skipping guided calibration");
+    }
+    return ret;
 }
 
 esp_err_t gesture_detect_apply_params(const gesture_params_t *params)
