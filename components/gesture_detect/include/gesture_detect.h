@@ -150,6 +150,16 @@ typedef struct {
 
 void gesture_detect_get_last_capture(gesture_detect_capture_t *out);
 
+/**
+ * @brief Start a data-capture session.  While active, the detector task
+ *        logs every frame's raw metrics (proj, vel, smooth_vel, r_mag,
+ *        axis states) at 50 Hz over BLE/UART so the user can collect
+ *        gesture data for offline analysis.
+ *
+ * @param duration_ms  How long to capture.  0 = default 30 s.
+ */
+void gesture_detect_start_capture(uint32_t duration_ms);
+
 #ifdef __cplusplus
 }
 #endif

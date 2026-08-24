@@ -722,9 +722,16 @@ static void handle_command(const char *cmd)
                          cap.nod_axis[0], cap.nod_axis[1], cap.nod_axis[2]);
         ble_console_logf("  tilt=[%.2f %.2f %.2f]\n",
                          cap.tilt_axis[0], cap.tilt_axis[1], cap.tilt_axis[2]);
+    } else if (strncmp(cmd, "dc", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
+        /* dc [ms] — start data-capture session. Logs every frame's raw
+         * metrics at 50 Hz for offline analysis.  Default 30 s. */
+        long ms = 30000;
+        parse_args(cmd, &ms, 1);
+        gesture_detect_start_capture((uint32_t)ms);
+        ble_console_logf("capture started for %ld ms\n", ms);
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);
-        ble_console_log("  gestures: c ca ct p q 'q reset' sp sr cd\n");
+        ble_console_log("  gestures: c ca ct p q 'q reset' sp sr cd dc\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
         ble_console_log("  configs : cmd list|get|set|del|run\n");
 #ifdef ENABLE_SERIAL_TRIGGER
