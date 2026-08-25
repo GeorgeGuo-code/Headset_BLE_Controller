@@ -413,6 +413,12 @@ async function connect () {
 function onDisconnected () {
   setStatus('已断开', null)
   setConnected(false)
+  /* Clean up stale device reference so the next connect() attempt
+   * goes through getDevices()/requestDevice() fresh. */
+  if (device) {
+    device.removeEventListener('gattserverdisconnected', onDisconnected)
+    device = null
+  }
   rxChar = txChar = null
   rxTextBuf = ''
   pushLog('设备已断开', 'sys')
@@ -423,8 +429,13 @@ function disconnect () {
   window.electronAPI.cancelBluetoothRequest()
   $('device-list').classList.add('hidden')
   $('device-list').replaceChildren()
-  if (device && device.gatt.connected) device.gatt.disconnect()
-  else onDisconnected()
+  if (device && device.gatt.connected) {
+    /* gatt.disconnect() fires 'gattserverdisconnected' → onDisconnected()
+     * which handles full cleanup (removing listener, nulling device, etc.) */
+    device.gatt.disconnect()
+  } else {
+    onDisconnected()
+  }
 }
 
 const BLE_CHUNK_SIZE = 18   /* safe payload for MTU 23 (20 − 2 headroom) */
