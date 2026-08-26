@@ -173,6 +173,52 @@ static void quat_normalize(float a[4])
     a[0] *= inv; a[1] *= inv; a[2] *= inv; a[3] *= inv;
 }
 
+/* Maximum allowed angle (degrees) between q_drift and q_neutral.
+ * After many snap-on-return events during rapid gestures, q_drift
+ * can accumulate >100° of rotation from q_neutral.  This causes
+ * compute_effective_axes to rotate the calibrated nod/tilt axes into
+ * orientations where a tilt gesture projects equally onto both axes,
+ * making the dominance gate misclassify tilts as nods.  Clamping the
+ * drift keeps the effective axes close to the well-calibrated raw
+ * axes.  15° is enough to absorb typical DMP drift (5-10°) while
+ * keeping the effective axes well-aligned with the calibrated raw
+ * axes — at 25° the tilt projection from a nod was already ~7° and
+ * growing, risking misclassification. */
+#define Q_DRIFT_MAX_DEG  15.0f
+
+/* After any snap that sets q_drift = qcur, call this to ensure
+ * q_drift doesn't rotate more than Q_DRIFT_MAX_DEG from q_neutral.
+ * Uses slerp to pull q_drift back toward q_neutral if needed. */
+static void constrain_q_drift(gd_t *gd, const neutral_pose_aligned_t *np)
+{
+    float d = gd->q_drift[0]*np->q_neutral[0] + gd->q_drift[1]*np->q_neutral[1] +
+              gd->q_drift[2]*np->q_neutral[2] + gd->q_drift[3]*np->q_neutral[3];
+    /* Ensure same hemisphere for slerp */
+    float sign = 1.0f;
+    if (d < 0.0f) { sign = -1.0f; d = -d; }
+    if (d > 1.0f) d = 1.0f;
+
+    float angle_deg = 2.0f * acosf(d) * (180.0f / (float)M_PI);
+    if (angle_deg > Q_DRIFT_MAX_DEG) {
+        float t = Q_DRIFT_MAX_DEG / angle_deg;  /* fraction toward q_drift */
+        float angle = acosf(d);
+        float sin_angle = sinf(angle);
+        float a_coeff, b_coeff;
+        if (sin_angle < 1e-6f) {
+            a_coeff = 1.0f - t; b_coeff = t;
+        } else {
+            a_coeff = sinf((1.0f - t) * angle) / sin_angle;
+            b_coeff = sinf(t * angle) / sin_angle;
+        }
+        /* slerp from q_neutral toward (sign * q_drift) by factor t */
+        for (int i = 0; i < 4; i++)
+            gd->q_drift[i] = a_coeff * np->q_neutral[i] + b_coeff * sign * gd->q_drift[i];
+        quat_normalize(gd->q_drift);
+        GD_DBGI("DBG-CONSTRAIN drift %.1f° → %.1f° from q_neutral",
+                 angle_deg, Q_DRIFT_MAX_DEG);
+    }
+}
+
 /* Rotation angle of a (unit) quaternion, in degrees, always in [0,180]. */
 static float quat_angle_deg(const float q[4])
 {
@@ -513,6 +559,18 @@ static void detector_task(void *arg)
 
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
+        /* Pull a stack-local aligned copy of the neutral pose so the
+         * quaternion/vector helpers can take its members as float* without
+         * tripping -Werror=address-of-packed-member. The pose is stable
+         * for the duration of one tick (calibration only writes when
+         * detector_task is between samples). The nod/tilt axes are still
+         * expressed in the q_neutral frame — that's fine as long as
+         * q_drift doesn't stray far from q_neutral.  constrain_q_drift()
+         * (called after every snap) enforces Q_DRIFT_MAX_DEG to prevent
+         * the effective axes from rotating into bad orientations. */
+        neutral_pose_aligned_t np;
+        gesture_params_get_neutral_aligned(&np);
+
         /* Phase 5: first sample after apply_params() seeds q_drift from
          * the current pose and skips processing for this tick — we have
          * no prior projection state for the velocity estimate and r itself
@@ -520,24 +578,13 @@ static void detector_task(void *arg)
          * against q_drift, which slowly tracks佩戴微调. */
         if (!s_gd.q_drift_valid) {
             memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
+            constrain_q_drift(&s_gd, &np);
             s_gd.q_drift_valid  = true;
             s_gd.still_since_ms = 0;
             prev_valid = false;
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
         }
-
-        /* Pull a stack-local aligned copy of the neutral pose so the
-         * quaternion/vector helpers can take its members as float* without
-         * tripping -Werror=address-of-packed-member. The pose is stable
-         * for the duration of one tick (calibration only writes when
-         * detector_task is between samples). The nod/tilt axes are still
-         * expressed in the q_neutral frame — that's fine as long as
-         * q_drift doesn't stray far from q_neutral, which the still-snap
-         * guarantees by keeping q_drift ≈ current pose whenever the user
-         * is at rest. */
-        neutral_pose_aligned_t np;
-        gesture_params_get_neutral_aligned(&np);
 
         /* Relative rotation from the runtime baseline q_drift, expressed
          * as a rotation vector (axis * angle, degrees). Replaces the old
@@ -590,7 +637,12 @@ static void detector_task(void *arg)
             if (s_glitch_streak >= GLITCH_RESYNC_FRAMES) {
                 /* Persistent offset: q_drift has drifted from the actual
                  * device orientation. Snap q_drift to qcur (same as
-                 * `q reset` but automatic) so detection can resume. */
+                 * `q reset` but automatic) so detection can resume.
+                 * Note: do NOT constrain_q_drift here — if qcur is far
+                 * from q_neutral, constraining would keep |r| > R_MAX
+                 * and cause an infinite resync loop.  The still-snap
+                 * paths will gradually pull q_drift back toward
+                 * q_neutral once the user is at rest. */
                 float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
                           qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
                 if (d < 0.0f) {
@@ -770,9 +822,11 @@ static void detector_task(void *arg)
          *
          * Use EMA-smoothed velocity instead of raw frame-to-frame derivative
          * to suppress noise spikes that cause the wrong axis to appear
-         * dominant for a single tick. Require the dominant axis to exceed
-         * the other by 1.4× before any NEUTRAL→LOCKED transition. */
-        const float DOMINANCE = 1.4f;
+         * dominant for a single tick. Asymmetric thresholds: nod only needs
+         * 1.2× to dominate (it's the primary motion), while tilt requires
+         * 2.0× (tilt crosstalk from nod must not beat the real axis). */
+        const float DOM_NOD  = 1.2f;   /* nod needs sn ≥ 1.2 × st */
+        const float DOM_TILT = 2.0f;   /* tilt needs st ≥ 2.0 × sn */
         bool nod_dominant;
         float sv_nod  = s_gd.smooth_vel_nod;
         float sv_tilt = s_gd.smooth_vel_tilt;
@@ -781,22 +835,34 @@ static void detector_task(void *arg)
         } else {
             float ratio_nt = sv_nod  / (sv_tilt + 1e-3f);
             float ratio_tn = sv_tilt / (sv_nod  + 1e-3f);
-            if (ratio_nt >= DOMINANCE) {
+            if (ratio_nt >= DOM_NOD) {
                 nod_dominant = true;
-            } else if (ratio_tn >= DOMINANCE) {
+            } else if (ratio_tn >= DOM_TILT
+                       && absf(proj_tilt) >= absf(proj_nod)) {
+                /* Tilt velocity dominates AND tilt projection is actually
+                 * larger than nod projection.  The second check catches the
+                 * case where accumulated tilt EMA (st) is inflated by
+                 * crosstalk — if |proj_nod| > |proj_tilt| the user is
+                 * clearly nodding, not tilting, regardless of EMA state. */
                 nod_dominant = false;
             } else {
                 /* Neither axis dominates — mixed motion. Hold fire this tick
                  * and let the per-axis velocity check resolve on the next one. */
                 GD_DBGI("DBG-DOM-SKIP proj_nod=%+.1f proj_tilt=%+.1f "
-                         "sv_nod=%.1f sv_tilt=%.1f r_nt=%.2f r_tn=%.2f (need %.1f)",
+                         "sv_nod=%.1f sv_tilt=%.1f r_nt=%.2f r_tn=%.2f (n%.1f t%.1f)",
                          proj_nod, proj_tilt, sv_nod, sv_tilt,
-                         ratio_nt, ratio_tn, DOMINANCE);
+                         ratio_nt, ratio_tn, DOM_NOD, DOM_TILT);
                 vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
                 continue;
             }
         }
         bool fired_this_tick = false;
+        /* Capture axis states before step_axis so we can detect
+         * LOCKED→NEUTRAL transitions (gesture completed, head back
+         * near rest). Snap q_drift at that moment to prevent the
+         * DMP-drift accumulation that causes false TILT fires. */
+        axis_state_t pitch_before = s_gd.pitch.state;
+        axis_state_t roll_before  = s_gd.roll.state;
         if (nod_dominant) {
             fired_this_tick = step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
                       GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ true);
@@ -809,27 +875,81 @@ static void detector_task(void *arg)
             step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
                       GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ false);
         }
+        /* Snap-on-return: when either axis transitions from a LOCKED
+         * state back to NEUTRAL, the gesture has completed and the head
+         * has returned near its resting position. Snap q_drift now to
+         * prevent projection drift from accumulating across rapid
+         * gesture sequences. Without this, q_drift goes stale during
+         * fast alternating nods/look-ups, pt drifts to ±40°, and
+         * false TILT events fire. */
+        static uint32_t s_vel_still_since = 0;
+        bool pitch_returned = (pitch_before == GD_AXIS_LOCKED_POS ||
+                               pitch_before == GD_AXIS_LOCKED_NEG) &&
+                              s_gd.pitch.state == GD_AXIS_NEUTRAL;
+        bool roll_returned  = (roll_before == GD_AXIS_LOCKED_POS ||
+                               roll_before == GD_AXIS_LOCKED_NEG) &&
+                              s_gd.roll.state  == GD_AXIS_NEUTRAL;
+        if (pitch_returned || roll_returned) {
+            float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
+                      qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
+            if (d < 0.0f) {
+                s_gd.q_drift[0] = -qcur[0]; s_gd.q_drift[1] = -qcur[1];
+                s_gd.q_drift[2] = -qcur[2]; s_gd.q_drift[3] = -qcur[3];
+            } else {
+                memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
+            }
+            constrain_q_drift(&s_gd, &np);
+            s_gd.still_since_ms = now_ms;   /* re-arm Phase 5 timer */
+            s_vel_still_since = 0;          /* prevent redundant vel-snap */
+            GD_DBGI("DBG-SNAP-RET proj_nod=%+.1f proj_tilt=%+.1f "
+                     "rm=%.1f (%s returned)",
+                     proj_nod, proj_tilt, r_mag,
+                     pitch_returned ? "pitch" : "roll");
+        }
+        /* After any gesture fires, reset both smooth velocities to zero.
+         * This prevents accumulated crosstalk EMA from a previous gesture
+         * contaminating the next gesture's dominance decision.  Without
+         * this, st can build to 150-300+°/s over a rapid sequence of
+         * nods/look-ups and trigger false TILT events. */
         if (fired_this_tick) {
+            s_gd.smooth_vel_nod  = 0.0f;
+            s_gd.smooth_vel_tilt = 0.0f;
             GD_DBGI("DBG-CTX proj_nod=%+.1f proj_tilt=%+.1f "
                      "sv_nod=%.1f sv_tilt=%.1f dom=%s",
                      proj_nod, proj_tilt, sv_nod, sv_tilt,
                      nod_dominant ? "NOD" : "TILT");
         }
 
-        /* Phase 5: sliding baseline snap. After STILL_DURATION_MS of rest
-         * (both projections inside the dead zone), snap q_drift to the
-         * current quaternion so佩戴微调 is absorbed. The snap respects
-         * the q/-q hemisphere to avoid the wrap-around the DMP occasionally
-         * produces across the ±π boundary. We also reset the still timer
-         * after each snap so the next snap requires another full window of
-         * stillness — otherwise a long stationary period would snap on
-         * every tick, which is harmless but noisy in the still_since_ms
-         * accounting. */
-        const uint32_t STILL_DURATION_MS = 500;
+        /* Phase 5: sliding baseline snap.
+         *
+         * Primary (velocity-based): when both projected velocities are
+         * near zero for VEL_STILL_MS, snap q_drift to qcur.  This
+         * catches the common case of fast alternating gestures where
+         * q_drift goes stale and projections grow to ±40° — the brief
+         * pauses between gestures have near-zero velocity even though
+         * the projections are large.  Snapping re-centers the baseline
+         * so the next gesture starts clean.
+         *
+         * Secondary (projection-based): when both projections are
+         * inside the dead zone for STILL_DURATION_MS, snap.  This
+         * handles long-term micro-drift during quiet periods.
+         *
+         * Both paths respect the q/-q hemisphere to avoid the
+         * wrap-around the DMP occasionally produces. */
+        const uint32_t STILL_DURATION_MS = 200;
+        const uint32_t VEL_STILL_MS      = 120;
+        const float VEL_STILL_THRESH     = 15.0f;   /* °/s */
         const float zone_for_still = s_gd.params.neutral_zone_deg;
-        bool is_still = (absf(proj_nod) < zone_for_still) &&
-                        (absf(proj_tilt) < zone_for_still);
-        if (is_still) {
+        bool proj_still = (absf(proj_nod) < zone_for_still) &&
+                          (absf(proj_tilt) < zone_for_still);
+        bool vel_still  = (absf(vel_nod) < VEL_STILL_THRESH) &&
+                          (absf(vel_tilt) < VEL_STILL_THRESH);
+
+        /* Velocity-still timer: tracks consecutive ticks where both
+         * projected velocities are near zero but projections are large
+         * (i.e. q_drift is stale). */
+
+        if (proj_still) {
             if (s_gd.still_since_ms == 0) {
                 s_gd.still_since_ms = now_ms;
             } else if ((now_ms - s_gd.still_since_ms) >= STILL_DURATION_MS) {
@@ -841,13 +961,38 @@ static void detector_task(void *arg)
                 } else {
                     memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
                 }
-                s_gd.still_since_ms = now_ms;   /* re-arm the next still window */
-                GD_DBGI("DBG-SNAP q_drift=[%.3f %.3f %.3f %.3f]",
-                         s_gd.q_drift[0], s_gd.q_drift[1],
-                         s_gd.q_drift[2], s_gd.q_drift[3]);
+                constrain_q_drift(&s_gd, &np);
+                s_gd.still_since_ms = now_ms;
+                s_vel_still_since = 0;
+                GD_DBGI("DBG-SNAP-ProjStill pn=%+.1f pt=%+.1f rm=%.1f",
+                         proj_nod, proj_tilt, r_mag);
             }
         } else {
             s_gd.still_since_ms = 0;
+        }
+
+        if (vel_still && !proj_still) {
+            /* Velocity is near zero but projections are large →
+             * q_drift is stale.  Snap after a short window. */
+            if (s_vel_still_since == 0) {
+                s_vel_still_since = now_ms;
+            } else if ((now_ms - s_vel_still_since) >= VEL_STILL_MS) {
+                float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
+                          qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
+                if (d < 0.0f) {
+                    s_gd.q_drift[0] = -qcur[0]; s_gd.q_drift[1] = -qcur[1];
+                    s_gd.q_drift[2] = -qcur[2]; s_gd.q_drift[3] = -qcur[3];
+                } else {
+                    memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
+                }
+                constrain_q_drift(&s_gd, &np);
+                s_vel_still_since = now_ms;
+                GD_DBGI("DBG-SNAP-VelStill pn=%+.1f pt=%+.1f "
+                         "vn=%.0f vt=%.0f rm=%.1f",
+                         proj_nod, proj_tilt, vel_nod, vel_tilt, r_mag);
+            }
+        } else if (!vel_still) {
+            s_vel_still_since = 0;
         }
 
         vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));

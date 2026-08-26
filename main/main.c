@@ -986,12 +986,14 @@ void app_main(void)
         ESP_LOGW(TAG, "UART console unavailable: %s", esp_err_to_name(cerr));
     }
 
-    /* 5b. Touch sensor → mouse-left button. Default channel is T2 (GPIO2 on
-     *     ESP32-S3). Placed after the BLE stack starts so the press/release
-     *     worker can find a valid conn_id, and after the UART console so
-     *     the REPL prompt is reachable during the ~6 s initial scan.
+    /* 5b. Touch sensor → mouse-left button. [DISABLED]
+     *     Temporarily disabled — uncomment to re-enable.
+     *     Default channel is T2 (GPIO2 on ESP32-S3). Placed after the BLE
+     *     stack starts so the press/release worker can find a valid conn_id,
+     *     and after the UART console so the REPL prompt is reachable during
+     *     the ~6 s initial scan.
      *     Independent of the MPU — runs in both healthy and degraded mode. */
-    ESP_ERROR_CHECK(touch_sensor_init(TOUCH_MIN_CHAN_ID + 1));
+    // ESP_ERROR_CHECK(touch_sensor_init(TOUCH_MIN_CHAN_ID + 1));
 
     if (!s_detector_ready) {
         ble_console_logf("SENSOR FAIL: mpu_dmp_init=%u (%s)\n",

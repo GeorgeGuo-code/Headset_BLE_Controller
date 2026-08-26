@@ -13,7 +13,7 @@
 #define GESTURE_DEFAULT_TRIGGER_VEL_DEG_S    50.0f   /*!< window peak d(proj)/dt to fire (°/s) — relaxed from 80°/s; peak in a typical slow nod is ~40-60°/s */
 #define GESTURE_DEFAULT_NEUTRAL_ZONE_DEG      2.5f   /*!< per-frame dead zone for re-arming (°) — smaller so the system re-arms quickly between gestures */
 #define GESTURE_DEFAULT_DEBOUNCE_MS          500     /*!< min ms the user must hold inside zone before re-arming */
-#define GESTURE_DEFAULT_COOLDOWN_MS         1000     /*!< min ms between any two fired events (kills double-fire / phantom second gesture from return-swing) */
+#define GESTURE_DEFAULT_COOLDOWN_MS         1300     /*!< min ms between any two fired events — 1300ms covers the ~1220ms return-swing window after a nod, preventing false LOOK_UP */
 #define GESTURE_DEFAULT_SIGN_PITCH             1     /*!< 1: positive pitch = nod (chin-down) */
 #define GESTURE_DEFAULT_SIGN_ROLL              0     /*!< 0: positive roll = left-tilt (flip with `sr` if needed) */
 
