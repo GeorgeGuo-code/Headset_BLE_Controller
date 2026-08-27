@@ -36,7 +36,7 @@ static const char *TAG = "gesture_detect";
  * Very useful for tuning thresholds; set to 0 for production builds.
  * When data-capture mode is active (s_dc_active), DBG logs are suppressed
  * so only DC lines appear — makes it easy to copy clean data. */
-#define GD_DEBUG_FIRING      1
+#define GD_DEBUG_FIRING      0
 
 #if GD_DEBUG_FIRING
 #define GD_DBGI(fmt, ...) do { if (!s_dc_active) ESP_LOGI(TAG, fmt, ##__VA_ARGS__); } while(0)
@@ -94,24 +94,33 @@ typedef struct {
      * time constant at 50 Hz). */
     float           smooth_vel_nod;      /*!< EMA-smoothed |proj_nod| velocity */
     float           smooth_vel_tilt;     /*!< EMA-smoothed |proj_tilt| velocity */
+
+    /* Direction-based dominance signatures */
+    gesture_signatures_t sig;
+
+    /* Cross-product instantaneous rotation axis */
+    float           prev_fwd[3];
+    bool            prev_fwd_valid;
+    float           smooth_axis[3];
+    bool            smooth_axis_valid;
+    /* Accumulation-based trigger */
+    float           prev_proj_axis;
+    float           accum;
+    bool            accum_armed;
 } gd_t;
 
-/* Diagnostic snapshot of the most recent axis calibration, exposed via the
- * `cd` BLE command. Used in the v3 prototype to verify that the Δr-average
- * algorithm produces a stable direction across runs without needing to
- * instrument the detector task itself. */
+#if 0
 typedef struct {
-    uint32_t valid;             /*!< samples kept after DMP-glitch rejection */
-    uint32_t used;              /*!< samples contributing to the average */
-    float    nod_axis[3];       /*!< persisted nod_axis (device frame) */
-    float    tilt_axis[3];      /*!< persisted tilt_axis (device frame) */
-    float    sum_mag_deg;       /*!< Σ|Δr| over the kept samples */
-    float    drift_deg;         /*!< max |Δr − mean(Δr)| — a small drift means the user's
-                                     motion was consistent; large means the user wasn't doing the
-                                     same gesture repeatedly. */
+    uint32_t valid;
+    uint32_t used;
+    float    nod_axis[3];
+    float    tilt_axis[3];
+    float    sum_mag_deg;
+    float    drift_deg;
 } last_capture_t;
 
 static last_capture_t s_last_cap;
+#endif
 
 /* ===== Data-capture mode (Phase: diagnostics) ============================
  * When active, detector_task logs every frame's raw metrics at 50 Hz so
@@ -123,6 +132,9 @@ static volatile bool     s_dc_active    = false;
 static volatile uint32_t s_dc_until_ms  = 0;
 
 static gd_t s_gd;
+
+static float s_cal_rest_q[4] = {1, 0, 0, 0};
+static bool  s_cal_rest_valid = false;
 
 /* ===== small math ======================================================== */
 
@@ -367,11 +379,13 @@ const gesture_params_t *gesture_detect_get_params(void)
     return &s_gd.params;
 }
 
+#if 0
 void gesture_detect_set_sign(bool positive_pitch_is_nod, bool positive_roll_is_right)
 {
     s_gd.params.sign_pitch = positive_pitch_is_nod ? 1 : 0;
     s_gd.params.sign_roll  = positive_roll_is_right ? 1 : 0;
 }
+#endif
 
 void gesture_detect_get_q_drift(float out[4])
 {
@@ -1027,6 +1041,7 @@ void gesture_detect_start_capture(uint32_t duration_ms)
              (unsigned)duration_ms);
 }
 
+#if 0
 /* ===== Neutral calibration ============================================== */
 
 /**
@@ -1126,7 +1141,9 @@ esp_err_t gesture_detect_calibrate_neutral(uint32_t duration_ms)
     }
     return ESP_OK;
 }
+#endif
 
+#if 0
 /**
  * @brief Derive the two gesture axes from a live nod. Requires a valid
  *        `q_neutral` (call gesture_detect_calibrate_neutral first). The
@@ -1388,7 +1405,9 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
              s_gd.params.neutral_zone_deg);
     return ESP_OK;
 }
+#endif
 
+#if 0
 /**
  * @brief Measure the user's actual left/right tilt axis and persist it.
  *
@@ -1575,7 +1594,9 @@ esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms)
              sum_tilt_mag);
     return ESP_OK;
 }
+#endif
 
+#if 0
 void gesture_detect_get_last_capture(gesture_detect_capture_t *out)
 {
     if (out == NULL) {
@@ -1587,4 +1608,240 @@ void gesture_detect_get_last_capture(gesture_detect_capture_t *out)
     out->drift_deg   = s_last_cap.drift_deg;
     memcpy(out->nod_axis,  s_last_cap.nod_axis,  sizeof(out->nod_axis));
     memcpy(out->tilt_axis, s_last_cap.tilt_axis, sizeof(out->tilt_axis));
+}
+#endif
+
+/* ===== 5-step calibration: generic gesture signature capture =============== */
+
+esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
+{
+    if (duration_ms < 500) return ESP_ERR_INVALID_ARG;
+
+    ESP_LOGI(TAG, "calibrating REST for %u ms...", (unsigned)duration_ms);
+
+    const uint32_t period_ms = 20;
+    const uint32_t ticks = duration_ms / period_ms;
+    const float W_MIN = 0.05f;
+
+    float q_sum[4] = {0};
+    uint32_t count = 0;
+    s_gd.calibrating = true;
+
+    for (uint32_t i = 0; i < ticks; i++) {
+        float q[4];
+        if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+            float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
+            if (w_abs >= W_MIN) {
+                if (count > 0) {
+                    float d = q[0]*q_sum[0] + q[1]*q_sum[1] +
+                              q[2]*q_sum[2] + q[3]*q_sum[3];
+                    if (d < 0.0f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
+                }
+                q_sum[0] += q[0]; q_sum[1] += q[1];
+                q_sum[2] += q[2]; q_sum[3] += q[3];
+                count++;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+    }
+    s_gd.calibrating = false;
+
+    if (count < 3) {
+        ESP_LOGE(TAG, "rest cal: too few samples (%u)", (unsigned)count);
+        s_cal_rest_valid = false;
+        return ESP_FAIL;
+    }
+    float rn = sqrtf(q_sum[0]*q_sum[0] + q_sum[1]*q_sum[1] +
+                     q_sum[2]*q_sum[2] + q_sum[3]*q_sum[3]);
+    s_cal_rest_q[0] = q_sum[0]/rn; s_cal_rest_q[1] = q_sum[1]/rn;
+    s_cal_rest_q[2] = q_sum[2]/rn; s_cal_rest_q[3] = q_sum[3]/rn;
+    s_cal_rest_valid = true;
+
+    ESP_LOGI(TAG, "rest captured (%u samples) q=[%.3f %.3f %.3f %.3f]",
+             (unsigned)count, s_cal_rest_q[0], s_cal_rest_q[1],
+             s_cal_rest_q[2], s_cal_rest_q[3]);
+    return ESP_OK;
+}
+
+esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duration_ms)
+{
+    if (duration_ms < 500) return ESP_ERR_INVALID_ARG;
+    if (type < GESTURE_NOD || type > GESTURE_TILT_RIGHT) return ESP_ERR_INVALID_ARG;
+
+    static const char *names[] = { "?", "NOD", "LOOK_UP", "TILT_LEFT", "TILT_RIGHT" };
+    ESP_LOGI(TAG, "calibrating gesture %s for %u ms...", names[type], (unsigned)duration_ms);
+
+    const uint32_t period_ms = 20;
+    const uint32_t ticks     = duration_ms / period_ms;
+    const uint32_t rest_ticks = ticks / 3;
+    const uint32_t gesture_ticks = ticks - rest_ticks;
+    const float W_MIN = 0.05f;
+
+    float q_rest[4] = {0};
+    uint32_t rest_count = 0;
+
+    if (s_cal_rest_valid) {
+        q_rest[0] = s_cal_rest_q[0]; q_rest[1] = s_cal_rest_q[1];
+        q_rest[2] = s_cal_rest_q[2]; q_rest[3] = s_cal_rest_q[3];
+        rest_count = 999;
+        ESP_LOGI(TAG, "gesture cal %s: using pre-captured rest", names[type]);
+    } else {
+        s_gd.calibrating = true;
+        for (uint32_t i = 0; i < rest_ticks; i++) {
+            float q[4];
+            if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+                float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
+                if (w_abs >= W_MIN) {
+                    if (rest_count > 0) {
+                        float d = q[0]*q_rest[0] + q[1]*q_rest[1] +
+                                  q[2]*q_rest[2] + q[3]*q_rest[3];
+                        if (d < 0.0f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
+                    }
+                    q_rest[0] += q[0]; q_rest[1] += q[1];
+                    q_rest[2] += q[2]; q_rest[3] += q[3];
+                    rest_count++;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(period_ms));
+        }
+        s_gd.calibrating = false;
+        if (rest_count < 3) {
+            ESP_LOGE(TAG, "gesture cal %s: too few rest samples (%u)", names[type], (unsigned)rest_count);
+            return ESP_FAIL;
+        }
+        float rn = sqrtf(q_rest[0]*q_rest[0] + q_rest[1]*q_rest[1] +
+                         q_rest[2]*q_rest[2] + q_rest[3]*q_rest[3]);
+        q_rest[0] /= rn; q_rest[1] /= rn; q_rest[2] /= rn; q_rest[3] /= rn;
+    }
+
+    float q_rest_conj[4]; quat_conj(q_rest, q_rest_conj);
+    float best_mag = 0.0f;
+    float axis_sum[3] = {0};
+    uint32_t gesture_count = 0;
+    uint32_t gesture_ticks_count = (rest_count >= 999) ? ticks : gesture_ticks;
+
+    float all_r[120][3];
+    float all_mag[120];
+    uint32_t n_frames = 0;
+
+    s_gd.calibrating = true;
+    for (uint32_t i = 0; i < gesture_ticks_count && n_frames < 120; i++) {
+        float q[4];
+        if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+            float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
+            if (w_abs >= W_MIN) {
+                float qrel[4]; quat_mul(q_rest_conj, q, qrel); quat_normalize(qrel);
+                float r[3]; quat_to_rotvec_deg(qrel, r);
+                float mag = v3_norm(r);
+                all_r[n_frames][0] = r[0];
+                all_r[n_frames][1] = r[1];
+                all_r[n_frames][2] = r[2];
+                all_mag[n_frames] = mag;
+                n_frames++;
+                if (mag > best_mag && mag < 90.0f) best_mag = mag;
+                gesture_count++;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+    }
+    s_gd.calibrating = false;
+
+    const float FRAC_MIN = 0.30f;
+    for (uint32_t i = 0; i < n_frames; i++) {
+        if (all_mag[i] > best_mag * FRAC_MIN && all_mag[i] < 90.0f) {
+            float inv = 1.0f / all_mag[i];
+            axis_sum[0] += all_r[i][0] * inv;
+            axis_sum[1] += all_r[i][1] * inv;
+            axis_sum[2] += all_r[i][2] * inv;
+        }
+    }
+
+    if (best_mag < 5.0f) {
+        ESP_LOGE(TAG, "gesture cal %s: peak rotation too small (%.1f deg)", names[type], best_mag);
+        return ESP_FAIL;
+    }
+
+    float axis_sm = sqrtf(axis_sum[0]*axis_sum[0] + axis_sum[1]*axis_sum[1] + axis_sum[2]*axis_sum[2]);
+    if (axis_sm < 0.01f) {
+        ESP_LOGE(TAG, "gesture cal %s: axis sum too small, no valid frames", names[type]);
+        return ESP_FAIL;
+    }
+    float axis[3] = {axis_sum[0]/axis_sm, axis_sum[1]/axis_sm, axis_sum[2]/axis_sm};
+
+    uint32_t avg_count = 0;
+    for (uint32_t i = 0; i < n_frames; i++) {
+        if (all_mag[i] > best_mag * FRAC_MIN && all_mag[i] < 90.0f) avg_count++;
+    }
+
+    uint8_t flag = 0;
+    switch (type) {
+        case GESTURE_NOD:
+            memcpy(s_gd.sig.sig_nod, axis, sizeof(float)*3);
+            s_gd.sig.spread_nod_deg = 0.0f;
+            flag = GESTURE_SIG_F_NOD;
+            break;
+        case GESTURE_LOOK_UP:
+            memcpy(s_gd.sig.sig_lookup, axis, sizeof(float)*3);
+            s_gd.sig.spread_lookup_deg = 0.0f;
+            flag = GESTURE_SIG_F_LOOKUP;
+            break;
+        case GESTURE_TILT_LEFT:
+            memcpy(s_gd.sig.sig_tiltL, axis, sizeof(float)*3);
+            s_gd.sig.spread_tiltL_deg = 0.0f;
+            flag = GESTURE_SIG_F_TILTL;
+            break;
+        case GESTURE_TILT_RIGHT:
+            memcpy(s_gd.sig.sig_tiltR, axis, sizeof(float)*3);
+            s_gd.sig.spread_tiltR_deg = 0.0f;
+            flag = GESTURE_SIG_F_TILTR;
+            break;
+        default: break;
+    }
+    s_gd.sig.calibrated |= flag;
+    gesture_signatures_save_to_nvs(&s_gd.sig);
+
+    ESP_LOGI(TAG, "gesture %s: axis=[%.3f %.3f %.3f] peak=%.1f avg_frames=%u/%u calibrated=0x%02x",
+             names[type], axis[0], axis[1], axis[2], best_mag,
+             (unsigned)avg_count, (unsigned)gesture_count, s_gd.sig.calibrated);
+
+    if ((s_gd.sig.calibrated & GESTURE_SIG_F_MINIMUM) == GESTURE_SIG_F_MINIMUM) {
+        ESP_LOGI(TAG, "3 axes calibrated - inferring signs...");
+        gesture_detect_infer_signs();
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t gesture_detect_infer_signs(void)
+{
+    if ((s_gd.sig.calibrated & GESTURE_SIG_F_MINIMUM) != GESTURE_SIG_F_MINIMUM) {
+        ESP_LOGW(TAG, "cannot infer signs: only 0x%02x calibrated (need 0x%02x)",
+                 s_gd.sig.calibrated, GESTURE_SIG_F_MINIMUM);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    float sn[3], tl[3];
+    memcpy(sn, s_gd.sig.sig_nod,   sizeof(float)*3);
+    memcpy(tl, s_gd.sig.sig_tiltL, sizeof(float)*3);
+
+    neutral_pose_aligned_t np;
+    gesture_params_get_neutral_aligned(&np);
+    float nod_eff[3], tilt_eff[3];
+    compute_effective_axes(&np, s_gd.q_drift, nod_eff, tilt_eff);
+
+    float d_nod = v3_dot(sn, nod_eff);
+    int inferred_pitch = (d_nod >= 0.0f) ? 1 : 0;
+
+    float d_tl = v3_dot(tl, tilt_eff);
+    int inferred_roll = (d_tl < 0.0f) ? 0 : 1;
+
+    gesture_params_t params = s_gd.params;
+    params.sign_pitch = (uint8_t)inferred_pitch;
+    params.sign_roll  = (uint8_t)inferred_roll;
+    gesture_detect_apply_params(&params);
+    gesture_params_save_to_nvs(&params);
+
+    ESP_LOGI(TAG, "signs inferred: sign_pitch=%d sign_roll=%d (d_nod=%+.3f d_tl=%+.3f)",
+             inferred_pitch, inferred_roll, d_nod, d_tl);
+    return ESP_OK;
 }

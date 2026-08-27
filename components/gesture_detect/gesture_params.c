@@ -177,3 +177,40 @@ void gesture_params_set_neutral_aligned(const neutral_pose_aligned_t *src)
     gesture_detect_apply_params(&params);
     gesture_params_save_to_nvs(&params);
 }
+
+/* ===== Gesture signatures ================================================= */
+
+esp_err_t gesture_signatures_load_from_nvs(gesture_signatures_t *out)
+{
+    nvs_handle_t h;
+    esp_err_t err = open_namespace(&h);
+    if (err != ESP_OK) return err;
+
+    size_t size = 0;
+    err = nvs_get_blob(h, GESTURE_NVS_KEY_SIG, NULL, &size);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(h);
+        memset(out, 0, sizeof(*out));
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (err != ESP_OK || size != sizeof(gesture_signatures_t)) {
+        nvs_close(h);
+        memset(out, 0, sizeof(*out));
+        return (err != ESP_OK) ? err : ESP_ERR_INVALID_SIZE;
+    }
+    err = nvs_get_blob(h, GESTURE_NVS_KEY_SIG, out, &size);
+    nvs_close(h);
+    if (err != ESP_OK) memset(out, 0, sizeof(*out));
+    return err;
+}
+
+esp_err_t gesture_signatures_save_to_nvs(const gesture_signatures_t *sig)
+{
+    nvs_handle_t h;
+    esp_err_t err = open_namespace(&h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(h, GESTURE_NVS_KEY_SIG, sig, sizeof(*sig));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}

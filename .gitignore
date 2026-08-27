@@ -79,8 +79,9 @@ Desktop.ini
 .devcontainer
 reference/
 config_test/
+tools/
 
-# SESSION_STATE.md
+SESSION_STATE.md
 docs/
 
 # coding assistance

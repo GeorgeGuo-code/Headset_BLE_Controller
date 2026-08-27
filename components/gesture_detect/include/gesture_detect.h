@@ -43,12 +43,9 @@ const gesture_params_t *gesture_detect_get_params(void);
  */
 esp_err_t gesture_detect_start(QueueHandle_t event_queue);
 
-/**
- * @brief Convenience sign-convention override. Equivalent to
- *        apply_params with the sign bytes flipped; does NOT touch the
- *        other thresholds.
- */
+/* --- DEAD CODE: sign flipping done directly in main.c (sp/sr commands)
 void gesture_detect_set_sign(bool positive_pitch_is_nod, bool positive_roll_is_right);
+*/
 
 /**
  * @brief Phase 5: copy the current sliding baseline `q_drift` into
@@ -76,79 +73,72 @@ void gesture_detect_get_effective_axes(float out_nod[3], float out_tilt[3]);
  *        at a very different angle). See gesture_detect.c. */
 void gesture_detect_reset_q_drift(void);
 
-/**
- * @brief Block for `duration_ms` while sampling the DMP quaternion,
- *        average it, and store as the new neutral orientation
- *        (`q_neutral`). Aborts with ESP_FAIL if motion exceeds an internal
- *        guard (relative rotation > 25°), so the user can't accidentally
- *        lock in a non-neutral pose.
- *
- *        Updates both the in-memory params AND NVS. Pair with
- *        gesture_detect_calibrate_axes() to finish calibration.
- */
+/* --- DEAD CODE: old 2-axis calibration (neutral + axes + tilt).
+ * Replaced by the rest→gesture flow (cr/cn/ctl/ctr commands).
+ * Never called from main.c.
 esp_err_t gesture_detect_calibrate_neutral(uint32_t duration_ms);
-
-/**
- * @brief Block for `duration_ms` while the user performs slow nods, and
- *        derive the two gesture axes (nod_axis, tilt_axis) relative to the
- *        already-calibrated neutral pose. This is what makes detection work
- *        at an arbitrary mounting angle. Requires gesture_detect_calibrate_
- *        neutral() to have run first. Aborts if the nod is too small.
- *
- *        Updates both the in-memory params AND NVS. Specifically overwrites
- *        `nod_axis` (the user's actual nod direction) and, as a temporary
- *        fallback, `tilt_axis` (`up × nod_axis`). For accurate left / right
- *        tilt detection the user should run gesture_detect_calibrate_tilt()
- *        afterwards, which measures the actual tilt axis instead of relying
- *        on the geometric fallback.
- */
 esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms);
-
-/**
- * @brief Block for `duration_ms` while the user performs slow left and
- *        right tilts, and overwrite the persisted `tilt_axis` with a value
- *        measured from the user's actual tilt motion (instead of the
- *        geometric `up × nod_axis` fallback from calibrate_axes()). This
- *        fixes left/right tilt being misrecognised as nod/look-up when
- *        the user's natural tilt direction does not align perfectly with
- *        the geometric axis.
- *
- *        Requires gesture_detect_calibrate_neutral() and
- *        gesture_detect_calibrate_axes() to have run first (we need a
- *        neutral pose and a nod_axis to define the plane perpendicular
- *        to nod in which we measure tilt). Updates both in-memory params
- *        and NVS. Suppresses detector events for the duration of the
- *        capture so the user's calibration gestures don't fire as real
- *        events; restores the prior `calibrated` flag on failure.
- */
 esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms);
+*/
 
 /**
- * @brief Legacy alias kept for compatibility with earlier code paths
- *        that already used the original name.
+ * @brief 5-step calibration: capture the (pn, pt) signature for one gesture.
+ *
+ *        Call once per gesture type (NOD, LOOK_UP, TILT_LEFT, TILT_RIGHT).
+ *        The user performs the requested gesture during `duration_ms`.
+ *        The function:
+ *          1. records DMP samples and computes r = rotvec(conj(q_drift) ⊗ q)
+ *          2. projects r onto (nod_eff, tilt_eff) to get (pn, pt) per frame
+ *          3. averages the in-motion (pn, pt) vectors to get the signature
+ *          4. stores the signature in s_gd.sig and persists to NVS
+ *
+ *        After all 4 gestures are calibrated, call
+ *        gesture_detect_infer_signs() to auto-set sign_pitch / sign_roll.
+ *
+ * @param type        GESTURE_NOD, GESTURE_LOOK_UP, GESTURE_TILT_LEFT, or GESTURE_TILT_RIGHT
+ * @param duration_ms capture window (≥ 1000 recommended)
  */
+esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duration_ms);
+
+/**
+ * @brief Phase A: capture rest quaternion for subsequent gesture calibration.
+ *        Call this before gesture_detect_calibrate_gesture() so the gesture
+ *        phase skips its internal rest capture and uses this baseline.
+ *
+ * @param duration_ms how long to sample rest pose (2000 recommended)
+ */
+esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms);
+
+/**
+ * @brief Auto-infer sign_pitch / sign_roll from the 4 calibrated signatures.
+ *
+ *        Looks at the pn sign of NOD vs LOOK_UP and the pt sign of
+ *        TILT_LEFT vs TILT_RIGHT to determine which sign convention
+ *        matches the user's actual motion direction.
+ *        Saves the result to NVS.
+ */
+esp_err_t gesture_detect_infer_signs(void);
+
+/* --- DEAD CODE: legacy alias for calibrate_neutral (also dead)
 static inline esp_err_t gesture_detect_calibrate_baseline(uint32_t duration_ms)
 {
     return gesture_detect_calibrate_neutral(duration_ms);
 }
+*/
 
-/**
- * @brief Diagnostic snapshot of the most recent axis calibration.
- *
- *        Populated by `gesture_detect_calibrate_axes()` (and the tilt pass
- *        inside it). Read-only. Used by the `cd` console command to verify
- *        that the v3 Δr-average algorithm produced a stable direction.
- */
+/* --- DEAD CODE: capture_t and get_last_capture — s_last_cap never populated.
+ * calibrate_axes (which wrote s_last_cap) is dead code.
 typedef struct {
-    uint32_t valid;             /*!< samples kept after DMP-glitch rejection */
-    uint32_t used;              /*!< samples that contributed to the average */
-    float    nod_axis[3];       /*!< persisted nod_axis */
-    float    tilt_axis[3];      /*!< persisted tilt_axis */
-    float    sum_mag_deg;       /*!< peak horizontal magnitude reached during calibration (°); was Σ|Δr| in earlier schema — see gesture_detect.c */
-    float    drift_deg;         /*!< reserved (0 in v3) */
+    uint32_t valid;
+    uint32_t used;
+    float    nod_axis[3];
+    float    tilt_axis[3];
+    float    sum_mag_deg;
+    float    drift_deg;
 } gesture_detect_capture_t;
 
 void gesture_detect_get_last_capture(gesture_detect_capture_t *out);
+*/
 
 /**
  * @brief Start a data-capture session.  While active, the detector task

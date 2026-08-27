@@ -1,7 +1,7 @@
 /*
- * Phase-3 STUB. Real implementation lands when calibration session is
- * wired in. Functions are deliberately no-op so callers can compile
- * against the header today and light up later without an API churn.
+ * DEAD CODE: Phase-3 STUB. Never used — calib_session.h is not included
+ * anywhere in the project. The rest→gesture flow (cr/cn/ctl/ctr commands
+ * in main.c) replaced this approach. Kept as reference only.
  */
 
 #include "calib_session.h"

@@ -2,15 +2,16 @@
  * main.c — boot sequence: NVS -> MPU/DMP -> gesture detector -> BLE stack
  * (NUS console + HID) -> UART console.
  *
- * Commands ("c"/"ca"/"ct"/"p"/"sp"/"sr"/"hs"/"ac"/"ak"/"o"/...) arrive on two
- * channels that share one queue and one dispatcher:
+ * Commands ("cr"/"cn"/"ctl"/"ctr"/"p"/"sp"/"sr"/"hs"/"ac"/"ak"/"o"/...) arrive
+ * on two channels that share one queue and one dispatcher:
  *   - BLE: a central (the Electron tool or nRF Connect) writes a line to the
  *     NUS RX characteristic. Results stream back over the TX notify char.
  *   - UART: `hmbc <cmd...>` in the serial REPL. Added in Phase 7 so HID can be
  *     smoke-tested without a BLE central attached.
  * Both feed s_cmd_q; handle_command() is the single implementation.
  *
- * The BOOT button remains as an offline fallback calibration trigger.
+ * Calibration flow: cr (rest) → cn (nod) → ctl (left tilt) → ctr (right tilt).
+ * The BOOT button posts "c" but that command is not yet implemented.
  */
 
 #include <stdbool.h>
@@ -93,29 +94,7 @@ static void gesture_bridge_task(void *arg)
     }
 }
 
-/* Guided three-phase calibration (neutral -> nod_axis -> tilt_axis). Prompts
- * and results go over BLE so the connected tool can display them. Ported from
- * the reference firmware; ~11.4 s total. */
-static void run_guided_calibration(void)
-{
-    ble_console_log("== calibration 1/3: keep your head STILL ==\n");
-    esp_err_t err = gesture_detect_calibrate_neutral(2000);
-    if (err != ESP_OK) {
-        ble_console_logf("neutral capture failed: %s — aborting\n", esp_err_to_name(err));
-        return;
-    }
-    ble_console_log("== calibration 2/3: do a few slow NODS now ==\n");
-    vTaskDelay(pdMS_TO_TICKS(700));
-    err = gesture_detect_calibrate_axes(4000);
-    if (err != ESP_OK) {
-        ble_console_logf("nod-axis capture failed: %s — aborting\n", esp_err_to_name(err));
-        return;
-    }
-    ble_console_log("== calibration 3/3: do slow LEFT and RIGHT tilts now ==\n");
-    vTaskDelay(pdMS_TO_TICKS(700));
-    err = gesture_detect_calibrate_tilt(4000);
-    ble_console_logf("calibration result: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-}
+
 
 /* Parse up to `max` whitespace-separated integers following the opcode.
  * Returns how many were parsed. Accepts decimal or 0x-prefixed hex. */
@@ -512,7 +491,6 @@ static bool handle_hid_command(const char *cmd)
             size_t type_len = (size_t)(q - type_start);
 
             cmd_trigger_type_t ttype = TRIGGER_NONE;
-            uint16_t tvalue = 0;
             if (type_len == 4 && strncmp(type_start, "none", 4) == 0) {
                 ttype = TRIGGER_NONE;
             } else if (type_len == 7 && strncmp(type_start, "gesture", 7) == 0) {
@@ -624,17 +602,37 @@ static void handle_command(const char *cmd)
         return;
     }
 
-    if (strcmp(cmd, "c") == 0 || strcmp(cmd, "cal") == 0) {
-        ble_console_log("triggering guided calibration...\n");
-        run_guided_calibration();
-    } else if (strcmp(cmd, "ca") == 0) {
-        ble_console_log("nod calibration only (do slow nods)...\n");
-        esp_err_t err = gesture_detect_calibrate_axes(4000);
-        ble_console_logf("nod calibration result: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-    } else if (strcmp(cmd, "ct") == 0) {
-        ble_console_log("tilt calibration only (do slow LEFT and RIGHT tilts)...\n");
-        esp_err_t err = gesture_detect_calibrate_tilt(4000);
-        ble_console_logf("tilt calibration result: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+    if (strcmp(cmd, "cr") == 0) {
+        ble_console_log("calibrating REST (keep your head STILL)...\n");
+        esp_err_t err = gesture_detect_calibrate_rest(2000);
+        ble_console_logf("REST calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+    } else if (strcmp(cmd, "cn") == 0) {
+        ble_console_log("calibrating NOD (do a slow chin-down nod)...\n");
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_NOD, 2000);
+        ble_console_logf("NOD calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+        if (err == ESP_OK) {
+            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
+            ble_console_logf("  nod_axis=[%.3f %.3f %.3f]\n",
+                             sig.sig_nod[0], sig.sig_nod[1], sig.sig_nod[2]);
+        }
+    } else if (strcmp(cmd, "ctl") == 0) {
+        ble_console_log("calibrating TILT_LEFT (do a slow left tilt)...\n");
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_LEFT, 2000);
+        ble_console_logf("TILT_LEFT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+        if (err == ESP_OK) {
+            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
+            ble_console_logf("  tiltL_axis=[%.3f %.3f %.3f]\n",
+                             sig.sig_tiltL[0], sig.sig_tiltL[1], sig.sig_tiltL[2]);
+        }
+    } else if (strcmp(cmd, "ctr") == 0) {
+        ble_console_log("calibrating TILT_RIGHT (do a slow right tilt)...\n");
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_RIGHT, 2000);
+        ble_console_logf("TILT_RIGHT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+        if (err == ESP_OK) {
+            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
+            ble_console_logf("  tiltR_axis=[%.3f %.3f %.3f]\n",
+                             sig.sig_tiltR[0], sig.sig_tiltR[1], sig.sig_tiltR[2]);
+        }
     } else if (strcmp(cmd, "p") == 0) {
         const gesture_params_t *p = gesture_detect_get_params();
         ble_console_logf("params: trigger=%.1f vel=%.1f zone=%.1f debounce=%u "
@@ -665,6 +663,22 @@ static void handle_command(const char *cmd)
                          nod_eff[0], nod_eff[1], nod_eff[2]);
         ble_console_logf("  tilt_eff =[%.2f %.2f %.2f]\n",
                          tilt_eff[0], tilt_eff[1], tilt_eff[2]);
+        /* Show calibration signatures (3D rotation axes). */
+        gesture_signatures_t sig;
+        gesture_signatures_load_from_nvs(&sig);
+        if (sig.calibrated & GESTURE_SIG_F_NOD)
+            ble_console_logf("  nod_axis   =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_nod[0], sig.sig_nod[1], sig.sig_nod[2], sig.spread_nod_deg);
+        if (sig.calibrated & GESTURE_SIG_F_LOOKUP)
+            ble_console_logf("  look_axis  =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_lookup[0], sig.sig_lookup[1], sig.sig_lookup[2], sig.spread_lookup_deg);
+        if (sig.calibrated & GESTURE_SIG_F_TILTL)
+            ble_console_logf("  tiltL_axis =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_tiltL[0], sig.sig_tiltL[1], sig.sig_tiltL[2], sig.spread_tiltL_deg);
+        if (sig.calibrated & GESTURE_SIG_F_TILTR)
+            ble_console_logf("  tiltR_axis =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_tiltR[0], sig.sig_tiltR[1], sig.sig_tiltR[2], sig.spread_tiltR_deg);
+        ble_console_logf("  sig_mask=0x%02x\n", sig.calibrated);
     } else if (strcmp(cmd, "q") == 0) {
         /* Phase 5: standalone q_drift diagnostic. Reports the angle between
          * q_drift and q_neutral — the larger this gets, the more佩戴微调
@@ -674,10 +688,7 @@ static void handle_command(const char *cmd)
         const gesture_params_t *p = gesture_detect_get_params();
         float qd[4];
         gesture_detect_get_q_drift(qd);
-        float qn_conj[4], qdiff[4];
-        /* Use the same quat helpers the detector does. They aren't exposed
-         * in the public header, so we re-derive the angle inline: the angle
-         * between two unit quaternions is 2·acos(|dot|) degrees. */
+        /* Angle between two unit quaternions is 2·acos(|dot|) degrees. */
         float d = qd[0]*p->neutral.q_neutral[0] +
                   qd[1]*p->neutral.q_neutral[1] +
                   qd[2]*p->neutral.q_neutral[2] +
@@ -710,9 +721,9 @@ static void handle_command(const char *cmd)
         ble_console_logf("sign_roll flipped -> positive_roll_is_right=%u\n",
                          (unsigned)(params.sign_roll == 1));
     } else if (strcmp(cmd, "cd") == 0) {
-        /* Capture diagnostics for the v3 prototype. Shows how stable the last
-         * calibration was, which is the main knob we don't yet verify at
-         * runtime. Re-run after `c` to compare runs. */
+        /* DEAD CODE: s_last_cap is never populated (calibrate_axes is dead).
+         * The type gesture_detect_capture_t and get_last_capture are also
+         * commented out in the header.  This command is a no-op placeholder.
         gesture_detect_capture_t cap;
         gesture_detect_get_last_capture(&cap);
         ble_console_logf("cap diag: valid=%u used=%u sum_mag=%.1f drift=%.1f\n",
@@ -722,6 +733,8 @@ static void handle_command(const char *cmd)
                          cap.nod_axis[0], cap.nod_axis[1], cap.nod_axis[2]);
         ble_console_logf("  tilt=[%.2f %.2f %.2f]\n",
                          cap.tilt_axis[0], cap.tilt_axis[1], cap.tilt_axis[2]);
+        */
+        ble_console_log("cd: diagnostics unavailable (dead code)\n");
     } else if (strncmp(cmd, "dc", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
         /* dc [ms] — start data-capture session. Logs every frame's raw
          * metrics at 50 Hz for offline analysis.  Default 30 s. */
@@ -731,7 +744,7 @@ static void handle_command(const char *cmd)
         ble_console_logf("capture started for %ld ms\n", ms);
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);
-        ble_console_log("  gestures: c ca ct p q 'q reset' sp sr cd dc\n");
+        ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
         ble_console_log("  configs : cmd list|get|set|del|run\n");
 #ifdef ENABLE_SERIAL_TRIGGER
@@ -760,7 +773,7 @@ static void on_console_cmd(const char *cmd, size_t len)
     (void)len;
     char buf[CMD_MAX_LEN];
     size_t n = 0;
-    /* Phase 7.1: BLE NUS accepts both the bare command ("c", "p", ...) used
+    /* Phase 7.1: BLE NUS accepts both the bare command ("cr", "p", ...) used
      * by the Electron config tool and the `hmbc <cmd>` prefix used by the
      * UART REPL. Strip the prefix if present so a single command set
      * survives both transports — and so the user can keep using the same
@@ -837,7 +850,7 @@ static esp_err_t start_uart_console(void)
     const esp_console_cmd_t cmd = {
         .command = "hmbc",
         .help    = "Send a command to the gesture/HID controller "
-                   "(hs | ac <code> | ak <mods> <key> | o [path] | seq <steps> | c | p | ...)",
+                   "(hs | ac <code> | ak <mods> <key> | o [path] | seq <steps> | cr | cn | p | ...)",
         .hint    = NULL,
         .func    = &cmd_hmbc,
     };
@@ -863,7 +876,9 @@ static esp_err_t start_uart_console(void)
 }
 
 /* BOOT-button task — offline fallback trigger. Posts "c" to the command
- * queue when held for BOOT_HOLD_MS. */
+ * queue when held for BOOT_HOLD_MS. NOTE: "c" has no handler in
+ * handle_command() yet — will hit "unknown command". TODO: implement
+ * a full guided calibration sequence for the "c" command. */
 static void boot_button_task(void *arg)
 {
     (void)arg;
