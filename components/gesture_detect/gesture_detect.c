@@ -46,6 +46,12 @@ static const char *TAG = "gesture_detect";
 #define GD_DBGW(...) do {} while(0)
 #endif
 
+/* ===== Accumulation-based detection thresholds ============================ */
+#define TRIG_VEL_FRAC     0.35f  /*!< trigger velocity = peak × this fraction */
+#define END_VEL_FRAC      0.20f  /*!< end velocity = peak × this fraction */
+#define END_HOLD_FRAMES   5      /*!< frames below end_vel before firing (5×20ms = 100ms) */
+#define FIRE_COOLDOWN_MS  1000   /*!< minimum ms between two fired events */
+
 /* ===== Module state ====================================================== */
 
 typedef enum {
@@ -105,7 +111,7 @@ typedef struct {
     bool            smooth_axis_valid;
     /* Accumulation-based trigger */
     float           prev_proj_axis;
-    float           accum;
+    float           accum[3];
     bool            accum_armed;
 } gd_t;
 
@@ -549,7 +555,7 @@ static void detector_task(void *arg)
 {
     (void)arg;
     TickType_t last = xTaskGetTickCount();
-    float prev_nod = 0.0f, prev_tilt = 0.0f;
+    float prev_r_mag = 0.0f;
     bool  prev_valid = false;
 
     while (s_gd.running) {
@@ -679,289 +685,196 @@ static void detector_task(void *arg)
         }
         s_glitch_streak = 0;
 
-        /* Phase 6: rotate the calibrated nod/tilt axes into the current
-         * q_drift frame so the projection stays correct as q_drift drifts
-         * away from q_neutral. With no drift this is a no-op (q_diff =
-         * identity); after佩戴微调 the axes rotate by the same amount as
-         * q_drift, keeping the geometry consistent. */
-        float nod_axis_eff[3], tilt_axis_eff[3];
-        compute_effective_axes(&np, s_gd.q_drift, nod_axis_eff, tilt_axis_eff);
+        /* ---- Forward-vector cross product → rotation axis -------------- */
+        const float FWD_BODY[3] = {1.0f, 0.0f, 0.0f};
+        float fwd[3];
+        quat_rotate_vec(qcur, FWD_BODY, fwd);
 
-        /* Project onto the (drift-rotated) gesture axes, then apply sign.
-         * The projection replaces the old rel_pitch / rel_roll channels. */
-        float proj_nod  = v3_dot(r, nod_axis_eff);
-        float proj_tilt = v3_dot(r, tilt_axis_eff);
-        proj_nod  = apply_sign_pitch(proj_nod,  s_gd.params.sign_pitch);
-        proj_tilt = apply_sign_roll (proj_tilt, s_gd.params.sign_roll);
-
-        /* ---- Projection glitch filter ---------------------------------
-         * DMP can produce single-frame quaternion jumps that slip through
-         * the |r|<45° filter.  When that happens the projection itself
-         * jumps by 20°+ in one tick, polluting the EMA for many frames.
-         *
-         * Guard: if the projection delta exceeds PROJ_MAX_DELTA in one
-         * frame, treat it as a glitch — skip this tick entirely (don't
-         * update prev projections, EMA, or state machine).  This is
-         * separate from the |r| filter which catches large *rotation*
-         * glitches; this catches large *projection* glitches that happen
-         * at smaller |r|. */
-        const float PROJ_MAX_DELTA = 20.0f;   /* °/frame — reject above */
-        if (prev_valid) {
-            float d_nod  = fabsf(proj_nod  - prev_nod);
-            float d_tilt = fabsf(proj_tilt - prev_tilt);
-            if (d_nod > PROJ_MAX_DELTA || d_tilt > PROJ_MAX_DELTA) {
-                GD_DBGW("DBG-PROJ-GLITCH dn=%.1f dt=%.1f (max %.0f)",
-                         d_nod, d_tilt, PROJ_MAX_DELTA);
-                prev_valid = false;
-                vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
-                continue;
-            }
+        float cp[3] = {0.0f, 0.0f, 0.0f};
+        bool cp_valid = false;
+        if (s_gd.prev_fwd_valid) {
+            v3_cross(s_gd.prev_fwd, fwd, cp);
+            cp_valid = (v3_norm(cp) > 0.0001f);
         }
+        s_gd.prev_fwd[0] = fwd[0]; s_gd.prev_fwd[1] = fwd[1]; s_gd.prev_fwd[2] = fwd[2];
+        s_gd.prev_fwd_valid = true;
 
-        /* Derivative-based velocity (degrees/sec). First sample uses 0.
-         * Apply EMA smoothing (α=0.3) to suppress single-frame noise
-         * spikes that cause the dominance gate to pick the wrong axis.
-         *
-         * DMP noise can produce frame-to-frame projection jumps of 30°+
-         * even when |r| < 45° (the glitch filter threshold), yielding
-         * velocities of 1500°/s+. These extreme spikes contaminate the
-         * EMA for many ticks. Filter them out: only feed the EMA when
-         * the raw velocity is within a human-possible range (~200°/s
-         * peak, use 400°/s ceiling for safety). */
-        float vel_nod = 0.0f, vel_tilt = 0.0f;
-        const float VEL_ALPHA = 0.3f;
-        const float VEL_MAX   = 400.0f;   /* °/s — skip EMA update above this */
+        /* ---- Angular velocity (deg/s) from rotation magnitude change -- */
+        float vel = 0.0f;
         if (prev_valid) {
-            float dt = (float)GD_TASK_PERIOD_MS / 1000.0f;
-            vel_nod  = (proj_nod  - prev_nod)  / dt;
-            vel_tilt = (proj_tilt - prev_tilt) / dt;
-            if (absf(vel_nod) <= VEL_MAX) {
-                s_gd.smooth_vel_nod  = VEL_ALPHA * absf(vel_nod)
-                                     + (1.0f - VEL_ALPHA) * s_gd.smooth_vel_nod;
-            } else {
-                GD_DBGW("DBG-VEL-CLAMP nod vel=%.0f°/s (max %.0f)", vel_nod, VEL_MAX);
-            }
-            if (absf(vel_tilt) <= VEL_MAX) {
-                s_gd.smooth_vel_tilt = VEL_ALPHA * absf(vel_tilt)
-                                     + (1.0f - VEL_ALPHA) * s_gd.smooth_vel_tilt;
-            } else {
-                GD_DBGW("DBG-VEL-CLAMP tilt vel=%.0f°/s (max %.0f)", vel_tilt, VEL_MAX);
-            }
+            vel = fabsf(r_mag - prev_r_mag) / ((float)GD_TASK_PERIOD_MS / 1000.0f);
         }
-        prev_nod   = proj_nod;
-        prev_tilt  = proj_tilt;
+        prev_r_mag = r_mag;
         prev_valid = true;
 
-        /* Data-capture mode: log every frame's raw metrics at 50 Hz.
-         * Triggered by `dc` BLE command; auto-expires after the requested
-         * duration.  Compact one-line format for easy parsing:
-         *   DC t=<ms> pn=<°> pt=<°> vn=<°/s> vt=<°/s> sn=<°/s> st=<°/s> rm=<°> ps=<0-2> rs=<0-2>
-         * ps/rs: 0=NEUTRAL 1=LOCKED_POS 2=LOCKED_NEG */
+        /* Accumulation state (declared early so DC output can reference them) */
+        static uint32_t s_end_hold = 0;
+        static float    s_peak_sign_dot = 0.0f;
+
+        /* ---- 3-axis classification via dot product with signatures ----
+         * Copy packed sig arrays to aligned locals to avoid
+         * -Werror=address-of-packed-member. */
+        float sig_nod_a[3], sig_tiltL_a[3], sig_tiltR_a[3];
+        memcpy(sig_nod_a,   s_gd.sig.sig_nod,   sizeof(sig_nod_a));
+        memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
+        memcpy(sig_tiltR_a, s_gd.sig.sig_tiltR, sizeof(sig_tiltR_a));
+
+        int best_sig_idx = -1;
+        if (s_gd.sig.calibrated != 0 && cp_valid) {
+            if (!s_gd.smooth_axis_valid) {
+                s_gd.smooth_axis[0] = cp[0]; s_gd.smooth_axis[1] = cp[1]; s_gd.smooth_axis[2] = cp[2];
+                s_gd.smooth_axis_valid = true;
+            } else {
+                float d = v3_dot(cp, s_gd.smooth_axis);
+                if (d < 0.0f) { cp[0]=-cp[0]; cp[1]=-cp[1]; cp[2]=-cp[2]; }
+                const float AX_ALPHA = 0.2f;
+                s_gd.smooth_axis[0] = s_gd.smooth_axis[0]*(1-AX_ALPHA) + cp[0]*AX_ALPHA;
+                s_gd.smooth_axis[1] = s_gd.smooth_axis[1]*(1-AX_ALPHA) + cp[1]*AX_ALPHA;
+                s_gd.smooth_axis[2] = s_gd.smooth_axis[2]*(1-AX_ALPHA) + cp[2]*AX_ALPHA;
+                float sm = v3_norm(s_gd.smooth_axis);
+                if (sm > 0.001f) { s_gd.smooth_axis[0]/=sm; s_gd.smooth_axis[1]/=sm; s_gd.smooth_axis[2]/=sm; }
+            }
+            /* Only classify against calibrated signatures. */
+            float dn  = (s_gd.sig.calibrated & GESTURE_SIG_F_NOD)   ? v3_dot(s_gd.smooth_axis, sig_nod_a)   : 0.0f;
+            float dtl = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) ? v3_dot(s_gd.smooth_axis, sig_tiltL_a) : 0.0f;
+            float dtr = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTR) ? v3_dot(s_gd.smooth_axis, sig_tiltR_a) : 0.0f;
+            /* Index must match sig_gt[]: 0=NOD 1=LOOK_UP 2=TILTL 3=TILTR */
+            float ad[] = {fabsf(dn), 0.0f, fabsf(dtl), fabsf(dtr)};
+            float best = 0.0f; int bi = -1;
+            for (int i = 0; i < 4; i++) { if (ad[i] > best) { best = ad[i]; bi = i; } }
+            if (best > 0.15f) best_sig_idx = bi;
+        }
+
+        /* ---- Scale cross product by calibration-derived factor ---------
+         * Forward-vector cross product values are tiny (~0.01-0.1)
+         * because the forward direction barely changes per frame.
+         * Calibration records avg_cp per gesture; scale brings
+         * average gesture to ~1.0 for usable accumulation range. */
+        float cp_sc[3] = {cp[0], cp[1], cp[2]};
+        {
+            float avg_cp = 0.0f;
+            if (best_sig_idx >= 0) {
+                switch (best_sig_idx) {
+                    case 0: case 1: avg_cp = s_gd.sig.avg_cp_nod;   break;
+                    case 2:         avg_cp = s_gd.sig.avg_cp_tiltL; break;
+                    case 3:         avg_cp = s_gd.sig.avg_cp_tiltR; break;
+                }
+            } else {
+                /* Before classification, use overall average */
+                avg_cp = (s_gd.sig.avg_cp_nod + s_gd.sig.avg_cp_tiltL + s_gd.sig.avg_cp_tiltR) / 3.0f;
+            }
+            if (avg_cp > 0.001f) {
+                float scale = 1.0f / avg_cp;
+                cp_sc[0] = cp[0] * scale;
+                cp_sc[1] = cp[1] * scale;
+                cp_sc[2] = cp[2] * scale;
+            }
+        }
+
+        /* Data-capture mode: log frame metrics at 50 Hz. */
         if (s_dc_active) {
             if (now_ms >= s_dc_until_ms) {
                 s_dc_active = false;
                 ESP_LOGI(TAG, "data capture OFF");
             } else {
-                ESP_LOGI(TAG, "DC t=%u pn=%+.1f pt=%+.1f vn=%+.0f vt=%+.0f "
-                         "sn=%.0f st=%.0f rm=%.1f ps=%d rs=%d",
-                         (unsigned)now_ms, proj_nod, proj_tilt,
-                         vel_nod, vel_tilt,
-                         s_gd.smooth_vel_nod, s_gd.smooth_vel_tilt,
-                         r_mag,
-                         (int)s_gd.pitch.state, (int)s_gd.roll.state);
+                /* Line 1: raw data + rotation axis + velocity */
+                ESP_LOGI(TAG, "DC1 t=%u r=[%+.1f %+.1f %+.1f] rm=%.1f "
+                         "cp=[%.4f %.4f %.4f] sc=[%.2f %.2f %.2f] vel=%.0f",
+                         (unsigned)now_ms,
+                         r[0], r[1], r[2], r_mag,
+                         cp_valid ? cp[0] : 0.0f,
+                         cp_valid ? cp[1] : 0.0f,
+                         cp_valid ? cp[2] : 0.0f,
+                         cp_sc[0], cp_sc[1], cp_sc[2],
+                         vel);
+                /* Line 2: accumulation + classification */
+                float acc_mag = v3_norm(s_gd.accum);
+                float acc_n = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_nod_a) / acc_mag : 0.0f;
+                float acc_tL = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltL_a) / acc_mag : 0.0f;
+                float acc_tR = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltR_a) / acc_mag : 0.0f;
+                ESP_LOGI(TAG, "DC2 idx=%d acc=[%.1f %.1f %.1f] |acc|=%.1f "
+                         "dot(n=%.2f tL=%.2f tR=%.2f) hold=%u",
+                         best_sig_idx,
+                         s_gd.accum[0], s_gd.accum[1], s_gd.accum[2],
+                         acc_mag, acc_n, acc_tL, acc_tR,
+                         (unsigned)s_end_hold);
             }
         }
 
-        /* ----- diagnostic dump (rate-limited, motion-gated) -----------
-         * Logs all four signals at 10 Hz, but only while one of the
-         * projections exceeds 2° from neutral. Suppressed entirely
-         * until gesture_detect_calibrate_axes() has completed — the
-         * pre-calibration projections reference placeholder axes and
-         * are not meaningful. Purpose: diagnose left/right tilt
-         * asymmetry by comparing the actual peak magnitudes each side
-         * achieves on raw input. Remove this block once the asymmetry
-         * is resolved. */
-        if (s_gd.calibrated) {
-            static uint32_t last_dbg_ms = 0;
-            static float    dbg_peak_nod  = 0.0f;
-            static float    dbg_peak_tilt = 0.0f;
-            if (absf(proj_nod) > 2.0f || absf(proj_tilt) > 2.0f) {
-                if (absf(proj_nod)  > dbg_peak_nod)  dbg_peak_nod  = absf(proj_nod);
-                if (absf(proj_tilt) > dbg_peak_tilt) dbg_peak_tilt = absf(proj_tilt);
-                if ((now_ms - last_dbg_ms) >= 100) {
-                    GD_DBGI("DBG t=%u nod=%+.1f(v%+.0f s%.0f) tilt=%+.1f(v%+.0f s%.0f) peak:nod=%.1f tilt=%.1f",
-                             now_ms, proj_nod, vel_nod, s_gd.smooth_vel_nod,
-                             proj_tilt, vel_tilt, s_gd.smooth_vel_tilt,
-                             dbg_peak_nod, dbg_peak_tilt);
-                    last_dbg_ms = now_ms;
+        /* ---- Per-gesture velocity thresholds (from calibration) ------- */
+        float trigger_vel = 50.0f, end_vel = 30.0f, peak_vel_ref = 100.0f;
+        if (best_sig_idx == 0 && s_gd.sig.peak_vel_nod > 10.0f)
+            peak_vel_ref = s_gd.sig.peak_vel_nod;
+        else if (best_sig_idx == 1 && s_gd.sig.peak_vel_nod > 10.0f)
+            peak_vel_ref = s_gd.sig.peak_vel_nod;
+        else if (best_sig_idx == 2 && s_gd.sig.peak_vel_tiltL > 10.0f)
+            peak_vel_ref = s_gd.sig.peak_vel_tiltL;
+        else if (best_sig_idx == 3 && s_gd.sig.peak_vel_tiltR > 10.0f)
+            peak_vel_ref = s_gd.sig.peak_vel_tiltR;
+        trigger_vel = peak_vel_ref * TRIG_VEL_FRAC;
+        end_vel     = peak_vel_ref * END_VEL_FRAC;
+
+        /* ---- Accumulation-based trigger --------------------------------
+         * Accumulate raw cross-product vectors while velocity > trigger.
+         * Record the sign of the accumulation at peak velocity.
+         * Fire when velocity drops below end_vel for END_HOLD_FRAMES
+         * and the accumulated sign matches the peak sign.
+         * The return stroke produces opposite-sign cross products,
+         * so the accumulator is naturally cancelled. */
+
+        if (s_gd.accum_armed && best_sig_idx >= 0 && cp_valid) {
+            const float *msig = NULL;
+            switch (best_sig_idx) {
+                case 0: case 1: msig = sig_nod_a;   break;
+                case 2:         msig = sig_tiltL_a;  break;
+                case 3:         msig = sig_tiltR_a;  break;
+            }
+            if (vel > trigger_vel) {
+                /* Accumulate scaled cross product. */
+                s_gd.accum[0] += cp_sc[0]; s_gd.accum[1] += cp_sc[1]; s_gd.accum[2] += cp_sc[2];
+                s_end_hold = 0;
+                /* Record sign at peak velocity. */
+                if (msig && vel > trigger_vel * 0.8f) {
+                    s_peak_sign_dot = v3_dot(s_gd.accum, msig);
+                }
+            } else if (vel < end_vel && v3_norm(s_gd.accum) > 1.0f) {
+                /* Velocity dropped below end_vel — start hold timer. */
+                s_end_hold++;
+                if (s_end_hold >= END_HOLD_FRAMES) {
+                    /* Check: accumulated sign matches peak sign? */
+                    float dot_final = msig ? v3_dot(s_gd.accum, msig) : 0.0f;
+                    bool sign_match = (dot_final * s_peak_sign_dot > 0.0f);
+                    if (sign_match && now_ms >= s_gd.cooldown_until_ms) {
+                        static const gesture_type_t sig_gt[] = {
+                            GESTURE_NOD, GESTURE_LOOK_UP, GESTURE_TILT_LEFT, GESTURE_TILT_RIGHT
+                        };
+                        emit_event(sig_gt[best_sig_idx], v3_norm(s_gd.accum), vel);
+                        GD_DBGI("DBG-FIRE idx=%d dot=%.2f accum=%.1f vel=%.0f",
+                                 best_sig_idx, dot_final, v3_norm(s_gd.accum), vel);
+                    }
+                    /* Reset accumulator regardless. */
+                    memset(s_gd.accum, 0, sizeof(s_gd.accum));
+                    s_gd.accum_armed = true;
+                    s_end_hold = 0; s_peak_sign_dot = 0.0f;
+                    s_gd.smooth_axis_valid = false;
                 }
             } else {
-                /* Returned to rest: report peaks then reset, so the user
-                 * sees "this gesture reached X° / Y°" after each motion. */
-                if (dbg_peak_nod > 2.0f || dbg_peak_tilt > 2.0f) {
-                    GD_DBGI("DBG rest  peak:nod=%.1f tilt=%.1f (sign_tilt=%s)",
-                             dbg_peak_nod, dbg_peak_tilt,
-                             (proj_tilt > 0.0f) ? "+" :
-                             ((proj_tilt < 0.0f) ? "-" : "0"));
-                }
-                dbg_peak_nod  = 0.0f;
-                dbg_peak_tilt = 0.0f;
-                last_dbg_ms   = now_ms;
+                /* Velocity in between trigger and end, or accumulator empty
+                 * — keep accumulating or do nothing. */
             }
+        } else if (best_sig_idx < 0) {
+            /* No classification — reset accumulator. */
+            memset(s_gd.accum, 0, sizeof(s_gd.accum));
+            s_gd.accum_armed = true;
+            s_end_hold = 0; s_peak_sign_dot = 0.0f;
         }
 
-        /* Single-event mutex. A nod with a small roll component used to
-         * fire BOTH NOD and TILT_RIGHT in the same tick. We pick the
-         * axis with the higher peak velocity (the dominant component of
-         * the motion) and suppress the other axis's emit_event() this
-         * tick — but only on the very first transition. If the other
-         * axis is already mid-lock from a previous gesture, that one
-         * isn't suppressed (its fire already happened earlier). The
-         * step_axis() rewinds suppressed axes to NEUTRAL so they
-         * remain ready for the next genuine gesture.
-         *
-         * Before both calibration steps have completed, the gesture axes
-         * are placeholder values, so the projections are meaningless.
-         * Suppress all event emission until then. */
-        if (!s_gd.calibrated) {
-            vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
-            continue;
-        }
-
-        /* Dominance gate. A real nod/look-up carries a tilt crosstalk that can
-         * be 40-70% of the nod magnitude (a person doesn't nod on a perfect
-         * vertical axis). The old per-tick mutex picked whichever axis was
-         * faster, but a tilt axis can briefly cross its trigger threshold
-         * before the nod does on a nod motion, firing the wrong label.
-         *
-         * Use EMA-smoothed velocity instead of raw frame-to-frame derivative
-         * to suppress noise spikes that cause the wrong axis to appear
-         * dominant for a single tick. Asymmetric thresholds: nod only needs
-         * 1.2× to dominate (it's the primary motion), while tilt requires
-         * 2.0× (tilt crosstalk from nod must not beat the real axis). */
-        const float DOM_NOD  = 1.2f;   /* nod needs sn ≥ 1.2 × st */
-        const float DOM_TILT = 2.0f;   /* tilt needs st ≥ 2.0 × sn */
-        bool nod_dominant;
-        float sv_nod  = s_gd.smooth_vel_nod;
-        float sv_tilt = s_gd.smooth_vel_tilt;
-        if (sv_nod < 1.0f && sv_tilt < 1.0f) {
-            nod_dominant = sv_nod >= sv_tilt;
-        } else {
-            float ratio_nt = sv_nod  / (sv_tilt + 1e-3f);
-            float ratio_tn = sv_tilt / (sv_nod  + 1e-3f);
-            if (ratio_nt >= DOM_NOD) {
-                nod_dominant = true;
-            } else if (ratio_tn >= DOM_TILT
-                       && absf(proj_tilt) >= absf(proj_nod)) {
-                /* Tilt velocity dominates AND tilt projection is actually
-                 * larger than nod projection.  The second check catches the
-                 * case where accumulated tilt EMA (st) is inflated by
-                 * crosstalk — if |proj_nod| > |proj_tilt| the user is
-                 * clearly nodding, not tilting, regardless of EMA state. */
-                nod_dominant = false;
-            } else {
-                /* Neither axis dominates — mixed motion. Hold fire this tick
-                 * and let the per-axis velocity check resolve on the next one. */
-                GD_DBGI("DBG-DOM-SKIP proj_nod=%+.1f proj_tilt=%+.1f "
-                         "sv_nod=%.1f sv_tilt=%.1f r_nt=%.2f r_tn=%.2f (n%.1f t%.1f)",
-                         proj_nod, proj_tilt, sv_nod, sv_tilt,
-                         ratio_nt, ratio_tn, DOM_NOD, DOM_TILT);
-                vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
-                continue;
-            }
-        }
-        bool fired_this_tick = false;
-        /* Capture axis states before step_axis so we can detect
-         * LOCKED→NEUTRAL transitions (gesture completed, head back
-         * near rest). Snap q_drift at that moment to prevent the
-         * DMP-drift accumulation that causes false TILT fires. */
-        axis_state_t pitch_before = s_gd.pitch.state;
-        axis_state_t roll_before  = s_gd.roll.state;
-        if (nod_dominant) {
-            fired_this_tick = step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
-                      GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ true);
-            step_axis(&s_gd.roll,  proj_tilt, absf(vel_tilt), now_ms,
-                      GESTURE_TILT_RIGHT, GESTURE_TILT_LEFT,
-                      /* allow_fire = */ false);
-        } else {
-            fired_this_tick = step_axis(&s_gd.roll,  proj_tilt, absf(vel_tilt), now_ms,
-                      GESTURE_TILT_RIGHT, GESTURE_TILT_LEFT, /* allow_fire = */ true);
-            step_axis(&s_gd.pitch, proj_nod, absf(vel_nod), now_ms,
-                      GESTURE_NOD, GESTURE_LOOK_UP, /* allow_fire = */ false);
-        }
-        /* Snap-on-return: when either axis transitions from a LOCKED
-         * state back to NEUTRAL, the gesture has completed and the head
-         * has returned near its resting position. Snap q_drift now to
-         * prevent projection drift from accumulating across rapid
-         * gesture sequences. Without this, q_drift goes stale during
-         * fast alternating nods/look-ups, pt drifts to ±40°, and
-         * false TILT events fire. */
-        static uint32_t s_vel_still_since = 0;
-        bool pitch_returned = (pitch_before == GD_AXIS_LOCKED_POS ||
-                               pitch_before == GD_AXIS_LOCKED_NEG) &&
-                              s_gd.pitch.state == GD_AXIS_NEUTRAL;
-        bool roll_returned  = (roll_before == GD_AXIS_LOCKED_POS ||
-                               roll_before == GD_AXIS_LOCKED_NEG) &&
-                              s_gd.roll.state  == GD_AXIS_NEUTRAL;
-        if (pitch_returned || roll_returned) {
-            float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
-                      qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
-            if (d < 0.0f) {
-                s_gd.q_drift[0] = -qcur[0]; s_gd.q_drift[1] = -qcur[1];
-                s_gd.q_drift[2] = -qcur[2]; s_gd.q_drift[3] = -qcur[3];
-            } else {
-                memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
-            }
-            constrain_q_drift(&s_gd, &np);
-            s_gd.still_since_ms = now_ms;   /* re-arm Phase 5 timer */
-            s_vel_still_since = 0;          /* prevent redundant vel-snap */
-            GD_DBGI("DBG-SNAP-RET proj_nod=%+.1f proj_tilt=%+.1f "
-                     "rm=%.1f (%s returned)",
-                     proj_nod, proj_tilt, r_mag,
-                     pitch_returned ? "pitch" : "roll");
-        }
-        /* After any gesture fires, reset both smooth velocities to zero.
-         * This prevents accumulated crosstalk EMA from a previous gesture
-         * contaminating the next gesture's dominance decision.  Without
-         * this, st can build to 150-300+°/s over a rapid sequence of
-         * nods/look-ups and trigger false TILT events. */
-        if (fired_this_tick) {
-            s_gd.smooth_vel_nod  = 0.0f;
-            s_gd.smooth_vel_tilt = 0.0f;
-            GD_DBGI("DBG-CTX proj_nod=%+.1f proj_tilt=%+.1f "
-                     "sv_nod=%.1f sv_tilt=%.1f dom=%s",
-                     proj_nod, proj_tilt, sv_nod, sv_tilt,
-                     nod_dominant ? "NOD" : "TILT");
-        }
-
-        /* Phase 5: sliding baseline snap.
-         *
-         * Primary (velocity-based): when both projected velocities are
-         * near zero for VEL_STILL_MS, snap q_drift to qcur.  This
-         * catches the common case of fast alternating gestures where
-         * q_drift goes stale and projections grow to ±40° — the brief
-         * pauses between gestures have near-zero velocity even though
-         * the projections are large.  Snapping re-centers the baseline
-         * so the next gesture starts clean.
-         *
-         * Secondary (projection-based): when both projections are
-         * inside the dead zone for STILL_DURATION_MS, snap.  This
-         * handles long-term micro-drift during quiet periods.
-         *
-         * Both paths respect the q/-q hemisphere to avoid the
-         * wrap-around the DMP occasionally produces. */
+        /* ---- Phase 5: sliding baseline snap --------------------------- */
         const uint32_t STILL_DURATION_MS = 200;
-        const uint32_t VEL_STILL_MS      = 120;
-        const float VEL_STILL_THRESH     = 15.0f;   /* °/s */
         const float zone_for_still = s_gd.params.neutral_zone_deg;
-        bool proj_still = (absf(proj_nod) < zone_for_still) &&
-                          (absf(proj_tilt) < zone_for_still);
-        bool vel_still  = (absf(vel_nod) < VEL_STILL_THRESH) &&
-                          (absf(vel_tilt) < VEL_STILL_THRESH);
-
-        /* Velocity-still timer: tracks consecutive ticks where both
-         * projected velocities are near zero but projections are large
-         * (i.e. q_drift is stale). */
+        bool proj_still = (r_mag < zone_for_still);
+        bool vel_still  = (vel < 15.0f);
+        static uint32_t s_vel_still_since = 0;
 
         if (proj_still) {
             if (s_gd.still_since_ms == 0) {
@@ -978,19 +891,15 @@ static void detector_task(void *arg)
                 constrain_q_drift(&s_gd, &np);
                 s_gd.still_since_ms = now_ms;
                 s_vel_still_since = 0;
-                GD_DBGI("DBG-SNAP-ProjStill pn=%+.1f pt=%+.1f rm=%.1f",
-                         proj_nod, proj_tilt, r_mag);
             }
         } else {
             s_gd.still_since_ms = 0;
         }
 
         if (vel_still && !proj_still) {
-            /* Velocity is near zero but projections are large →
-             * q_drift is stale.  Snap after a short window. */
             if (s_vel_still_since == 0) {
                 s_vel_still_since = now_ms;
-            } else if ((now_ms - s_vel_still_since) >= VEL_STILL_MS) {
+            } else if ((now_ms - s_vel_still_since) >= 120) {
                 float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
                           qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
                 if (d < 0.0f) {
@@ -1001,9 +910,6 @@ static void detector_task(void *arg)
                 }
                 constrain_q_drift(&s_gd, &np);
                 s_vel_still_since = now_ms;
-                GD_DBGI("DBG-SNAP-VelStill pn=%+.1f pt=%+.1f "
-                         "vn=%.0f vt=%.0f rm=%.1f",
-                         proj_nod, proj_tilt, vel_nod, vel_tilt, r_mag);
             }
         } else if (!vel_still) {
             s_vel_still_since = 0;
@@ -1716,13 +1622,21 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
 
     float q_rest_conj[4]; quat_conj(q_rest, q_rest_conj);
     float best_mag = 0.0f;
-    float axis_sum[3] = {0};
+    float best_vel = 0.0f;
     uint32_t gesture_count = 0;
     uint32_t gesture_ticks_count = (rest_count >= 999) ? ticks : gesture_ticks;
 
     float all_r[120][3];
     float all_mag[120];
     uint32_t n_frames = 0;
+    float prev_r_mag = 0.0f;
+    TickType_t prev_frame_tick = 0;
+    /* Track forward-vector cross product magnitudes during calibration */
+    const float FWD_B[3] = {1.0f, 0.0f, 0.0f};
+    float prev_fwd_cal[3] = {0.0f};
+    bool  prev_fwd_cal_valid = false;
+    float cp_mag_sum = 0.0f;
+    uint32_t cp_count = 0;
 
     s_gd.calibrating = true;
     for (uint32_t i = 0; i < gesture_ticks_count && n_frames < 120; i++) {
@@ -1733,13 +1647,56 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                 float qrel[4]; quat_mul(q_rest_conj, q, qrel); quat_normalize(qrel);
                 float r[3]; quat_to_rotvec_deg(qrel, r);
                 float mag = v3_norm(r);
+                /* Skip frames beyond 90 degrees — quaternion wrap artifacts
+                 * cause sudden jumps (e.g. 13° → 146°) that corrupt the
+                 * velocity and axis statistics. */
+                if (mag > 90.0f) {
+                    gesture_count++;
+                    vTaskDelay(pdMS_TO_TICKS(period_ms));
+                    continue;
+                }
+                /* Compute velocity BEFORE recording this frame.
+                 * Use actual elapsed ticks to handle skipped frames
+                 * (>90° quaternion wrap) where time passes but
+                 * prev_r_mag isn't updated. */
+                float vel_now = 0.0f;
+                TickType_t now_tick = xTaskGetTickCount();
+                if (n_frames > 0 && prev_frame_tick > 0) {
+                    float dt_s = (float)(now_tick - prev_frame_tick) * portTICK_PERIOD_MS / 1000.0f;
+                    if (dt_s > 0.001f) {
+                        vel_now = fabsf(mag - prev_r_mag) / dt_s;
+                    }
+                    if (vel_now > best_vel) best_vel = vel_now;
+                }
                 all_r[n_frames][0] = r[0];
                 all_r[n_frames][1] = r[1];
                 all_r[n_frames][2] = r[2];
                 all_mag[n_frames] = mag;
                 n_frames++;
-                if (mag > best_mag && mag < 90.0f) best_mag = mag;
+                if (mag > best_mag) best_mag = mag;
+                prev_r_mag = mag;
+                prev_frame_tick = now_tick;
                 gesture_count++;
+                /* Compute forward-vector cross product for avg_cp */
+                {
+                    float fwd_cal[3];
+                    quat_rotate_vec(q, FWD_B, fwd_cal);
+                    if (prev_fwd_cal_valid) {
+                        float cpv[3];
+                        v3_cross(prev_fwd_cal, fwd_cal, cpv);
+                        cp_mag_sum += v3_norm(cpv);
+                        cp_count++;
+                    }
+                    prev_fwd_cal[0] = fwd_cal[0]; prev_fwd_cal[1] = fwd_cal[1]; prev_fwd_cal[2] = fwd_cal[2];
+                    prev_fwd_cal_valid = true;
+                }
+                /* Debug: output every 5th frame during calibration */
+                if (n_frames % 5 == 0) {
+                    ESP_LOGI(TAG, "CAL-%s f=%u r=[%+.1f %+.1f %+.1f] mag=%.1f vel=%.0f "
+                             "best_mag=%.1f best_vel=%.0f",
+                             names[type], (unsigned)n_frames, r[0], r[1], r[2], mag, vel_now,
+                             best_mag, best_vel);
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(period_ms));
@@ -1747,12 +1704,45 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
     s_gd.calibrating = false;
 
     const float FRAC_MIN = 0.30f;
+
+    /* ---- Compute gesture axis via PCA (principal component) -----------
+     * The gesture axis is the direction of maximum variance in r-space.
+     * PCA removes the mean (eliminating drift offset) and finds the
+     * direction where the r vectors spread the most (the gesture axis).
+     * Power iteration: 5 iterations on 3x3 covariance matrix. */
+    /* 1. Compute centroid of qualifying frames */
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+    uint32_t pca_n = 0;
     for (uint32_t i = 0; i < n_frames; i++) {
         if (all_mag[i] > best_mag * FRAC_MIN && all_mag[i] < 90.0f) {
-            float inv = 1.0f / all_mag[i];
-            axis_sum[0] += all_r[i][0] * inv;
-            axis_sum[1] += all_r[i][1] * inv;
-            axis_sum[2] += all_r[i][2] * inv;
+            cx += all_r[i][0]; cy += all_r[i][1]; cz += all_r[i][2];
+            pca_n++;
+        }
+    }
+    float axis[3] = {0.0f, 0.0f, 0.0f};
+    if (pca_n >= 2) {
+        float inv_n = 1.0f / (float)pca_n;
+        cx *= inv_n; cy *= inv_n; cz *= inv_n;
+        /* 2. Build 3x3 covariance matrix from centered vectors */
+        float c00=0,c01=0,c02=0, c11=0,c12=0, c22=0;
+        for (uint32_t i = 0; i < n_frames; i++) {
+            if (all_mag[i] <= best_mag * FRAC_MIN || all_mag[i] >= 90.0f) continue;
+            float dx = all_r[i][0] - cx;
+            float dy = all_r[i][1] - cy;
+            float dz = all_r[i][2] - cz;
+            c00 += dx*dx; c01 += dx*dy; c02 += dx*dz;
+            c11 += dy*dy; c12 += dy*dz;
+            c22 += dz*dz;
+        }
+        /* 3. Power iteration: find dominant eigenvector */
+        axis[0] = 1.0f; axis[1] = 0.0f; axis[2] = 0.0f;
+        for (int iter = 0; iter < 8; iter++) {
+            float x = c00*axis[0] + c01*axis[1] + c02*axis[2];
+            float y = c01*axis[0] + c11*axis[1] + c12*axis[2];
+            float z = c02*axis[0] + c12*axis[1] + c22*axis[2];
+            float nm = sqrtf(x*x + y*y + z*z);
+            if (nm < 1e-10f) break;
+            axis[0] = x/nm; axis[1] = y/nm; axis[2] = z/nm;
         }
     }
 
@@ -1761,12 +1751,16 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
         return ESP_FAIL;
     }
 
-    float axis_sm = sqrtf(axis_sum[0]*axis_sum[0] + axis_sum[1]*axis_sum[1] + axis_sum[2]*axis_sum[2]);
+    float axis_sm = sqrtf(axis[0]*axis[0] + axis[1]*axis[1] + axis[2]*axis[2]);
     if (axis_sm < 0.01f) {
-        ESP_LOGE(TAG, "gesture cal %s: axis sum too small, no valid frames", names[type]);
+        ESP_LOGE(TAG, "gesture cal %s: axis sum too small (cp_count=%u), no valid frames",
+                 names[type], (unsigned)cp_count);
         return ESP_FAIL;
     }
-    float axis[3] = {axis_sum[0]/axis_sm, axis_sum[1]/axis_sm, axis_sum[2]/axis_sm};
+    axis[0] /= axis_sm; axis[1] /= axis_sm; axis[2] /= axis_sm;
+
+    ESP_LOGI(TAG, "gesture %s: axis PCA=[%+.3f %+.3f %+.3f] pca_n=%u",
+             names[type], axis[0], axis[1], axis[2], (unsigned)pca_n);
 
     uint32_t avg_count = 0;
     for (uint32_t i = 0; i < n_frames; i++) {
@@ -1774,10 +1768,15 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
     }
 
     uint8_t flag = 0;
+    float avg_cp = (cp_count > 0) ? (cp_mag_sum / (float)cp_count) : 0.0f;
+    ESP_LOGI(TAG, "gesture %s: avg_cp=%.4f (sum=%.3f cnt=%u)",
+             names[type], avg_cp, cp_mag_sum, (unsigned)cp_count);
     switch (type) {
         case GESTURE_NOD:
             memcpy(s_gd.sig.sig_nod, axis, sizeof(float)*3);
             s_gd.sig.spread_nod_deg = 0.0f;
+            s_gd.sig.peak_vel_nod = best_vel;
+            s_gd.sig.avg_cp_nod = avg_cp;
             flag = GESTURE_SIG_F_NOD;
             break;
         case GESTURE_LOOK_UP:
@@ -1788,11 +1787,15 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
         case GESTURE_TILT_LEFT:
             memcpy(s_gd.sig.sig_tiltL, axis, sizeof(float)*3);
             s_gd.sig.spread_tiltL_deg = 0.0f;
+            s_gd.sig.peak_vel_tiltL = best_vel;
+            s_gd.sig.avg_cp_tiltL = avg_cp;
             flag = GESTURE_SIG_F_TILTL;
             break;
         case GESTURE_TILT_RIGHT:
             memcpy(s_gd.sig.sig_tiltR, axis, sizeof(float)*3);
             s_gd.sig.spread_tiltR_deg = 0.0f;
+            s_gd.sig.peak_vel_tiltR = best_vel;
+            s_gd.sig.avg_cp_tiltR = avg_cp;
             flag = GESTURE_SIG_F_TILTR;
             break;
         default: break;

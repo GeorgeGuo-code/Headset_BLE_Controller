@@ -608,7 +608,7 @@ static void handle_command(const char *cmd)
         ble_console_logf("REST calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
     } else if (strcmp(cmd, "cn") == 0) {
         ble_console_log("calibrating NOD (do a slow chin-down nod)...\n");
-        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_NOD, 2000);
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_NOD, 4000);
         ble_console_logf("NOD calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
         if (err == ESP_OK) {
             gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
@@ -617,7 +617,7 @@ static void handle_command(const char *cmd)
         }
     } else if (strcmp(cmd, "ctl") == 0) {
         ble_console_log("calibrating TILT_LEFT (do a slow left tilt)...\n");
-        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_LEFT, 2000);
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_LEFT, 4000);
         ble_console_logf("TILT_LEFT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
         if (err == ESP_OK) {
             gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
@@ -626,7 +626,7 @@ static void handle_command(const char *cmd)
         }
     } else if (strcmp(cmd, "ctr") == 0) {
         ble_console_log("calibrating TILT_RIGHT (do a slow right tilt)...\n");
-        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_RIGHT, 2000);
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_RIGHT, 4000);
         ble_console_logf("TILT_RIGHT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
         if (err == ESP_OK) {
             gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
@@ -679,6 +679,11 @@ static void handle_command(const char *cmd)
             ble_console_logf("  tiltR_axis =[%.3f %.3f %.3f] spread=%.1f°\n",
                              sig.sig_tiltR[0], sig.sig_tiltR[1], sig.sig_tiltR[2], sig.spread_tiltR_deg);
         ble_console_logf("  sig_mask=0x%02x\n", sig.calibrated);
+        if (sig.peak_vel_nod > 0.0f)
+            ble_console_logf("  peak_vel: nod=%.0f tiltL=%.0f tiltR=%.0f deg/s\n",
+                             sig.peak_vel_nod, sig.peak_vel_tiltL, sig.peak_vel_tiltR);
+        ble_console_logf("  avg_cp: nod=%.4f tiltL=%.4f tiltR=%.4f\n",
+                         sig.avg_cp_nod, sig.avg_cp_tiltL, sig.avg_cp_tiltR);
     } else if (strcmp(cmd, "q") == 0) {
         /* Phase 5: standalone q_drift diagnostic. Reports the angle between
          * q_drift and q_neutral — the larger this gets, the more佩戴微调

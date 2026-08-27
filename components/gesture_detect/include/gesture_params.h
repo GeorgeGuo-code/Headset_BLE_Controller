@@ -163,6 +163,12 @@ typedef struct __attribute__((packed)) {
     float   spread_lookup_deg;  /*!< angular std-dev for LOOK_UP */
     float   spread_tiltL_deg;   /*!< angular std-dev for TILT_LEFT */
     float   spread_tiltR_deg;   /*!< angular std-dev for TILT_RIGHT */
+    float   peak_vel_nod;       /*!< peak angular velocity during NOD calibration (deg/s) */
+    float   peak_vel_tiltL;     /*!< peak angular velocity during TILT_LEFT calibration (deg/s) */
+    float   peak_vel_tiltR;     /*!< peak angular velocity during TILT_RIGHT calibration (deg/s) */
+    float   avg_cp_nod;        /*!< avg cross-product magnitude during NOD calibration */
+    float   avg_cp_tiltL;      /*!< avg cross-product magnitude during TILT_LEFT calibration */
+    float   avg_cp_tiltR;      /*!< avg cross-product magnitude during TILT_RIGHT calibration */
     uint8_t calibrated;         /*!< bitmask of GESTURE_SIG_F_* */
     uint8_t reserved[3];
 } gesture_signatures_t;
