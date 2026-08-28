@@ -30,6 +30,18 @@
 static cmd_config_t s_configs[CMD_CFG_MAX];
 static SemaphoreHandle_t s_mutex;
 
+/* Per-config cooldown tracking (not persisted — reset on reboot). */
+static uint32_t s_last_fire_ms[CMD_CFG_MAX];
+
+/* ── Fuzzy matching threshold ──────────────────────────────────────────────
+ * When a gesture fires with confidence below this value, the detector is
+ * "unsure" — the rotation axis didn't strongly match any signature.  In
+ * that case we also check fallback_value for a match, allowing the config
+ * to fire on a neighboring gesture (e.g. LOOK_UP when the user intended
+ * NOD but the detector misclassified).  Above this threshold, only
+ * trigger_value is checked (exact match). */
+#define FUZZY_CONFIDENCE_THRESHOLD  0.7f
+
 /* ── NVS helpers ────────────────────────────────────────────────────────── */
 
 static esp_err_t nvs_cfg_key(uint8_t id, char *buf, size_t buf_size)
@@ -235,6 +247,7 @@ esp_err_t cmd_config_init(void)
     if (!s_mutex) return ESP_ERR_NO_MEM;
 
     memset(s_configs, 0, sizeof(s_configs));
+    memset(s_last_fire_ms, 0, sizeof(s_last_fire_ms));
 
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
@@ -306,12 +319,49 @@ esp_err_t cmd_config_set(const cmd_config_t *cfg)
     return err;
 }
 
+esp_err_t cmd_config_set_fuzzy(uint8_t id, uint16_t fallback_value,
+                               uint16_t cooldown_ms, uint8_t min_confidence)
+{
+    if (id < 1 || id > CMD_CFG_MAX) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    cmd_config_t *cfg = &s_configs[id - 1];
+    if (cfg->id == 0) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "set_fuzzy: cfg_%u does not exist", (unsigned)id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    cfg->fallback_value = fallback_value;
+    cfg->cooldown_ms    = cooldown_ms;
+    cfg->min_confidence = min_confidence;
+    xSemaphoreGive(s_mutex);
+
+    /* persist to NVS */
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+
+    char key[8];
+    snprintf(key, sizeof(key), "%s%u", NVS_KEY_PREFIX, (unsigned)id);
+    err = nvs_set_blob(h, key, cfg, sizeof(*cfg));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    ESP_LOGI(TAG, "set_fuzzy id=%u fallback=0x%04x cooldown=%u conf=%u",
+             (unsigned)id, (unsigned)fallback_value,
+             (unsigned)cooldown_ms, (unsigned)min_confidence);
+    return err;
+}
+
 esp_err_t cmd_config_delete(uint8_t id)
 {
     if (id < 1 || id > CMD_CFG_MAX) return ESP_ERR_INVALID_ARG;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memset(&s_configs[id - 1], 0, sizeof(cmd_config_t));
+    s_last_fire_ms[id - 1] = 0;
     xSemaphoreGive(s_mutex);
 
     nvs_handle_t h;
@@ -341,29 +391,95 @@ esp_err_t cmd_config_execute(uint8_t id)
     return hid_output_send_seq(cfg->steps, cfg->n_steps);
 }
 
-void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value)
+void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
+                                   float confidence)
 {
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+    /* ── Diagnostic: log the incoming gesture event ────────────────────── */
+    static const char *gesture_names[] = {
+        "NONE", "NOD", "LOOK_UP", "TILT_LEFT", "TILT_RIGHT"
+    };
+    const char *gname = (value <= 4) ? gesture_names[value] : "?";
+    ESP_LOGI(TAG, "═══ gesture event: %s (val=%u) conf=%.2f (%.0f%%) ═══",
+             gname, (unsigned)value, confidence, confidence * 100.0f);
+
     for (uint8_t i = 0; i < CMD_CFG_MAX; i++) {
-        const cmd_config_t *cfg = &s_configs[i];
+        cmd_config_t *cfg = &s_configs[i];
         if (cfg->id == 0) continue;
         if (cfg->trigger_type != type) continue;
 
         bool match = false;
+        const char *match_reason = NULL;
+
         if (type == TRIGGER_GESTURE) {
-            /* Bitmask match: value is a single gesture (1<<gesture_type),
-             * trigger_value is a bitmask of allowed gestures.
-             * Any bit matching = trigger (OR logic). */
-            match = (cfg->trigger_value & (1 << value)) != 0;
+            uint16_t gesture_bit = (1 << value);
+            bool primary   = (cfg->trigger_value & gesture_bit) != 0;
+            bool fallback  = (cfg->fallback_value & gesture_bit) != 0;
+            bool conf_gate = (cfg->min_confidence == 0 ||
+                              (confidence * 100.0f) >= (float)cfg->min_confidence);
+
+            ESP_LOGD(TAG, "  cfg_%u '%s': trigger=0x%04x fallback=0x%04x "
+                     "min_conf=%u%% | gesture_bit=0x%04x",
+                     (unsigned)cfg->id, cfg->name,
+                     (unsigned)cfg->trigger_value, (unsigned)cfg->fallback_value,
+                     (unsigned)cfg->min_confidence, (unsigned)gesture_bit);
+            ESP_LOGD(TAG, "    primary=%d fallback=%d conf_gate=%d",
+                     (int)primary, (int)fallback, (int)conf_gate);
+
+            if (primary) {
+                if (conf_gate) {
+                    match = true;
+                    match_reason = "PRIMARY match (conf passes gate)";
+                } else {
+                    match_reason = "PRIMARY match BLOCKED by min_confidence";
+                }
+            } else if (fallback && confidence < FUZZY_CONFIDENCE_THRESHOLD) {
+                if (conf_gate) {
+                    match = true;
+                    match_reason = "FALLBACK match (low conf, neighbor gesture)";
+                } else {
+                    match_reason = "FALLBACK match BLOCKED by min_confidence";
+                }
+            } else if (fallback && confidence >= FUZZY_CONFIDENCE_THRESHOLD) {
+                match_reason = "FALLBACK skipped (conf too high — detector sure)";
+            } else {
+                match_reason = "no match (gesture not in trigger or fallback)";
+            }
         } else {
             match = (cfg->trigger_value == value);
+            match_reason = match ? "exact value match" : "value mismatch";
         }
 
+        /* ── Per-config cooldown check ──────────────────────────────────── */
+        if (match && cfg->cooldown_ms > 0) {
+            uint32_t elapsed = now_ms - s_last_fire_ms[i];
+            if (elapsed < cfg->cooldown_ms) {
+                ESP_LOGI(TAG, "  cfg_%u '%s': ⛔ SUPPRESSED — cooldown "
+                         "%ums / %ums remaining",
+                         (unsigned)cfg->id, cfg->name,
+                         (unsigned)cfg->cooldown_ms,
+                         (unsigned)(cfg->cooldown_ms - elapsed));
+                continue;
+            }
+        }
+
+        /* ── Final decision ────────────────────────────────────────────── */
         if (match && cfg->n_steps > 0) {
             esp_err_t err = hid_output_send_seq(cfg->steps, cfg->n_steps);
-            ESP_LOGI(TAG, "trigger cfg_%u '%s' -> %s",
-                     (unsigned)cfg->id, cfg->name, esp_err_to_name(err));
+            s_last_fire_ms[i] = now_ms;
+            ESP_LOGI(TAG, "  cfg_%u '%s': ✅ FIRED (%s) — %u steps -> %s",
+                     (unsigned)cfg->id, cfg->name, match_reason,
+                     (unsigned)cfg->n_steps, esp_err_to_name(err));
+        } else if (match && cfg->n_steps == 0) {
+            ESP_LOGI(TAG, "  cfg_%u '%s': ⚠️ match but no steps configured",
+                     (unsigned)cfg->id, cfg->name);
+        } else {
+            ESP_LOGD(TAG, "  cfg_%u '%s': — skip (%s)",
+                     (unsigned)cfg->id, cfg->name, match_reason);
         }
     }
+    ESP_LOGI(TAG, "═══ end trigger evaluation ═══");
 }
 
 esp_err_t cmd_config_list(char *out, size_t out_size)
@@ -393,9 +509,26 @@ esp_err_t cmd_config_list(char *out, size_t out_size)
             snprintf(tbuf, sizeof(tbuf), "none");
         }
 
-        char line[200];
-        int n = snprintf(line, sizeof(line), "cfg: id=%u name=\"%s\" trigger=%s n_steps=%u\n",
+        char line[260];
+        int n = snprintf(line, sizeof(line),
+                         "cfg: id=%u name=\"%s\" trigger=%s n_steps=%u",
                          (unsigned)cfg->id, cfg->name, tbuf, (unsigned)cfg->n_steps);
+
+        /* Append fuzzy parameters if any are set. */
+        if (cfg->fallback_value != 0 || cfg->cooldown_ms > 0 || cfg->min_confidence > 0) {
+            size_t len = strlen(line);
+            snprintf(line + len, sizeof(line) - len,
+                     " fuzzy: fb=0x%04x cd=%ums conf=%u%%",
+                     (unsigned)cfg->fallback_value,
+                     (unsigned)cfg->cooldown_ms,
+                     (unsigned)cfg->min_confidence);
+        }
+        {
+            size_t len = strlen(line);
+            line[len] = '\n';
+            line[len + 1] = '\0';
+            n = (int)strlen(line);
+        }
 
         if (pos + (size_t)n >= out_size) return ESP_ERR_NO_MEM;
         memcpy(out + pos, line, (size_t)n);

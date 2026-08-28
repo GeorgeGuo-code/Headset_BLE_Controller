@@ -3,7 +3,7 @@
  *
  * 与固件的契约（见 ble_console.h）：
  *   Service 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
- *   RX 6E400002-…  写入 ASCII 命令行：c / ca / ct / p / sp / sr
+ *   RX 6E400002-…  写入 ASCII 命令行：cr / cn / ctl / ctr / p / sp / sr
  *   TX 6E400003-…  notify，UTF-8 日志流（按 MTU-3 分片，需要按行重组）
  *   广播名 HMBC-Console
  */
@@ -22,7 +22,7 @@ let rxTextBuf = ''            // TX 分片重组缓冲（按 \n 切行）
 const logLines = []           // {ts, text, cls}
 const gestureCounts = { NOD: 0, LOOK_UP: 0, TILT_LEFT: 0, TILT_RIGHT: 0 }
 const GESTURE_LABEL = {
-  NOD: '点头', LOOK_UP: '抬头', TILT_LEFT: '左倾', TILT_RIGHT: '右倾'
+  REST: '静止', NOD: '点头', LOOK_UP: '抬头', TILT_LEFT: '左倾', TILT_RIGHT: '右倾'
 }
 
 /* 扫描期间累积发现的设备（按 deviceId 去重） */
@@ -94,6 +94,8 @@ function setConnected (on) {
 
 function classify (line) {
   if (/^GESTURE /.test(line)) return 'gesture'
+  if (/^DETECT /.test(line)) return 'gesture'
+  if (/^═══/.test(line)) return 'cal'
   if (/(failed|error|abort|ESP_ERR|unknown command)/i.test(line)) return 'err'
   if (/result:\s*OK|^boot complete/.test(line)) return 'ok'
   if (/^==|calibration|校准/i.test(line)) return 'cal'
@@ -142,7 +144,7 @@ function renderLog () {
 
 /* ── 校准状态机（从日志文本推导 UI 状态） ─────────────────────────────────── */
 
-const STEP_DURATION_MS = { 1: 2000, 2: 4000, 3: 4000 }
+const STEP_DURATION_MS = { 1: 2000, 2: 4000, 3: 4000, 4: 4000 }
 let calTimer = null
 
 function resetSteps () {
@@ -181,25 +183,90 @@ function finishCal (ok, msg) {
   $('cal-result').className = 'result ' + (ok ? 'ok' : 'err')
 }
 
-/* 固件输出的提示串（main.c: run_guided_calibration / handle_command）：
- *   "== calibration 1/3: keep your head STILL =="
- *   "== calibration 2/3: do a few slow NODS now =="
- *   "== calibration 3/3: do slow LEFT and RIGHT tilts now =="
- *   "neutral capture failed: … — aborting" / "nod-axis capture failed: …"
- *   "calibration result: OK" / "<err name>"
- *   "nod calibration result: …" / "tilt calibration result: …"
+/* 固件输出的提示串：
+ *   "calibrating gesture NOD for 4000 ms (rest→peak)..."
+ *   "gesture NOD: axis=[x y z] peak=25.3° ..."
  */
 function trackCalibration (line) {
-  let m = line.match(/^==\s*calibration\s*(\d)\/3/i)
-  if (m) { startStep(Number(m[1])); return }
-
   if (/triggering guided calibration/i.test(line)) { resetSteps(); return }
+
+  let m
+  /* 4-step gesture calibration: REST → NOD → TILT_LEFT → TILT_RIGHT */
+  if (/calibrating REST|calibrating REST/i.test(line))  { resetSteps(); startStep(1); return }
+  if (/calibrating gesture NOD|calibrating NOD/i.test(line))       { resetSteps(); startStep(2); return }
+  if (/calibrating gesture TILT_LEFT|calibrating TILT_LEFT/i.test(line)) { resetSteps(); startStep(3); return }
+  if (/calibrating gesture TILT_RIGHT|calibrating TILT_RIGHT/i.test(line)){ resetSteps(); startStep(4); return }
+
+  /* Old 3-step calibration markers (compat) */
+  m = line.match(/^==\s*calibration\s*(\d)\/3/i)
+  if (m) { startStep(Number(m[1])); return }
   if (/nod calibration only/i.test(line))  { resetSteps(); startStep(2); return }
   if (/tilt calibration only/i.test(line)) { resetSteps(); startStep(3); return }
 
-  if (/neutral capture failed/i.test(line))  { markStep(1, 'fail'); finishCal(false, '基准姿态采集失败：' + line); return }
-  if (/nod-axis capture failed/i.test(line)) { markStep(2, 'fail'); finishCal(false, '点头轴采集失败：' + line); return }
+  /* Calibration results — new format: gesture NOD: axis=[...] peak=XX° */
+  m = line.match(/gesture (NOD|LOOK_UP|TILT_LEFT|TILT_RIGHT):\s*axis=\[([^\]]*)\]\s*peak=([\d.]+)/i)
+  if (m) {
+    const gestName = m[1].toUpperCase()
+    const stepMap = { NOD: 2, TILT_LEFT: 3, TILT_RIGHT: 4 }
+    const step = stepMap[gestName] || 2
+    markStep(step, 'done')
+    const label = GESTURE_LABEL[gestName] || gestName
+    finishCal(true, `${label} 校准完成 (peak=${m[3]}°)`)
+    sendCmd('p', true)
+    return
+  }
 
+  /* Calibration results — old format: NOD: pn_mean=... sig=[...] */
+  m = line.match(/^(NOD|LOOK_UP|TILT_LEFT|TILT_RIGHT)[:\s].*(sig=|axis=)/i)
+  if (m) {
+    const gestName = m[1].toUpperCase()
+    const stepMap = { NOD: 2, TILT_LEFT: 3, TILT_RIGHT: 4 }
+    const step = stepMap[gestName] || 2
+    markStep(step, 'done')
+    const label = GESTURE_LABEL[gestName] || gestName
+    finishCal(true, `${label} 校准完成`)
+    sendCmd('p', true)
+    return
+  }
+
+  /* Failure messages */
+  m = line.match(/gesture cal (NOD|LOOK_UP|TILT_LEFT|TILT_RIGHT):\s*(.*)/i)
+  if (m && /fail|error|too few|degenerate/i.test(m[2])) {
+    const gestName = m[1].toUpperCase()
+    const stepMap = { NOD: 2, TILT_LEFT: 3, TILT_RIGHT: 4 }
+    const step = stepMap[gestName] || 2
+    markStep(step, 'fail')
+    const label = GESTURE_LABEL[gestName] || gestName
+    finishCal(false, `${label} 采集失败：${m[2]}`)
+    return
+  }
+
+  /* Auto-sign inference */
+  if (/signs inferred:/i.test(line)) {
+    const sp = line.match(/sign_pitch=(\d)/)
+    const sr = line.match(/sign_roll=(\d)/)
+    if (sp) paramValues.sign_pitch = sp[1]
+    if (sr) paramValues.sign_roll = sr[1]
+    renderParams()
+    finishCal(true, '全部手势校准完成，符号已自动推断')
+    return
+  }
+
+  /* main.c BLE output: "REST calibration: OK" or "NOD calibration: OK" etc. */
+  m = line.match(/^(REST|NOD|LOOK_UP|TILT_LEFT|TILT_RIGHT)\s+calibration:\s*(\S+)/i)
+  if (m) {
+    const gestName = m[1].toUpperCase()
+    const ok = m[2].toUpperCase() === 'OK'
+    const stepMap = { REST: 1, NOD: 2, TILT_LEFT: 3, TILT_RIGHT: 4 }
+    const step = stepMap[gestName] || 1
+    markStep(step, ok ? 'done' : 'fail')
+    const label = GESTURE_LABEL[gestName] || gestName
+    finishCal(ok, ok ? `${label} 校准完成` : `${label} 校准失败：${m[2]}`)
+    if (ok) sendCmd('p', true)   // 成功后自动回读参数
+    return
+  }
+
+  /* Legacy 3-step calibration results */
   m = line.match(/^(nod |tilt )?calibration result:\s*(\S+)/i)
   if (m) {
     const ok = m[2].toUpperCase() === 'OK'
@@ -221,8 +288,11 @@ const PARAM_LABEL = {
   sign_pitch: '俯仰符号 (1=正为点头)',
   sign_roll: '左右符号 (1=正为右倾)',
   q_neutral: '基准四元数 w x y z',
-  nod: '点头轴',
-  tilt: '倾斜轴'
+  nod_axis: '点头轴 (3D)',
+  look_axis: '仰头轴 (3D)',
+  tiltL_axis: '左倾轴 (3D)',
+  tiltR_axis: '右倾轴 (3D)',
+  sig_mask: '签名状态'
 }
 
 const paramValues = {}
@@ -267,7 +337,34 @@ function trackParams (line) {
   let m = line.match(/positive_pitch_is_nod=(\d)/)
   if (m) { paramValues.sign_pitch = m[1]; renderParams(); return }
   m = line.match(/positive_roll_is_right=(\d)/)
-  if (m) { paramValues.sign_roll = m[1]; renderParams() }
+  if (m) { paramValues.sign_roll = m[1]; renderParams(); return }
+
+  /* 3D axis lines from "p" command:
+   *   nod_axis   =[+.080 -.990 -.100] spread=8.2°
+   *   look_axis  =[+.980 +.010 -.190] spread=12.1°
+   *   tiltL_axis =[-.990 +.060 +.100] spread=6.5°
+   *   tiltR_axis =[+.990 -.050 -.100] spread=7.0°
+   *   sig_mask=0x0f
+   */
+  m = line.match(/nod_axis\s*=\[([^\]]*)\]\s*spread=(-?[\d.]+)/)
+  if (m) { paramValues.nod_axis = m[1].trim(); renderParams(); return }
+  m = line.match(/look_axis\s*=\[([^\]]*)\]\s*spread=(-?[\d.]+)/)
+  if (m) { paramValues.look_axis = m[1].trim(); renderParams(); return }
+  m = line.match(/tiltL_axis\s*=\[([^\]]*)\]\s*spread=(-?[\d.]+)/)
+  if (m) { paramValues.tiltL_axis = m[1].trim(); renderParams(); return }
+  m = line.match(/tiltR_axis\s*=\[([^\]]*)\]\s*spread=(-?[\d.]+)/)
+  if (m) { paramValues.tiltR_axis = m[1].trim(); renderParams(); return }
+  m = line.match(/sig_mask=(0x[0-9a-fA-F]+)/)
+  if (m) {
+    const mask = parseInt(m[1], 16)
+    const names = []
+    if (mask & 1) names.push('NOD')
+    if (mask & 2) names.push('LOOK')
+    if (mask & 4) names.push('T.L')
+    if (mask & 8) names.push('T.R')
+    paramValues.sig_mask = mask === 0x0f ? '✓ 全部完成' : names.join('+') || '未校准'
+    renderParams()
+  }
 }
 
 /* ── 手势事件 ─────────────────────────────────────────────────────────────── */
@@ -287,11 +384,18 @@ function renderGestures () {
   box.replaceChildren(...cards)
 }
 
-/* "GESTURE NOD ts=12345 peak=23.4 vel=88.1" */
+function clearGestures () {
+  for (const k of Object.keys(gestureCounts)) gestureCounts[k] = 0
+  renderGestures()
+  $('gesture-last').textContent = '等待手势…'
+}
+
+/* "GESTURE NOD ts=12345 peak=23.4° vel=88°/s conf=0.62 [HIGH]"
+ * Also matches old format without conf: "GESTURE NOD ts=12345 peak=23.4 vel=88.1" */
 function trackGesture (line) {
-  const m = line.match(/^GESTURE\s+(\w+)\s+ts=(\d+)\s+peak=(-?[\d.]+)\s+vel=(-?[\d.]+)/)
+  const m = line.match(/^GESTURE\s+(\w+)\s+ts=(\d+)\s+peak=(-?[\d.]+)°?\s+vel=(-?[\d.]+)°?\/?s?\s*(?:conf=(-?[\d.]+)\s*\[(\w+)\])?/)
   if (!m) return
-  const [, name, ts, peak, vel] = m
+  const [, name, ts, peak, vel, conf, confLabel] = m
   if (name in gestureCounts) {
     gestureCounts[name]++
     renderGestures()
@@ -301,11 +405,48 @@ function trackGesture (line) {
       setTimeout(() => card.classList.remove('hit'), 400)
     }
   }
-  $('gesture-last').textContent =
-    `最近：${GESTURE_LABEL[name] || name}  峰值 ${peak}°  角速度 ${vel}°/s  (ts=${ts})`
+  let info = `${GESTURE_LABEL[name] || name}  峰值 ${peak}°  角速度 ${vel}°/s`
+  if (conf !== undefined) {
+    info += `  置信度 ${(parseFloat(conf) * 100).toFixed(0)}% [${confLabel}]`
+  }
+  info += `  (ts=${ts})`
+  $('gesture-last').textContent = '最近：' + info
 }
 
 /* ── BLE ──────────────────────────────────────────────────────────────────── */
+
+/* Helper: connect GATT, discover NUS, subscribe notifications.
+ * Disconnects first to flush stale GATT cache that causes
+ * getPrimaryService() to hang after a reconnect. */
+async function gattConnectAndSubscribe (dev) {
+  /* Force-clear any cached GATT state from a previous session.
+   * disconnect() on an already-disconnected device is a no-op. */
+  if (dev.gatt.connected) {
+    dev.gatt.disconnect()
+  }
+  /* Small delay so the controller finishes any pending teardown. */
+  await new Promise((r) => setTimeout(r, 200))
+
+  const server = await dev.gatt.connect()
+  pushLog(`[CONN] GATT server connected`, 'sys')
+
+  /* getPrimaryService can hang on stale cache — race with a 4 s timeout. */
+  const service = await Promise.race([
+    server.getPrimaryService(NUS_SERVICE),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('getPrimaryService timeout')), 4000))
+  ])
+  pushLog(`[CONN] got service ${NUS_SERVICE}`, 'sys')
+  const rx = await service.getCharacteristic(NUS_RX)
+  const tx = await service.getCharacteristic(NUS_TX)
+  pushLog(`[CONN] RX props: ${JSON.stringify(rx.properties)}`, 'sys')
+  pushLog(`[CONN] TX props: ${JSON.stringify(tx.properties)}`, 'sys')
+
+  await tx.startNotifications()
+  tx.addEventListener('characteristicvaluechanged', onTxChunk)
+
+  rxChar = rx
+  txChar = tx
+}
 
 function onTxChunk (event) {
   const bytes = new Uint8Array(event.target.value.buffer)
@@ -345,12 +486,7 @@ async function connect () {
           try {
             device = match
             device.addEventListener('gattserverdisconnected', onDisconnected)
-            const server = await device.gatt.connect()
-            const service = await server.getPrimaryService(NUS_SERVICE)
-            rxChar = await service.getCharacteristic(NUS_RX)
-            txChar = await service.getCharacteristic(NUS_TX)
-            await txChar.startNotifications()
-            txChar.addEventListener('characteristicvaluechanged', onTxChunk)
+            await gattConnectAndSubscribe(device)
             $('device-list').classList.add('hidden')
             setStatus(`已连接 ${device.name || device.id}`, 'on')
             setConnected(true)
@@ -386,17 +522,7 @@ async function connect () {
     pushLog(`选中设备 ${device.name || device.id}`, 'sys')
     setStatus('连接中…', 'busy')
 
-    const server = await device.gatt.connect()
-    pushLog(`[CONN] GATT server connected`, 'sys')
-    const service = await server.getPrimaryService(NUS_SERVICE)
-    pushLog(`[CONN] got service ${NUS_SERVICE}`, 'sys')
-    rxChar = await service.getCharacteristic(NUS_RX)
-    txChar = await service.getCharacteristic(NUS_TX)
-    pushLog(`[CONN] RX props: ${JSON.stringify(rxChar.properties)}`, 'sys')
-    pushLog(`[CONN] TX props: ${JSON.stringify(txChar.properties)}`, 'sys')
-
-    await txChar.startNotifications()
-    txChar.addEventListener('characteristicvaluechanged', onTxChunk)
+    await gattConnectAndSubscribe(device)
 
     $('device-list').classList.add('hidden')
     setStatus(`已连接 ${device.name || device.id}`, 'on')
@@ -556,7 +682,7 @@ $('btn-disconnect').addEventListener('click', disconnect)
 document.querySelectorAll('button[data-cmd]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const cmd = btn.dataset.cmd
-    if (cmd === 'c' || cmd === 'ca' || cmd === 'ct') resetSteps()
+    if (cmd === 'cr' || cmd === 'cn' || cmd === 'ctl' || cmd === 'ctr') resetSteps()
     sendCmd(cmd)
   })
 })
@@ -1221,6 +1347,7 @@ $('btn-cfg-read').addEventListener('click', readConfigsFromDevice)
 $('btn-cfg-del-all').addEventListener('click', deleteAllConfigsFromDevice)
 $('btn-cfg-save').addEventListener('click', saveConfigsToFile)
 $('btn-cfg-load').addEventListener('click', loadConfigsFromFile)
+$('btn-gesture-clear').addEventListener('click', clearGestures)
 
 /* ── 初始化 ─────────────────────────────────────────────────────────────── */
 

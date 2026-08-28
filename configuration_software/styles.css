@@ -89,7 +89,7 @@ input:focus { outline: none; border-color: var(--accent); }
 .hidden { display: none !important; }
 
 /* calibration steps */
-#steps { list-style: none; margin: 10px 0; padding: 0; }
+#steps, #sig-steps { list-style: none; margin: 10px 0; padding: 0; }
 .step { display: flex; align-items: center; gap: 8px; padding: 4px 0; color: var(--dim); }
 .step .mark {
   width: 16px; height: 16px; border-radius: 50%;
@@ -104,6 +104,11 @@ input:focus { outline: none; border-color: var(--accent); }
 .step.fail { color: var(--err); }
 .step.fail .mark { border-color: var(--err); background: var(--err); color: #14171c; }
 .step.fail .mark::after { content: "\00d7"; }
+
+.cal-section { margin-top: 8px; }
+.cal-section h3 { font-size: 12px; color: var(--dim); margin: 0 0 4px; }
+.sig-btns { margin-top: 4px; }
+.sig-btns button { font-size: 12px; }
 
 #cal-progress { height: 4px; background: #10141a; border-radius: 2px; overflow: hidden; }
 #cal-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
@@ -126,6 +131,20 @@ input:focus { outline: none; border-color: var(--accent); }
 }
 .badge .n { display: block; font-size: 18px; font-family: Consolas, monospace; }
 .badge.hit { border-color: var(--accent); background: #1e2a3a; }
+
+/* inline button inside section headers (e.g. gesture clear) */
+.btn-inline {
+  font-size: 11px;
+  padding: 1px 8px;
+  margin-left: 8px;
+  vertical-align: middle;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+.btn-inline:hover { color: var(--fg); border-color: var(--fg); }
 
 /* log */
 #log {

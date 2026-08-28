@@ -49,7 +49,7 @@ static const char *TAG = "gesture_detect";
 /* ===== Accumulation-based detection thresholds ============================ */
 #define TRIG_VEL_FRAC     0.35f  /*!< trigger velocity = peak × this fraction */
 #define END_VEL_FRAC      0.20f  /*!< end velocity = peak × this fraction */
-#define END_HOLD_FRAMES   5      /*!< frames below end_vel before firing (5×20ms = 100ms) */
+#define END_HOLD_FRAMES   3      /*!< frames below end_vel before firing (3×20ms = 60ms) */
 #define FIRE_COOLDOWN_MS  1000   /*!< minimum ms between two fired events */
 
 /* ===== Module state ====================================================== */
@@ -428,7 +428,8 @@ void gesture_detect_reset_q_drift(void)
 
 /* ===== Event helper ====================================================== */
 
-static void emit_event(gesture_type_t type, float peak_angle, float peak_vel)
+static void emit_event(gesture_type_t type, float peak_angle, float peak_vel,
+                       float confidence)
 {
     if (s_gd.event_queue == NULL) {
         return;
@@ -439,6 +440,7 @@ static void emit_event(gesture_type_t type, float peak_angle, float peak_vel)
         .timestamp_ms      = now_ms,
         .peak_angle_deg    = peak_angle,
         .peak_velocity_deg_s = peak_vel,
+        .confidence        = confidence,
     };
     if (xQueueSend(s_gd.event_queue, &ev, 0) != pdTRUE) {
         /* queue full — drop newest. Bridge task is too slow; nothing
@@ -518,7 +520,7 @@ static bool step_axis(axis_ctx_t *ctx,
                          (int)gt, signed_rel, abs_velocity,
                          ctx->peak_abs_rel, ctx->peak_abs_vel,
                          trigger, trigger_v, zone, (unsigned)debounce);
-                emit_event(gt, ctx->peak_abs_rel, ctx->peak_abs_vel);
+                emit_event(gt, ctx->peak_abs_rel, ctx->peak_abs_vel, 1.0f);
                 return true;
             }
             GD_DBGI("DBG-SUPP proj=%+.1f vel=%.1f "
@@ -710,6 +712,15 @@ static void detector_task(void *arg)
         /* Accumulation state (declared early so DC output can reference them) */
         static uint32_t s_end_hold = 0;
         static float    s_peak_sign_dot = 0.0f;
+        /* Anti-glitch: only reset hold after N consecutive frames above trigger.
+         * A single DMP glitch (vel→0) followed by recovery won't reset hold. */
+        static uint32_t s_consec_above_trigger = 0;
+        /* Temporal consistency: require N consecutive frames with same
+         * classification before allowing accumulation.  Prevents brief
+         * cross-axis matches (e.g. nod's roll component → tiltL) from
+         * accumulating and firing. */
+        static int s_consistent_idx = -1;
+        static int s_consistent_count = 0;
 
         /* ---- 3-axis classification via dot product with signatures ----
          * Copy packed sig arrays to aligned locals to avoid
@@ -719,8 +730,18 @@ static void detector_task(void *arg)
         memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
         memcpy(sig_tiltR_a, s_gd.sig.sig_tiltR, sizeof(sig_tiltR_a));
 
+        /* Capture raw cp direction BEFORE flip (flip destroys pitch sign).
+         * Used later to distinguish NOD from LOOK_UP at emit time. */
+        float cp_raw_dot_nod = 0.0f;
+        if ((s_gd.sig.calibrated & GESTURE_SIG_F_NOD) && cp_valid) {
+            cp_raw_dot_nod = v3_dot(cp, sig_nod_a);
+        }
+
         int best_sig_idx = -1;
+        float classification_confidence = 0.0f;  /*!< dot product of best matching signature — carried to emit */
+        static float s_pitch_dot_sum = 0.0f;
         if (s_gd.sig.calibrated != 0 && cp_valid) {
+            /* Capture raw pitch direction BEFORE flip (flip destroys sign) */
             if (!s_gd.smooth_axis_valid) {
                 s_gd.smooth_axis[0] = cp[0]; s_gd.smooth_axis[1] = cp[1]; s_gd.smooth_axis[2] = cp[2];
                 s_gd.smooth_axis_valid = true;
@@ -734,7 +755,9 @@ static void detector_task(void *arg)
                 float sm = v3_norm(s_gd.smooth_axis);
                 if (sm > 0.001f) { s_gd.smooth_axis[0]/=sm; s_gd.smooth_axis[1]/=sm; s_gd.smooth_axis[2]/=sm; }
             }
-            /* Only classify against calibrated signatures. */
+            /* Only classify against calibrated signatures.
+             * NOD and LOOK_UP share one axis; classify as NOD (idx 0) always,
+             * distinguish at emit time via accumulated pitch direction. */
             float dn  = (s_gd.sig.calibrated & GESTURE_SIG_F_NOD)   ? v3_dot(s_gd.smooth_axis, sig_nod_a)   : 0.0f;
             float dtl = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) ? v3_dot(s_gd.smooth_axis, sig_tiltL_a) : 0.0f;
             float dtr = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTR) ? v3_dot(s_gd.smooth_axis, sig_tiltR_a) : 0.0f;
@@ -743,6 +766,7 @@ static void detector_task(void *arg)
             float best = 0.0f; int bi = -1;
             for (int i = 0; i < 4; i++) { if (ad[i] > best) { best = ad[i]; bi = i; } }
             if (best > 0.15f) best_sig_idx = bi;
+            classification_confidence = best;  /* raw dot; clamp to [0,1] at emit */
         }
 
         /* ---- Scale cross product by calibration-derived factor ---------
@@ -793,11 +817,12 @@ static void detector_task(void *arg)
                 float acc_tL = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltL_a) / acc_mag : 0.0f;
                 float acc_tR = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltR_a) / acc_mag : 0.0f;
                 ESP_LOGI(TAG, "DC2 idx=%d acc=[%.1f %.1f %.1f] |acc|=%.1f "
-                         "dot(n=%.2f tL=%.2f tR=%.2f) hold=%u",
+                         "dot(n=%.2f tL=%.2f tR=%.2f) hold=%u p=%.1f conf=%.2f",
                          best_sig_idx,
                          s_gd.accum[0], s_gd.accum[1], s_gd.accum[2],
                          acc_mag, acc_n, acc_tL, acc_tR,
-                         (unsigned)s_end_hold);
+                         (unsigned)s_end_hold, s_pitch_dot_sum,
+                         classification_confidence);
             }
         }
 
@@ -829,44 +854,97 @@ static void detector_task(void *arg)
                 case 2:         msig = sig_tiltL_a;  break;
                 case 3:         msig = sig_tiltR_a;  break;
             }
+            /* Temporal consistency tracking */
+            if (best_sig_idx == s_consistent_idx) {
+                s_consistent_count++;
+            } else {
+                s_consistent_idx = best_sig_idx;
+                s_consistent_count = 1;
+            }
+            const int CONSIST_FRAMES = 3;
             if (vel > trigger_vel) {
-                /* Accumulate scaled cross product. */
-                s_gd.accum[0] += cp_sc[0]; s_gd.accum[1] += cp_sc[1]; s_gd.accum[2] += cp_sc[2];
-                s_end_hold = 0;
+                s_consec_above_trigger++;
+                /* Cross-axis consistency: only accumulate if the raw cp
+                 * direction is consistent with the detected gesture's
+                 * signature AND classification has been stable for
+                 * CONSIST_FRAMES consecutive frames. */
+                bool axis_ok = true;
+                if (msig) {
+                    float cp_n = v3_norm(cp);
+                    if (cp_n > 0.001f) {
+                        float cp_dot_msig = fabsf(cp[0]*msig[0] + cp[1]*msig[1] + cp[2]*msig[2]) / cp_n;
+                        if (cp_dot_msig < 0.3f) axis_ok = false;
+                    }
+                }
+                bool cons_ok = (s_consistent_count >= CONSIST_FRAMES);
+                if (axis_ok && cons_ok) {
+                    /* Accumulate scaled cross product. */
+                    s_gd.accum[0] += cp_sc[0]; s_gd.accum[1] += cp_sc[1]; s_gd.accum[2] += cp_sc[2];
+                    /* Only reset hold after N consecutive frames above trigger.
+                     * A single DMP glitch (vel→0→high) won't reset hold. */
+                    const int TRIG_RESET_FRAMES = 3;
+                    if (s_consec_above_trigger >= TRIG_RESET_FRAMES) {
+                        s_end_hold = 0;
+                    }
+                    /* Accumulate raw pitch direction for NOD/LOOK_UP distinction */
+                    s_pitch_dot_sum += cp_raw_dot_nod;
+                }
                 /* Record sign at peak velocity. */
-                if (msig && vel > trigger_vel * 0.8f) {
+                if (msig && vel > trigger_vel * 0.8f && axis_ok && cons_ok) {
                     s_peak_sign_dot = v3_dot(s_gd.accum, msig);
                 }
-            } else if (vel < end_vel && v3_norm(s_gd.accum) > 1.0f) {
-                /* Velocity dropped below end_vel — start hold timer. */
-                s_end_hold++;
-                if (s_end_hold >= END_HOLD_FRAMES) {
-                    /* Check: accumulated sign matches peak sign? */
-                    float dot_final = msig ? v3_dot(s_gd.accum, msig) : 0.0f;
-                    bool sign_match = (dot_final * s_peak_sign_dot > 0.0f);
-                    if (sign_match && now_ms >= s_gd.cooldown_until_ms) {
-                        static const gesture_type_t sig_gt[] = {
-                            GESTURE_NOD, GESTURE_LOOK_UP, GESTURE_TILT_LEFT, GESTURE_TILT_RIGHT
-                        };
-                        emit_event(sig_gt[best_sig_idx], v3_norm(s_gd.accum), vel);
-                        GD_DBGI("DBG-FIRE idx=%d dot=%.2f accum=%.1f vel=%.0f",
-                                 best_sig_idx, dot_final, v3_norm(s_gd.accum), vel);
-                    }
-                    /* Reset accumulator regardless. */
-                    memset(s_gd.accum, 0, sizeof(s_gd.accum));
-                    s_gd.accum_armed = true;
-                    s_end_hold = 0; s_peak_sign_dot = 0.0f;
-                    s_gd.smooth_axis_valid = false;
-                }
             } else {
-                /* Velocity in between trigger and end, or accumulator empty
-                 * — keep accumulating or do nothing. */
+                s_consec_above_trigger = 0;
+                if (vel < end_vel && v3_norm(s_gd.accum) > 1.0f) {
+                    /* Velocity dropped below end_vel — start hold timer. */
+                    s_end_hold++;
+                    if (s_end_hold >= END_HOLD_FRAMES) {
+                        /* Check: accumulated sign matches peak sign? */
+                        float dot_final = msig ? v3_dot(s_gd.accum, msig) : 0.0f;
+                        bool sign_match = (dot_final * s_peak_sign_dot > 0.0f);
+                        if (sign_match && now_ms >= s_gd.cooldown_until_ms) {
+                            static const gesture_type_t sig_gt[] = {
+                                GESTURE_NOD, GESTURE_LOOK_UP, GESTURE_TILT_LEFT, GESTURE_TILT_RIGHT
+                            };
+                            /* For pitch axis: use accumulated raw cp direction
+                             * to distinguish NOD from LOOK_UP */
+                            gesture_type_t gt = sig_gt[best_sig_idx];
+                            if (best_sig_idx == 0 && s_pitch_dot_sum < 0.0f) {
+                                gt = GESTURE_LOOK_UP;
+                            }
+                            emit_event(gt, v3_norm(s_gd.accum), vel,
+                                       classification_confidence);
+                            ESP_LOGI(TAG, "DETECT %s idx=%d acc=%.1f vel=%.0f "
+                                     "pitch_sum=%.2f conf=%.2f [%s]",
+                                     (gt == GESTURE_NOD) ? "NOD" :
+                                     (gt == GESTURE_LOOK_UP) ? "LOOK_UP" :
+                                     (gt == GESTURE_TILT_LEFT) ? "TILT_LEFT" :
+                                     (gt == GESTURE_TILT_RIGHT) ? "TILT_RIGHT" : "?",
+                                     best_sig_idx, v3_norm(s_gd.accum), vel,
+                                     s_pitch_dot_sum, classification_confidence,
+                                     classification_confidence >= 0.7f ? "HIGH" :
+                                     classification_confidence >= 0.4f ? "MED" : "LOW");
+                        }
+                        /* Reset accumulator regardless. */
+                        memset(s_gd.accum, 0, sizeof(s_gd.accum));
+                        s_gd.accum_armed = true;
+                        s_end_hold = 0; s_peak_sign_dot = 0.0f;
+                        s_pitch_dot_sum = 0.0f;
+                        s_consistent_count = 0; s_consistent_idx = -1;
+                        s_consec_above_trigger = 0;
+                        s_gd.smooth_axis_valid = false;
+                    }
+                }
             }
+        /* else: velocity between end_vel and trigger — do nothing */
         } else if (best_sig_idx < 0) {
             /* No classification — reset accumulator. */
             memset(s_gd.accum, 0, sizeof(s_gd.accum));
             s_gd.accum_armed = true;
             s_end_hold = 0; s_peak_sign_dot = 0.0f;
+            s_pitch_dot_sum = 0.0f;
+            s_consistent_count = 0; s_consistent_idx = -1;
+            s_consec_above_trigger = 0;
         }
 
         /* ---- Phase 5: sliding baseline snap --------------------------- */
@@ -1628,6 +1706,7 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
 
     float all_r[120][3];
     float all_mag[120];
+    float all_vel[120];
     uint32_t n_frames = 0;
     float prev_r_mag = 0.0f;
     TickType_t prev_frame_tick = 0;
@@ -1672,6 +1751,7 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                 all_r[n_frames][1] = r[1];
                 all_r[n_frames][2] = r[2];
                 all_mag[n_frames] = mag;
+                all_vel[n_frames] = vel_now;
                 n_frames++;
                 if (mag > best_mag) best_mag = mag;
                 prev_r_mag = mag;
@@ -1704,17 +1784,19 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
     s_gd.calibrating = false;
 
     const float FRAC_MIN = 0.30f;
+    const float VEL_MIN = 30.0f;  /* exclude static/near-static frames from PCA */
 
     /* ---- Compute gesture axis via PCA (principal component) -----------
      * The gesture axis is the direction of maximum variance in r-space.
      * PCA removes the mean (eliminating drift offset) and finds the
      * direction where the r vectors spread the most (the gesture axis).
-     * Power iteration: 5 iterations on 3x3 covariance matrix. */
+     * Power iteration: 8 iterations on 3x3 covariance matrix. */
     /* 1. Compute centroid of qualifying frames */
     float cx = 0.0f, cy = 0.0f, cz = 0.0f;
     uint32_t pca_n = 0;
     for (uint32_t i = 0; i < n_frames; i++) {
-        if (all_mag[i] > best_mag * FRAC_MIN && all_mag[i] < 90.0f) {
+        if (all_mag[i] > best_mag * FRAC_MIN && all_mag[i] < 90.0f
+            && all_vel[i] > VEL_MIN) {
             cx += all_r[i][0]; cy += all_r[i][1]; cz += all_r[i][2];
             pca_n++;
         }
@@ -1726,7 +1808,8 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
         /* 2. Build 3x3 covariance matrix from centered vectors */
         float c00=0,c01=0,c02=0, c11=0,c12=0, c22=0;
         for (uint32_t i = 0; i < n_frames; i++) {
-            if (all_mag[i] <= best_mag * FRAC_MIN || all_mag[i] >= 90.0f) continue;
+            if (all_mag[i] <= best_mag * FRAC_MIN || all_mag[i] >= 90.0f
+                || all_vel[i] <= VEL_MIN) continue;
             float dx = all_r[i][0] - cx;
             float dy = all_r[i][1] - cy;
             float dz = all_r[i][2] - cz;

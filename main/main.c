@@ -85,12 +85,21 @@ static void gesture_bridge_task(void *arg)
         case GESTURE_NONE:
         default:                 name = "NONE";       break;
         }
-        ble_console_logf("GESTURE %s ts=%u peak=%.1f vel=%.1f\n",
-                         name, (unsigned)ev.timestamp_ms,
-                         ev.peak_angle_deg, ev.peak_velocity_deg_s);
+        /* Confidence quality label for quick visual scanning. */
+        const char *conf_label;
+        if      (ev.confidence >= 0.7f) conf_label = "HIGH";
+        else if (ev.confidence >= 0.4f) conf_label = "MED";
+        else                            conf_label = "LOW";
 
-        /* Execute any configs triggered by this gesture. */
-        cmd_config_execute_by_trigger(TRIGGER_GESTURE, (uint16_t)ev.type);
+        ble_console_logf("GESTURE %s ts=%u peak=%.1f° vel=%.0f°/s "
+                         "conf=%.2f [%s]\n",
+                         name, (unsigned)ev.timestamp_ms,
+                         ev.peak_angle_deg, ev.peak_velocity_deg_s,
+                         ev.confidence, conf_label);
+
+        /* Execute any configs triggered by this gesture (with confidence). */
+        cmd_config_execute_by_trigger(TRIGGER_GESTURE, (uint16_t)ev.type,
+                                      ev.confidence);
     }
 }
 
@@ -451,6 +460,25 @@ static bool handle_hid_command(const char *cmd)
 #endif
             ble_console_logf("cfg: id=%u name=\"%s\" trigger=%s n_steps=%u\n",
                              (unsigned)cfg->id, cfg->name, tname, (unsigned)cfg->n_steps);
+            /* Show fuzzy matching parameters. */
+            if (cfg->fallback_value != 0 || cfg->cooldown_ms > 0 || cfg->min_confidence > 0) {
+                char fb_buf[64] = "none";
+                if (cfg->fallback_value != 0) {
+                    /* Format fallback bitmask as gesture names. */
+                    int pos = 0;
+                    if (cfg->fallback_value & (1 << GESTURE_NOD))
+                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sNOD", pos ? "+" : "");
+                    if (cfg->fallback_value & (1 << GESTURE_LOOK_UP))
+                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sLOOK_UP", pos ? "+" : "");
+                    if (cfg->fallback_value & (1 << GESTURE_TILT_LEFT))
+                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sTILT_LEFT", pos ? "+" : "");
+                    if (cfg->fallback_value & (1 << GESTURE_TILT_RIGHT))
+                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sTILT_RIGHT", pos ? "+" : "");
+                }
+                ble_console_logf("  fuzzy: fallback=%s cooldown=%ums min_conf=%u%%\n",
+                                 fb_buf, (unsigned)cfg->cooldown_ms,
+                                 (unsigned)cfg->min_confidence);
+            }
             char seq_buf[512];
             if (cmd_config_format_seq(cfg, seq_buf, sizeof(seq_buf)) == ESP_OK) {
                 ble_console_logf("cfg: steps=%s\n", seq_buf);
@@ -580,8 +608,53 @@ static bool handle_hid_command(const char *cmd)
             return true;
         }
 
+        /* cmd fuzzy <id> <fallback_mask> <cooldown_ms> <min_confidence>
+         *
+         * Set fuzzy-matching parameters for an existing config.
+         *   fallback_mask  — gesture bitmask for fallback triggers
+         *                    (e.g. 2 = LOOK_UP, 5 = NOD+TILT_LEFT)
+         *   cooldown_ms    — per-config cooldown in ms (0 = global default)
+         *   min_confidence — minimum confidence 0–100 (0 = any confidence)
+         *
+         * Examples:
+         *   cmd fuzzy 1 2 2000 0     — cfg_1 also fires on LOOK_UP (fallback),
+         *                                2s cooldown, any confidence
+         *   cmd fuzzy 2 0 800 30     — cfg_2 no fallback, 800ms cooldown,
+         *                                min 30% confidence
+         */
+        if (strncmp(p, "fuzzy ", 6) == 0) {
+            const char *q = p + 6;
+            while (*q == ' ') q++;
+
+            long id, fb, cd, mc;
+            const char *r = seq_parse_int(q, q + 64, &id);
+            if (!r || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd fuzzy <id> <fallback_mask> <cooldown_ms> <min_confidence>\n"
+                                 "  gesture bits: 1=NOD 2=LOOK_UP 4=TILT_LEFT 8=TILT_RIGHT\n"
+                                 "  e.g. 'cmd fuzzy 1 2 2000 0' = cfg_1 also fires on LOOK_UP\n");
+                return true;
+            }
+            r = seq_parse_int(r, r + 64, &fb);
+            if (!r) { ble_console_log("cmd fuzzy: need <fallback_mask>\n"); return true; }
+            r = seq_parse_int(r, r + 64, &cd);
+            if (!r) { ble_console_log("cmd fuzzy: need <cooldown_ms>\n"); return true; }
+            r = seq_parse_int(r, r + 64, &mc);
+            if (!r) { ble_console_log("cmd fuzzy: need <min_confidence> (0-100)\n"); return true; }
+
+            if (mc < 0 || mc > 100) {
+                ble_console_log("cmd fuzzy: min_confidence must be 0–100\n");
+                return true;
+            }
+
+            esp_err_t err = cmd_config_set_fuzzy((uint8_t)id, (uint16_t)fb,
+                                                  (uint16_t)cd, (uint8_t)mc);
+            ble_console_logf("cmd fuzzy id=%ld -> %s\n", id, esp_err_to_name(err));
+            return true;
+        }
+
         /* unknown cmd subcommand */
-        ble_console_log("cmd: list | get <id> | set <id> <name> <type> <value> <seq> | del <id> | run <id>\n");
+        ble_console_log("cmd: list | get <id> | set <id> <name> <type> <value> <seq>\n");
+        ble_console_log("     del <id> | run <id> | fuzzy <id> <fb_mask> <cd_ms> <conf>\n");
         ble_console_log("  type: none / gesture / command\n");
         return true;
     }
@@ -751,7 +824,7 @@ static void handle_command(const char *cmd)
         ble_console_logf("unknown command: '%s'\n", cmd);
         ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
-        ble_console_log("  configs : cmd list|get|set|del|run\n");
+        ble_console_log("  configs : cmd list|get|set|del|run|fuzzy\n");
 #ifdef ENABLE_SERIAL_TRIGGER
         ble_console_log("            command <id> (debug)\n");
 #endif

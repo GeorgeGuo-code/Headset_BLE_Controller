@@ -23,15 +23,18 @@ typedef enum {
  * @brief One event handed off from the detector task to the consumer
  *        (UART logger in Phase 1, BLE HID bridge in Phase 2).
  *
- * The fields are filled at the moment the state machine fires; they are
- * diagnostic only and not consulted by downstream code, but are useful
- * for verifying calibration correctness.
+ * The fields are filled at the moment the state machine fires.  `confidence`
+ * reflects how well the detected rotation axis matched the best calibration
+ * signature — downstream code (cmd_config) uses it for fuzzy matching:
+ *   - high confidence (>0.7): exact gesture match, fire primary trigger
+ *   - low  confidence (<0.7): may be a misclassification, also check fallback
  */
 typedef struct {
     gesture_type_t type;             /*!< which gesture was recognised */
     uint32_t       timestamp_ms;     /*!< ms since boot at fire time */
     float          peak_angle_deg;   /*!< max |angle - neutral| since last fire */
     float          peak_velocity_deg_s; /*!< max |angular velocity| since last fire */
+    float          confidence;       /*!< 0.0~1.0, how well the rotation axis matches the calibrated signature */
 } gesture_event_t;
 
 #endif /* GESTURE_EVENT_H_ */

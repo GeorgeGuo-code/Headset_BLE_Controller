@@ -24,19 +24,25 @@
     <main>
       <section class="panel span2">
         <h2>校准</h2>
-        <div class="row">
-          <button data-cmd="c" class="primary need-conn" disabled>完整校准（3 步）</button>
-          <button data-cmd="ca" class="need-conn" disabled>仅点头轴</button>
-          <button data-cmd="ct" class="need-conn" disabled>仅左右倾斜</button>
+        <div class="cal-section">
+          <h3>手势校准（4 步）<span class="hint" style="margin-left:8px;text-transform:none">—— 先静止采基准，再点头+左倾+右倾（仰头复用点头轴）</span></h3>
+          <div class="row sig-btns">
+            <button data-cmd="cr"  class="need-conn" disabled>① 保持静止</button>
+            <button data-cmd="cn"  class="need-conn" disabled>② 点头 NOD</button>
+            <button data-cmd="ctl" class="need-conn" disabled>③ 左倾 TILT_L</button>
+            <button data-cmd="ctr" class="need-conn" disabled>④ 右倾 TILT_R</button>
+          </div>
+          <ol id="sig-steps">
+            <li class="step" data-step="1"><span class="mark"></span>
+              <span class="text">保持静止（2 s）—— 头部自然朝前，不要动</span></li>
+            <li class="step" data-step="2"><span class="mark"></span>
+              <span class="text">做几次点头到最低点并保持（4 s）—— 仰头复用此轴</span></li>
+            <li class="step" data-step="3"><span class="mark"></span>
+              <span class="text">做几次左耳朝左肩倾斜并保持（4 s）</span></li>
+            <li class="step" data-step="4"><span class="mark"></span>
+              <span class="text">做几次右耳朝右肩倾斜并保持（4 s）</span></li>
+          </ol>
         </div>
-        <ol id="steps">
-          <li class="step" data-step="1"><span class="mark"></span>
-            <span class="text">保持头部静止（基准姿态，2 s）</span></li>
-          <li class="step" data-step="2"><span class="mark"></span>
-            <span class="text">缓慢点头几次（点头轴，4 s）</span></li>
-          <li class="step" data-step="3"><span class="mark"></span>
-            <span class="text">缓慢左右倾头（倾斜轴，4 s）</span></li>
-        </ol>
         <div id="cal-progress"><div id="cal-bar"></div></div>
         <p id="cal-result" class="result"></p>
       </section>
@@ -53,7 +59,7 @@
       </section>
 
       <section class="panel">
-        <h2>手势事件</h2>
+        <h2>手势事件 <button id="btn-gesture-clear" class="btn-inline">清空</button></h2>
         <div id="gesture-badges"></div>
         <p id="gesture-last" class="hint">等待手势…</p>
       </section>
@@ -84,7 +90,7 @@
         </div>
         <pre id="log"></pre>
         <div class="row">
-          <input id="cmd-input" placeholder="自定义命令：c / ca / ct / p / sp / sr">
+          <input id="cmd-input" placeholder="自定义命令：cr / cn / cl / ctl / ctr / p / sp / sr">
           <button id="btn-send" class="need-conn" disabled>发送</button>
         </div>
       </section>

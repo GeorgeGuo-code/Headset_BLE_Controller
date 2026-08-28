@@ -46,7 +46,18 @@ typedef struct {
     uint8_t             id;                              /*!< 1–CMD_CFG_MAX; 0 = unused slot */
     char                name[CMD_CFG_NAME_MAX];          /*!< display name (UTF-8, NUL-term) */
     cmd_trigger_type_t  trigger_type;
-    uint16_t            trigger_value;                   /*!< gesture_type_t or command number */
+    uint16_t            trigger_value;                   /*!< primary trigger bitmask (gesture bits) */
+    uint16_t            fallback_value;                  /*!< fallback trigger bitmask — fires when gesture
+                                                             confidence < 0.7 (detector unsure, likely
+                                                             misclassification).  Set to same bitmask as
+                                                             trigger_value for "always fire on these" or
+                                                             add neighbor gestures for fuzzy matching. */
+    uint16_t            cooldown_ms;                     /*!< per-config cooldown (0 = use global default).
+                                                             Prevents cascade re-triggering from a single
+                                                             gesture event.  Recommend 800–2000 ms. */
+    uint8_t             min_confidence;                  /*!< minimum confidence 0–100 to trigger (0 = any).
+                                                             Values above 0 filter out low-confidence
+                                                             misclassifications.  30 = lenient, 70 = strict. */
     uint8_t             n_steps;
     hid_seq_step_t      steps[HID_SEQ_MAX_STEPS];
 } cmd_config_t;
@@ -70,6 +81,19 @@ const cmd_config_t *cmd_config_get(uint8_t id);
 esp_err_t cmd_config_set(const cmd_config_t *cfg);
 
 /**
+ * @brief  Update only the fuzzy-matching parameters of an existing config.
+ *         Does not touch trigger_type, trigger_value, steps, or name.
+ *         Writes to NVS.
+ *
+ * @param  id              1..CMD_CFG_MAX
+ * @param  fallback_value  fallback trigger bitmask (0 = no fallback)
+ * @param  cooldown_ms     per-config cooldown in ms (0 = use global default)
+ * @param  min_confidence  minimum confidence 0–100 (0 = any)
+ */
+esp_err_t cmd_config_set_fuzzy(uint8_t id, uint16_t fallback_value,
+                               uint16_t cooldown_ms, uint8_t min_confidence);
+
+/**
  * @brief  Delete a config from NVS and clear the in-memory slot.
  * @param  id  1..CMD_CFG_MAX
  */
@@ -86,10 +110,19 @@ esp_err_t cmd_config_execute(uint8_t id);
  * @brief  Find and execute all configs matching a trigger type+value.
  *         Called from gesture_bridge_task when a gesture fires.
  *
- * @param  type   TRIGGER_GESTURE or TRIGGER_COMMAND
- * @param  value  gesture_type_t value or command number
+ *         Matching rules (lenient):
+ *         1. Primary match:  trigger_value & (1 << value)  →  fire
+ *         2. Fallback match: fallback_value & (1 << value)
+ *            AND confidence < FUZZY_CONFIDENCE_THRESHOLD   →  fire
+ *         3. Confidence gate: confidence*100 < min_confidence → skip
+ *         4. Per-config cooldown: skip if cooldown not elapsed
+ *
+ * @param  type       TRIGGER_GESTURE or TRIGGER_COMMAND
+ * @param  value      gesture_type_t value or command number
+ * @param  confidence 0.0~1.0 detection confidence (pass 1.0 for command triggers)
  */
-void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value);
+void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
+                                   float confidence);
 
 /**
  * @brief  Format all stored configs as text lines for BLE console output.
