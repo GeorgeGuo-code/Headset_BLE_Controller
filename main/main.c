@@ -85,21 +85,17 @@ static void gesture_bridge_task(void *arg)
         case GESTURE_NONE:
         default:                 name = "NONE";       break;
         }
-        /* Confidence quality label for quick visual scanning. */
-        const char *conf_label;
-        if      (ev.confidence >= 0.7f) conf_label = "HIGH";
-        else if (ev.confidence >= 0.4f) conf_label = "MED";
-        else                            conf_label = "LOW";
 
-        ble_console_logf("GESTURE %s ts=%u peak=%.1f° vel=%.0f°/s "
-                         "conf=%.2f [%s]\n",
+        ble_console_logf("GESTURE %s ts=%u peak=%.1f vel=%.0f "
+                         "conf=[NOD=%.2f LK=%.2f TL=%.2f TR=%.2f] best=%d\n",
                          name, (unsigned)ev.timestamp_ms,
                          ev.peak_angle_deg, ev.peak_velocity_deg_s,
-                         ev.confidence, conf_label);
+                         ev.conf[0], ev.conf[1], ev.conf[2], ev.conf[3],
+                         (int)ev.best_idx);
 
-        /* Execute any configs triggered by this gesture (with confidence). */
+        /* Execute any configs triggered by this gesture (with conf array). */
         cmd_config_execute_by_trigger(TRIGGER_GESTURE, (uint16_t)ev.type,
-                                      ev.confidence);
+                                      ev.conf);
     }
 }
 
@@ -462,21 +458,21 @@ static bool handle_hid_command(const char *cmd)
                              (unsigned)cfg->id, cfg->name, tname, (unsigned)cfg->n_steps);
             /* Show fuzzy matching parameters. */
             if (cfg->fallback_value != 0 || cfg->cooldown_ms > 0 || cfg->min_confidence > 0) {
-                char fb_buf[64] = "none";
-                if (cfg->fallback_value != 0) {
-                    /* Format fallback bitmask as gesture names. */
+                /* Format trigger bitmask as gesture names. */
+                char tb_buf[64] = "none";
+                {
                     int pos = 0;
-                    if (cfg->fallback_value & (1 << GESTURE_NOD))
-                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sNOD", pos ? "+" : "");
-                    if (cfg->fallback_value & (1 << GESTURE_LOOK_UP))
-                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sLOOK_UP", pos ? "+" : "");
-                    if (cfg->fallback_value & (1 << GESTURE_TILT_LEFT))
-                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sTILT_LEFT", pos ? "+" : "");
-                    if (cfg->fallback_value & (1 << GESTURE_TILT_RIGHT))
-                        pos += snprintf(fb_buf + pos, sizeof(fb_buf) - pos, "%sTILT_RIGHT", pos ? "+" : "");
+                    if (cfg->trigger_value & (1 << GESTURE_NOD))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sNOD", pos ? "+" : "");
+                    if (cfg->trigger_value & (1 << GESTURE_LOOK_UP))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sLOOK_UP", pos ? "+" : "");
+                    if (cfg->trigger_value & (1 << GESTURE_TILT_LEFT))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sTILT_LEFT", pos ? "+" : "");
+                    if (cfg->trigger_value & (1 << GESTURE_TILT_RIGHT))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sTILT_RIGHT", pos ? "+" : "");
                 }
-                ble_console_logf("  fuzzy: fallback=%s cooldown=%ums min_conf=%u%%\n",
-                                 fb_buf, (unsigned)cfg->cooldown_ms,
+                ble_console_logf("  match: triggers=[%s] cooldown=%ums min_conf=%u%%\n",
+                                 tb_buf, (unsigned)cfg->cooldown_ms,
                                  (unsigned)cfg->min_confidence);
             }
             char seq_buf[512];

@@ -33,15 +33,6 @@ static SemaphoreHandle_t s_mutex;
 /* Per-config cooldown tracking (not persisted — reset on reboot). */
 static uint32_t s_last_fire_ms[CMD_CFG_MAX];
 
-/* ── Fuzzy matching threshold ──────────────────────────────────────────────
- * When a gesture fires with confidence below this value, the detector is
- * "unsure" — the rotation axis didn't strongly match any signature.  In
- * that case we also check fallback_value for a match, allowing the config
- * to fire on a neighboring gesture (e.g. LOOK_UP when the user intended
- * NOD but the detector misclassified).  Above this threshold, only
- * trigger_value is checked (exact match). */
-#define FUZZY_CONFIDENCE_THRESHOLD  0.7f
-
 /* ── NVS helpers ────────────────────────────────────────────────────────── */
 
 static esp_err_t nvs_cfg_key(uint8_t id, char *buf, size_t buf_size)
@@ -392,7 +383,7 @@ esp_err_t cmd_config_execute(uint8_t id)
 }
 
 void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
-                                   float confidence)
+                                   const float conf[4])
 {
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
@@ -401,8 +392,14 @@ void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
         "NONE", "NOD", "LOOK_UP", "TILT_LEFT", "TILT_RIGHT"
     };
     const char *gname = (value <= 4) ? gesture_names[value] : "?";
-    ESP_LOGI(TAG, "═══ gesture event: %s (val=%u) conf=%.2f (%.0f%%) ═══",
-             gname, (unsigned)value, confidence, confidence * 100.0f);
+    if (conf) {
+        ESP_LOGI(TAG, "═══ gesture event: %s (val=%u) "
+                 "conf=[NOD=%.2f LK=%.2f TL=%.2f TR=%.2f] ═══",
+                 gname, (unsigned)value,
+                 conf[0], conf[1], conf[2], conf[3]);
+    } else {
+        ESP_LOGI(TAG, "═══ command event: val=%u ═══", (unsigned)value);
+    }
 
     for (uint8_t i = 0; i < CMD_CFG_MAX; i++) {
         cmd_config_t *cfg = &s_configs[i];
@@ -412,39 +409,54 @@ void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
         bool match = false;
         const char *match_reason = NULL;
 
-        if (type == TRIGGER_GESTURE) {
-            uint16_t gesture_bit = (1 << value);
-            bool primary   = (cfg->trigger_value & gesture_bit) != 0;
-            bool fallback  = (cfg->fallback_value & gesture_bit) != 0;
-            bool conf_gate = (cfg->min_confidence == 0 ||
-                              (confidence * 100.0f) >= (float)cfg->min_confidence);
+        if (type == TRIGGER_GESTURE && conf) {
+            /* ── Multi-confidence matching ─────────────────────────────
+             *
+             * For each gesture bit in trigger_value, check if its
+             * confidence >= min_confidence.  If ANY gesture passes,
+             * the config fires.  This is the "threshold" model:
+             *
+             *   conf = [0.7, 0.82, 0.85, 0.7]
+             *   trigger_value = NOD | TILT_LEFT  (bits 0+2 = 0x05)
+             *   min_confidence = 80
+             *
+             *   → NOD:   conf[0]=0.70 < 80 → no
+             *   → TILT_LEFT: conf[2]=0.85 >= 80 → YES, fire
+             *
+             * The old fallback_value mechanism is removed — the multi-
+             * confidence model replaces it cleanly.
+             */
+            static const char *glabels[] = { "NOD", "LOOK_UP", "TILT_LEFT", "TILT_RIGHT" };
+            for (int g = 0; g < 4; g++) {
+                uint16_t bit = (1 << (g + 1));  /* gesture_type_t: NOD=1 → bit1, etc. */
+                if (!(cfg->trigger_value & bit)) continue;
 
-            ESP_LOGD(TAG, "  cfg_%u '%s': trigger=0x%04x fallback=0x%04x "
-                     "min_conf=%u%% | gesture_bit=0x%04x",
-                     (unsigned)cfg->id, cfg->name,
-                     (unsigned)cfg->trigger_value, (unsigned)cfg->fallback_value,
-                     (unsigned)cfg->min_confidence, (unsigned)gesture_bit);
-            ESP_LOGD(TAG, "    primary=%d fallback=%d conf_gate=%d",
-                     (int)primary, (int)fallback, (int)conf_gate);
+                float c = conf[g];
+                bool gate = (cfg->min_confidence == 0 ||
+                             (c * 100.0f) >= (float)cfg->min_confidence);
 
-            if (primary) {
-                if (conf_gate) {
+                ESP_LOGD(TAG, "  cfg_%u: check %s conf=%.2f gate=%d",
+                         (unsigned)cfg->id, glabels[g], c, (int)gate);
+
+                if (gate) {
                     match = true;
-                    match_reason = "PRIMARY match (conf passes gate)";
-                } else {
-                    match_reason = "PRIMARY match BLOCKED by min_confidence";
+                    match_reason = glabels[g];
+                    break;  /* first qualifying gesture wins */
                 }
-            } else if (fallback && confidence < FUZZY_CONFIDENCE_THRESHOLD) {
-                if (conf_gate) {
-                    match = true;
-                    match_reason = "FALLBACK match (low conf, neighbor gesture)";
-                } else {
-                    match_reason = "FALLBACK match BLOCKED by min_confidence";
+            }
+            if (!match) {
+                /* Log why none qualified */
+                char buf[80];
+                int pos = 0;
+                for (int g = 0; g < 4; g++) {
+                    uint16_t bit = (1 << (g + 1));
+                    if (!(cfg->trigger_value & bit)) continue;
+                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                                    "%s=%.0f%% ", glabels[g], conf[g] * 100.0f);
                 }
-            } else if (fallback && confidence >= FUZZY_CONFIDENCE_THRESHOLD) {
-                match_reason = "FALLBACK skipped (conf too high — detector sure)";
-            } else {
-                match_reason = "no match (gesture not in trigger or fallback)";
+                ESP_LOGD(TAG, "  cfg_%u '%s': no gesture above %u%% (%s)",
+                         (unsigned)cfg->id, cfg->name,
+                         (unsigned)cfg->min_confidence, buf);
             }
         } else {
             match = (cfg->trigger_value == value);
@@ -468,15 +480,14 @@ void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
         if (match && cfg->n_steps > 0) {
             esp_err_t err = hid_output_send_seq(cfg->steps, cfg->n_steps);
             s_last_fire_ms[i] = now_ms;
-            ESP_LOGI(TAG, "  cfg_%u '%s': ✅ FIRED (%s) — %u steps -> %s",
+            ESP_LOGI(TAG, "  cfg_%u '%s': ✅ FIRED via %s — %u steps -> %s",
                      (unsigned)cfg->id, cfg->name, match_reason,
                      (unsigned)cfg->n_steps, esp_err_to_name(err));
         } else if (match && cfg->n_steps == 0) {
             ESP_LOGI(TAG, "  cfg_%u '%s': ⚠️ match but no steps configured",
                      (unsigned)cfg->id, cfg->name);
         } else {
-            ESP_LOGD(TAG, "  cfg_%u '%s': — skip (%s)",
-                     (unsigned)cfg->id, cfg->name, match_reason);
+            ESP_LOGD(TAG, "  cfg_%u '%s': — skip", (unsigned)cfg->id, cfg->name);
         }
     }
     ESP_LOGI(TAG, "═══ end trigger evaluation ═══");

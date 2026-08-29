@@ -110,19 +110,20 @@ esp_err_t cmd_config_execute(uint8_t id);
  * @brief  Find and execute all configs matching a trigger type+value.
  *         Called from gesture_bridge_task when a gesture fires.
  *
- *         Matching rules (lenient):
- *         1. Primary match:  trigger_value & (1 << value)  →  fire
- *         2. Fallback match: fallback_value & (1 << value)
- *            AND confidence < FUZZY_CONFIDENCE_THRESHOLD   →  fire
- *         3. Confidence gate: confidence*100 < min_confidence → skip
- *         4. Per-config cooldown: skip if cooldown not elapsed
+ *         Multi-confidence matching:
+ *         For each config, check if ANY gesture in trigger_value has
+ *         conf[i] >= min_confidence (per-gesture threshold).  The config
+ *         fires if at least one gesture passes.  This replaces the old
+ *         single-confidence fuzzy fallback with a cleaner model:
+ *         "any gesture above the threshold is a valid trigger."
  *
  * @param  type       TRIGGER_GESTURE or TRIGGER_COMMAND
- * @param  value      gesture_type_t value or command number
- * @param  confidence 0.0~1.0 detection confidence (pass 1.0 for command triggers)
+ * @param  value      gesture_type_t value or command number (primary)
+ * @param  conf       array of 4 confidence values [NOD, LOOK_UP, TILT_L, TILT_R]
+ *                    Pass NULL for command triggers (treated as conf=1.0).
  */
 void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
-                                   float confidence);
+                                   const float conf[4]);
 
 /**
  * @brief  Format all stored configs as text lines for BLE console output.

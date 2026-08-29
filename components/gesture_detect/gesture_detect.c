@@ -51,6 +51,9 @@ static const char *TAG = "gesture_detect";
 #define END_VEL_FRAC      0.20f  /*!< end velocity = peak × this fraction */
 #define END_HOLD_FRAMES   3      /*!< frames below end_vel before firing (3×20ms = 60ms) */
 #define FIRE_COOLDOWN_MS  1000   /*!< minimum ms between two fired events */
+#define MIN_ACC_MAG       3.0f   /*!< minimum |accumulated| to fire (filters tiny noisy motions) */
+#define MIN_PITCH_SUM     0.05f  /*!< minimum |pitch_sum| to decide NOD vs LOOK_UP direction */
+#define AXIS_DOMINANCE    0.3f   /*!< winning axis dot must exceed runner-up by this margin */
 
 /* ===== Module state ====================================================== */
 
@@ -113,6 +116,8 @@ typedef struct {
     float           prev_proj_axis;
     float           accum[3];
     bool            accum_armed;
+    /* Per-gesture confidence snapshot (carried to emit_event) */
+    float           last_conf[4];   /*!< [0]=NOD [1]=LOOK_UP [2]=TILTL [3]=TILTR */
 } gd_t;
 
 #if 0
@@ -429,7 +434,7 @@ void gesture_detect_reset_q_drift(void)
 /* ===== Event helper ====================================================== */
 
 static void emit_event(gesture_type_t type, float peak_angle, float peak_vel,
-                       float confidence)
+                       const float conf[4], int8_t best_idx)
 {
     if (s_gd.event_queue == NULL) {
         return;
@@ -440,8 +445,13 @@ static void emit_event(gesture_type_t type, float peak_angle, float peak_vel,
         .timestamp_ms      = now_ms,
         .peak_angle_deg    = peak_angle,
         .peak_velocity_deg_s = peak_vel,
-        .confidence        = confidence,
+        .best_idx          = best_idx,
     };
+    if (conf) {
+        memcpy(ev.conf, conf, sizeof(ev.conf));
+    } else {
+        memset(ev.conf, 0, sizeof(ev.conf));
+    }
     if (xQueueSend(s_gd.event_queue, &ev, 0) != pdTRUE) {
         /* queue full — drop newest. Bridge task is too slow; nothing
          * the detector can do but keep state machine coherent. */
@@ -520,7 +530,7 @@ static bool step_axis(axis_ctx_t *ctx,
                          (int)gt, signed_rel, abs_velocity,
                          ctx->peak_abs_rel, ctx->peak_abs_vel,
                          trigger, trigger_v, zone, (unsigned)debounce);
-                emit_event(gt, ctx->peak_abs_rel, ctx->peak_abs_vel, 1.0f);
+                emit_event(gt, ctx->peak_abs_rel, ctx->peak_abs_vel, NULL, -1);
                 return true;
             }
             GD_DBGI("DBG-SUPP proj=%+.1f vel=%.1f "
@@ -756,17 +766,30 @@ static void detector_task(void *arg)
                 if (sm > 0.001f) { s_gd.smooth_axis[0]/=sm; s_gd.smooth_axis[1]/=sm; s_gd.smooth_axis[2]/=sm; }
             }
             /* Only classify against calibrated signatures.
-             * NOD and LOOK_UP share one axis; classify as NOD (idx 0) always,
-             * distinguish at emit time via accumulated pitch direction. */
-            float dn  = (s_gd.sig.calibrated & GESTURE_SIG_F_NOD)   ? v3_dot(s_gd.smooth_axis, sig_nod_a)   : 0.0f;
-            float dtl = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) ? v3_dot(s_gd.smooth_axis, sig_tiltL_a) : 0.0f;
-            float dtr = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTR) ? v3_dot(s_gd.smooth_axis, sig_tiltR_a) : 0.0f;
-            /* Index must match sig_gt[]: 0=NOD 1=LOOK_UP 2=TILTL 3=TILTR */
-            float ad[] = {fabsf(dn), 0.0f, fabsf(dtl), fabsf(dtr)};
+             * NOD/LOOK_UP share one axis (opposite directions).
+             * TILT_LEFT/TILT_RIGHT share one axis (opposite directions).
+             * Use fabsf for axis alignment — the sign (direction) is
+             * determined at emit time by s_pitch_dot_sum (pitch) and
+             * the accumulated sign (roll).  This way the confidence
+             * reflects "how well does the axis match" regardless of
+             * which direction along the axis the head is moving. */
+            float dn  = (s_gd.sig.calibrated & GESTURE_SIG_F_NOD)
+                ? fabsf(v3_dot(s_gd.smooth_axis, sig_nod_a))   : 0.0f;
+            float dtl = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL)
+                ? fabsf(v3_dot(s_gd.smooth_axis, sig_tiltL_a)) : 0.0f;
+            /* Index 0=NOD 1=LOOK_UP 2=TILTL 3=TILTR
+             * NOD and LOOK_UP share axis → same alignment confidence.
+             * TILT_LEFT and TILT_RIGHT share axis → same alignment.
+             * Direction split happens at emit time. */
+            float ad[] = {dn, dn, dtl, dtl};
             float best = 0.0f; int bi = -1;
             for (int i = 0; i < 4; i++) { if (ad[i] > best) { best = ad[i]; bi = i; } }
             if (best > 0.15f) best_sig_idx = bi;
-            classification_confidence = best;  /* raw dot; clamp to [0,1] at emit */
+            classification_confidence = best;
+            /* Save all4 for the event — carried through to emit_event.
+             * At emit time, the pitch-axis pair (NOD/LOOK_UP) or the
+             * roll-axis pair (TILT_L/TILT_R) is split based on direction. */
+            memcpy(s_gd.last_conf, ad, sizeof(s_gd.last_conf));
         }
 
         /* ---- Scale cross product by calibration-derived factor ---------
@@ -817,12 +840,14 @@ static void detector_task(void *arg)
                 float acc_tL = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltL_a) / acc_mag : 0.0f;
                 float acc_tR = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltR_a) / acc_mag : 0.0f;
                 ESP_LOGI(TAG, "DC2 idx=%d acc=[%.1f %.1f %.1f] |acc|=%.1f "
-                         "dot(n=%.2f tL=%.2f tR=%.2f) hold=%u p=%.1f conf=%.2f",
+                         "dot(n=%.2f tL=%.2f tR=%.2f) hold=%u p=%.1f "
+                         "conf=[NOD=%.2f LK=%.2f TL=%.2f TR=%.2f]",
                          best_sig_idx,
                          s_gd.accum[0], s_gd.accum[1], s_gd.accum[2],
                          acc_mag, acc_n, acc_tL, acc_tR,
                          (unsigned)s_end_hold, s_pitch_dot_sum,
-                         classification_confidence);
+                         s_gd.last_conf[0], s_gd.last_conf[1],
+                         s_gd.last_conf[2], s_gd.last_conf[3]);
             }
         }
 
@@ -895,35 +920,88 @@ static void detector_task(void *arg)
                 }
             } else {
                 s_consec_above_trigger = 0;
-                if (vel < end_vel && v3_norm(s_gd.accum) > 1.0f) {
+                if (vel < end_vel && v3_norm(s_gd.accum) > MIN_ACC_MAG) {
                     /* Velocity dropped below end_vel — start hold timer. */
                     s_end_hold++;
                     if (s_end_hold >= END_HOLD_FRAMES) {
                         /* Check: accumulated sign matches peak sign? */
                         float dot_final = msig ? v3_dot(s_gd.accum, msig) : 0.0f;
                         bool sign_match = (dot_final * s_peak_sign_dot > 0.0f);
+
+                        /* ── Axis dominance guard ──────────────────────────────
+                         * The accumulated vector's alignment with the winning
+                         * axis must exceed the runner-up by AXIS_DOMINANCE.
+                         * This prevents small noisy gestures from firing when
+                         * the vector points between two axes. */
+                        if (sign_match && best_sig_idx >= 0) {
+                            float nod_dot  = fabsf(v3_dot(s_gd.accum, sig_nod_a));
+                            float tilt_dot = fabsf(v3_dot(s_gd.accum, sig_tiltL_a));
+                            float win_dot = (best_sig_idx < 2) ? nod_dot : tilt_dot;
+                            float lose_dot = (best_sig_idx < 2) ? tilt_dot : nod_dot;
+                            if (win_dot - lose_dot < AXIS_DOMINANCE) {
+                                ESP_LOGD(TAG, "SKIP weak dominance: "
+                                         "win=%.2f lose=%.2f margin=%.2f < %.2f",
+                                         win_dot, lose_dot,
+                                         win_dot - lose_dot, AXIS_DOMINANCE);
+                                sign_match = false;
+                            }
+                        }
+
                         if (sign_match && now_ms >= s_gd.cooldown_until_ms) {
                             static const gesture_type_t sig_gt[] = {
                                 GESTURE_NOD, GESTURE_LOOK_UP, GESTURE_TILT_LEFT, GESTURE_TILT_RIGHT
                             };
-                            /* For pitch axis: use accumulated raw cp direction
-                             * to distinguish NOD from LOOK_UP */
+                            /* Determine gesture from direction. */
                             gesture_type_t gt = sig_gt[best_sig_idx];
-                            if (best_sig_idx == 0 && s_pitch_dot_sum < 0.0f) {
-                                gt = GESTURE_LOOK_UP;
+                            if (best_sig_idx == 0) {
+                                /* Pitch axis: require minimum pitch_sum magnitude
+                                 * to avoid noise-driven NOD↔LOOK_UP flip. */
+                                if (fabsf(s_pitch_dot_sum) >= MIN_PITCH_SUM) {
+                                    gt = (s_pitch_dot_sum < 0.0f)
+                                        ? GESTURE_LOOK_UP : GESTURE_NOD;
+                                }
+                                /* else: pitch_sum too weak, keep default (NOD) */
                             }
+                            if (best_sig_idx == 2 && dot_final < 0.0f) {
+                                gt = GESTURE_TILT_RIGHT;
+                            }
+
+                            /* Split confidence by direction:
+                             * The raw conf array has equal values for both
+                             * gestures on the same axis (NOD==LOOK_UP, TL==TR).
+                             * Zero out the opposite direction so only the
+                             * matched gesture shows confidence. */
+                            float split_conf[4];
+                            memcpy(split_conf, s_gd.last_conf, sizeof(split_conf));
+                            if (best_sig_idx == 0) {
+                                /* Pitch axis: use same direction as gt */
+                                if (gt == GESTURE_NOD) {
+                                    split_conf[1] = 0.0f;  /* kill LOOK_UP */
+                                } else {
+                                    split_conf[0] = 0.0f;  /* kill NOD */
+                                }
+                            } else if (best_sig_idx == 2) {
+                                /* Roll axis: direction from dot_final */
+                                if (dot_final >= 0.0f) {
+                                    split_conf[3] = 0.0f;  /* kill TILT_RIGHT */
+                                } else {
+                                    split_conf[2] = 0.0f;  /* kill TILT_LEFT */
+                                }
+                            }
+
                             emit_event(gt, v3_norm(s_gd.accum), vel,
-                                       classification_confidence);
+                                       split_conf, best_sig_idx);
                             ESP_LOGI(TAG, "DETECT %s idx=%d acc=%.1f vel=%.0f "
-                                     "pitch_sum=%.2f conf=%.2f [%s]",
+                                     "pitch_sum=%.2f "
+                                     "NOD=%.2f LK=%.2f TL=%.2f TR=%.2f",
                                      (gt == GESTURE_NOD) ? "NOD" :
                                      (gt == GESTURE_LOOK_UP) ? "LOOK_UP" :
                                      (gt == GESTURE_TILT_LEFT) ? "TILT_LEFT" :
                                      (gt == GESTURE_TILT_RIGHT) ? "TILT_RIGHT" : "?",
                                      best_sig_idx, v3_norm(s_gd.accum), vel,
-                                     s_pitch_dot_sum, classification_confidence,
-                                     classification_confidence >= 0.7f ? "HIGH" :
-                                     classification_confidence >= 0.4f ? "MED" : "LOW");
+                                     s_pitch_dot_sum,
+                                     s_gd.last_conf[0], s_gd.last_conf[1],
+                                     s_gd.last_conf[2], s_gd.last_conf[3]);
                         }
                         /* Reset accumulator regardless. */
                         memset(s_gd.accum, 0, sizeof(s_gd.accum));
