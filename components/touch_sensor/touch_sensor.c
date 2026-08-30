@@ -68,6 +68,7 @@ static touch_sensor_handle_t   s_sens_handle = NULL;
 static touch_channel_handle_t  s_chan_handle = NULL;
 static QueueHandle_t           s_cmd_q       = NULL;
 static int                     s_chan_id     = -1;
+static volatile bool           s_pressed     = false;
 
 /* ── Press/Release worker ─────────────────────────────────────────────────
  *
@@ -84,7 +85,6 @@ static int                     s_chan_id     = -1;
 static void press_release_worker(void *arg)
 {
     (void)arg;
-    bool pressed = false;
 
     for (;;) {
         worker_cmd_t cmd;
@@ -94,22 +94,20 @@ static void press_release_worker(void *arg)
         if (!hid_output_is_ready()) {
             ESP_LOGW(TAG, "HID link not ready — dropping %s",
                      cmd == CMD_PRESS ? "press" : "release");
-            /* Keep `pressed` unchanged so the next valid event still
-             * represents the real button state. */
             continue;
         }
 
         uint16_t conn_id = hid_output_conn_id();
         if (cmd == CMD_PRESS) {
-            if (!pressed) {
+            if (!s_pressed) {
                 esp_hidd_send_mouse_value(conn_id, MOUSE_BTN_LEFT, 0, 0);
-                pressed = true;
+                s_pressed = true;
                 ESP_LOGD(TAG, "CH %d: mouse LEFT down", s_chan_id);
             }
         } else { /* CMD_RELEASE */
-            if (pressed) {
+            if (s_pressed) {
                 esp_hidd_send_mouse_value(conn_id, 0, 0, 0);
-                pressed = false;
+                s_pressed = false;
                 ESP_LOGD(TAG, "CH %d: mouse LEFT up", s_chan_id);
             }
         }
@@ -254,4 +252,9 @@ esp_err_t touch_sensor_init(int chan_id)
 
     ESP_LOGI(TAG, "touch_sensor ready on CH %d (GPIO %d)", chan_id, info.chan_gpio);
     return ESP_OK;
+}
+
+bool touch_sensor_is_pressed(void)
+{
+    return s_pressed;
 }

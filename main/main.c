@@ -37,6 +37,7 @@
 #include "hid_output.h"
 #include "hid_dev.h"
 #include "cmd_config.h"
+#include "mouse_mode.h"
 #include "touch_sensor.h"
 #include "driver/touch_sens.h"
 #include "battery_quantity_detection.h"
@@ -66,6 +67,10 @@ static QueueHandle_t s_cmd_q;
  * command worker) comes up before the sensor, so commands can arrive while the
  * detector is not initialised — or never will be, if the MPU is dead. */
 static volatile bool s_detector_ready = false;
+
+/* True after touch_sensor_init() succeeds. Prevents double-init when the
+ * user toggles mouse mode multiple times. */
+static volatile bool s_touch_ready = false;
 
 /* ── Gesture consumer: stream each event over BLE (and UART). ─────────────── */
 static void gesture_bridge_task(void *arg)
@@ -672,9 +677,18 @@ static void handle_command(const char *cmd)
     }
 
     if (strcmp(cmd, "cr") == 0) {
-        ble_console_log("calibrating REST (keep your head STILL)...\n");
+        ble_console_log("calibrating REST (keep your head STILL, 2s)...\n");
         esp_err_t err = gesture_detect_calibrate_rest(2000);
-        ble_console_logf("REST calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+        if (err == ESP_OK) {
+            const gesture_sig_axes_t *axes = gesture_detect_get_sig_axes();
+            if (axes) {
+                ble_console_log("REST calibration: OK — signatures loaded, detection ENABLED\n");
+            } else {
+                ble_console_log("REST calibration: OK — no saved signatures, run cn/ctl/ctr\n");
+            }
+        } else {
+            ble_console_logf("REST calibration: %s\n", esp_err_to_name(err));
+        }
     } else if (strcmp(cmd, "cn") == 0) {
         ble_console_log("calibrating NOD (do a slow chin-down nod)...\n");
         esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_NOD, 4000);
@@ -816,9 +830,108 @@ static void handle_command(const char *cmd)
         parse_args(cmd, &ms, 1);
         gesture_detect_start_capture((uint32_t)ms);
         ble_console_logf("capture started for %ld ms\n", ms);
+    } else if (strncmp(cmd, "mouse", 5) == 0 && (cmd[5] == '\0' || cmd[5] == ' ')) {
+        const char *p = cmd + 5;
+        while (*p == ' ') p++;
+
+        if (strcmp(p, "on") == 0) {
+            mouse_mode_set_enabled(true);
+            /* Ensure touch sensor is initialized */
+            if (!s_touch_ready) {
+                esp_err_t terr = touch_sensor_init(TOUCH_MIN_CHAN_ID + 1);
+                if (terr == ESP_OK) {
+                    s_touch_ready = true;
+                } else {
+                    ble_console_logf("mouse: touch sensor init failed: %s\n",
+                                     esp_err_to_name(terr));
+                }
+            }
+            ble_console_log("mouse: toggle detection ENABLED\n");
+            ble_console_log("  trigger: left tilt + right tilt + touch held\n");
+        } else if (strcmp(p, "off") == 0) {
+            mouse_mode_set_enabled(false);
+            ble_console_log("mouse: toggle detection DISABLED\n");
+        } else if (strcmp(p, "status") == 0) {
+            bool active = mouse_mode_is_active();
+            bool enabled = mouse_mode_is_enabled();
+            const mouse_mode_params_t *mp = mouse_mode_get_params();
+            /* Machine-parseable line for the config tool */
+            ble_console_logf("mouse_mode: enabled=%d active=%d dz=%.1f ref=%.1f "
+                             "max=%.0f dwell=%u\n",
+                             (int)enabled, (int)active, mp->dead_zone_deg,
+                             mp->speed_ref_deg, mp->max_speed,
+                             (unsigned)mp->dwell_ms);
+            /* Human-readable */
+            ble_console_logf("mouse: enabled=%d active=%d dz=%.1f ref=%.1f "
+                             "max=%.0f dwell=%u ms\n",
+                             (int)enabled, (int)active, mp->dead_zone_deg,
+                             mp->speed_ref_deg, mp->max_speed,
+                             (unsigned)mp->dwell_ms);
+        } else if (strncmp(p, "dz", 2) == 0 && (p[2] == '\0' || p[2] == ' ')) {
+            const char *q = p + 2;
+            while (*q == ' ') q++;
+            char *endp;
+            float val = strtof(q, &endp);
+            if (endp == q || val < 0.1f || val > 10.0f) {
+                ble_console_log("mouse dz: 0.1..10.0 °/frame\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.dead_zone_deg = val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse dz -> %.1f°/frame\n", mp.dead_zone_deg);
+            }
+        } else if (strncmp(p, "ref", 3) == 0 && (p[3] == '\0' || p[3] == ' ')) {
+            const char *q = p + 3;
+            while (*q == ' ') q++;
+            char *endp;
+            float val = strtof(q, &endp);
+            if (endp == q || val < 0.5f || val > 20.0f) {
+                ble_console_log("mouse ref: 0.5..20.0 °/frame (velocity for max speed)\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.speed_ref_deg = val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse ref -> %.1f°/frame\n", mp.speed_ref_deg);
+            }
+        } else if (strncmp(p, "max", 3) == 0 && (p[3] == '\0' || p[3] == ' ')) {
+            long val;
+            const char *q = p + 3;
+            while (*q == ' ') q++;
+            char *endp;
+            val = strtol(q, &endp, 10);
+            if (endp == q || val < 5 || val > 127) {
+                ble_console_log("mouse max: 5..127 px/frame\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.max_speed = (float)val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse max -> %.0f\n", mp.max_speed);
+            }
+        } else if (strncmp(p, "dwell", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            long val;
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            char *endp;
+            val = strtol(q, &endp, 10);
+            if (endp == q || val < 0 || val > 10000) {
+                ble_console_log("mouse dwell: 0..10000 ms (0=immediate)\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.dwell_ms = (uint32_t)val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse dwell -> %u ms\n", (unsigned)mp.dwell_ms);
+            }
+        } else {
+            ble_console_log("mouse: on|off|status|dz|ref|max|dwell\n");
+            ble_console_log("  dz <°/f>     velocity dead zone (0.1..10, default 0.3)\n");
+            ble_console_log("  ref <°/f>    velocity for max speed (0.5..20, default 3.0)\n");
+            ble_console_log("  max <px>     max speed (5..127, default 60)\n");
+            ble_console_log("  dwell <ms>   0=immediate, >0=dwell (default 0)\n");
+        }
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);
         ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc\n");
+        ble_console_log("  mouse    : mouse on|off|status|dz|sens|acc|max|dwell\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
         ble_console_log("  configs : cmd list|get|set|del|run|fuzzy\n");
 #ifdef ENABLE_SERIAL_TRIGGER
@@ -1020,6 +1133,9 @@ void app_main(void)
 
     /* 1b. Command configs — loaded from NVS, used by `cmd`/`command` handler. */
     cmd_config_init();
+
+    /* 1c. Mouse mode — head-tracking cursor control. */
+    mouse_mode_init();
 
     /* 2. MPU6050 + DMP, BEFORE the BLE stack comes up.
      *

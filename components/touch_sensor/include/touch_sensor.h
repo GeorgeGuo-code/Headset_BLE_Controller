@@ -48,6 +48,9 @@ extern "C" {
  */
 esp_err_t touch_sensor_init(int chan_id);
 
+/** @brief True while the touch pad is being touched (left button held). */
+bool touch_sensor_is_pressed(void);
+
 #ifdef __cplusplus
 }
 #endif
