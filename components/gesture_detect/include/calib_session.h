@@ -4,11 +4,9 @@
 /**
  * @file calib_session.h
  *
- * Phase-3 STUB. Function signatures and the command-string grammar are
- * declared here so the rest of the project (and any future Phase-1/2
- * code that wants to wire the command parser) can compile against a
- * stable interface. Implementations in calib_session.c return
- * ESP_ERR_NOT_SUPPORTED for now and are no-ops.
+ * DEAD CODE: This header is not included anywhere in the project.
+ * The rest→gesture calibration flow (cr/cn/ctl/ctr in main.c) replaced
+ * the Phase-3 session approach. Kept as reference only.
  */
 
 #include <stdint.h>

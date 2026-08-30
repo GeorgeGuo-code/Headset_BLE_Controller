@@ -35,8 +35,14 @@ extern "C" {
 typedef void (*ble_console_cmd_cb_t)(const char *cmd, size_t len);
 
 /**
- * @brief  Bring up the BT controller + Bluedroid + GAP + the console GATT
- *         service and start advertising. Call once at boot, after NVS init.
+ * @brief  Register the console GATT service as one profile in ble_stack's
+ *         table and start the log TX task. Call once at boot, after NVS init
+ *         and BEFORE ble_stack_start() — the latter is what actually powers
+ *         the radio and starts advertising.
+ *
+ *         This no longer brings up the BT controller / Bluedroid. Bluedroid
+ *         keeps a single global GATTS callback, so radio ownership moved to
+ *         `ble_stack` in order to run BLE HID alongside this console.
  *
  * @param on_cmd  Command callback (may be NULL to ignore RX writes).
  * @return ESP_OK on success, or the first failing esp_* error.

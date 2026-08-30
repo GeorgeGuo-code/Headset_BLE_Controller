@@ -1,18 +1,22 @@
 /*
- * main.c — boot sequence: NVS -> MPU/DMP -> gesture detector -> BLE console.
+ * main.c — boot sequence: NVS -> MPU/DMP -> gesture detector -> BLE stack
+ * (NUS console + HID) -> UART console.
  *
- * Calibration is triggered over BLE (Nordic-UART-Service style console): a
- * central (e.g. the Electron tool or nRF Connect) writes a one-line command
- * ("c"/"ca"/"ct"/"p"/"sp"/"sr") to the RX characteristic. Gesture events and
- * calibration prompts/results are streamed back over the TX notify
- * characteristic (and mirrored to the UART console for local debugging).
+ * Commands ("cr"/"cn"/"ctl"/"ctr"/"p"/"sp"/"sr"/"hs"/"ac"/"ak"/"o"/...) arrive
+ * on two channels that share one queue and one dispatcher:
+ *   - BLE: a central (the Electron tool or nRF Connect) writes a line to the
+ *     NUS RX characteristic. Results stream back over the TX notify char.
+ *   - UART: `hmbc <cmd...>` in the serial REPL. Added in Phase 7 so HID can be
+ *     smoke-tested without a BLE central attached.
+ * Both feed s_cmd_q; handle_command() is the single implementation.
  *
- * This replaces the old UART-command trigger from the reference firmware. The
- * BOOT button remains as an offline fallback trigger.
+ * Calibration flow: cr (rest) → cn (nod) → ctl (left tilt) → ctr (right tilt).
+ * The BOOT button posts "c" but that command is not yet implemented.
  */
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -20,6 +24,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_check.h"
+#include "esp_console.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 
@@ -27,12 +33,24 @@
 #include "inv_mpu.h"
 #include "gesture_detect.h"
 #include "ble_console.h"
+#include "ble_stack.h"
+#include "hid_output.h"
+#include "hid_dev.h"
+#include "cmd_config.h"
+#include "mouse_mode.h"
+#include "touch_sensor.h"
+#include "driver/touch_sens.h"
+#include "battery_quantity_detection.h"
 
 #define TAG "main"
 
+#define BLE_DEVICE_NAME "HMBC-Console"
+
 #define EVENT_QUEUE_LEN 8
 #define CMD_QUEUE_LEN   4
-#define CMD_MAX_LEN     16
+/* Phase 7: was 16. Commands now take arguments ("ak 8 4", "af 12"), and Step 4
+ * will add rule names, so the buffer needs room beyond a two-letter opcode. */
+#define CMD_MAX_LEN     1024
 
 /* BOOT button (GPIO0 on most ESP32-S3 dev boards). Active-low. Hold to
  * trigger a full guided calibration without a BLE central attached. */
@@ -49,6 +67,10 @@ static QueueHandle_t s_cmd_q;
  * command worker) comes up before the sensor, so commands can arrive while the
  * detector is not initialised — or never will be, if the MPU is dead. */
 static volatile bool s_detector_ready = false;
+
+/* True after touch_sensor_init() succeeds. Prevents double-init when the
+ * user toggles mouse mode multiple times. */
+static volatile bool s_touch_ready = false;
 
 /* ── Gesture consumer: stream each event over BLE (and UART). ─────────────── */
 static void gesture_bridge_task(void *arg)
@@ -68,56 +90,632 @@ static void gesture_bridge_task(void *arg)
         case GESTURE_NONE:
         default:                 name = "NONE";       break;
         }
-        ble_console_logf("GESTURE %s ts=%u peak=%.1f vel=%.1f\n",
+
+        ble_console_logf("GESTURE %s ts=%u peak=%.1f vel=%.0f "
+                         "conf=[NOD=%.2f LK=%.2f TL=%.2f TR=%.2f] best=%d\n",
                          name, (unsigned)ev.timestamp_ms,
-                         ev.peak_angle_deg, ev.peak_velocity_deg_s);
+                         ev.peak_angle_deg, ev.peak_velocity_deg_s,
+                         ev.conf[0], ev.conf[1], ev.conf[2], ev.conf[3],
+                         (int)ev.best_idx);
+
+        /* Execute any configs triggered by this gesture (with conf array). */
+        cmd_config_execute_by_trigger(TRIGGER_GESTURE, (uint16_t)ev.type,
+                                      ev.conf);
     }
 }
 
-/* Guided three-phase calibration (neutral -> nod_axis -> tilt_axis). Prompts
- * and results go over BLE so the connected tool can display them. Ported from
- * the reference firmware; ~11.4 s total. */
-static void run_guided_calibration(void)
+
+
+/* Parse up to `max` whitespace-separated integers following the opcode.
+ * Returns how many were parsed. Accepts decimal or 0x-prefixed hex. */
+static int parse_args(const char *cmd, long *out, int max)
 {
-    ble_console_log("== calibration 1/3: keep your head STILL ==\n");
-    esp_err_t err = gesture_detect_calibrate_neutral(2000);
-    if (err != ESP_OK) {
-        ble_console_logf("neutral capture failed: %s — aborting\n", esp_err_to_name(err));
-        return;
+    int n = 0;
+    const char *p = cmd;
+    while (*p && n < max) {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        char *end = NULL;
+        long v = strtol(p, &end, 0);
+        if (end == p) {          /* not a number — this is the opcode, skip it */
+            while (*p && *p != ' ' && *p != '\t') {
+                p++;
+            }
+            continue;
+        }
+        out[n++] = v;
+        p = end;
     }
-    ble_console_log("== calibration 2/3: do a few slow NODS now ==\n");
-    vTaskDelay(pdMS_TO_TICKS(700));
-    err = gesture_detect_calibrate_axes(4000);
-    if (err != ESP_OK) {
-        ble_console_logf("nod-axis capture failed: %s — aborting\n", esp_err_to_name(err));
-        return;
-    }
-    ble_console_log("== calibration 3/3: do slow LEFT and RIGHT tilts now ==\n");
-    vTaskDelay(pdMS_TO_TICKS(700));
-    err = gesture_detect_calibrate_tilt(4000);
-    ble_console_logf("calibration result: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+    return n;
 }
 
-/* Execute one console command (dispatch mirrors the reference UART command
- * set). Runs in cal_worker_task, so blocking calibration is fine here. */
+/* Range-bounded integer parsers for the `seq` command. We can't strtol
+ * directly on [p, limit) because it's not NUL-terminated, so each integer
+ * is copied into a small stack buffer first. 16 bytes is plenty for any
+ * HID parameter we accept (max is 60000 ms sleep = 5 digits, plus sign). */
+#define SEQ_INT_BUF  16
+
+/* Parse one signed integer at p (after skipping leading whitespace), staying
+ * within [p, limit). On success, returns the pointer to the first char past
+ * the consumed integer (still inside [p, limit) or one-past-the-end). On
+ * failure (no integer found), returns NULL. */
+static const char *seq_parse_int(const char *p, const char *limit, long *out)
+{
+    while (p < limit && (*p == ' ' || *p == '\t')) p++;
+    if (p >= limit) return NULL;
+
+    char buf[SEQ_INT_BUF];
+    size_t n = limit - p;
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+
+    char *endp = NULL;
+    long v = strtol(buf, &endp, 0);
+    if (endp == buf) {
+        return NULL;  /* no digits */
+    }
+    *out = v;
+    return p + (endp - buf);
+}
+
+/* Parse two signed integers in sequence. On success, returns the pointer
+ * past the second one. On any failure, returns NULL — *a and *b are
+ * undefined. */
+static const char *seq_parse_two_ints(const char *p, const char *limit,
+                                      long *a, long *b)
+{
+    p = seq_parse_int(p, limit, a);
+    if (p == NULL) return NULL;
+    p = seq_parse_int(p, limit, b);
+    return p;
+}
+
+/* HID / output-layer commands. Handled before the sensor-ready gate below so
+ * HID stays testable when the MPU failed to come up (degraded mode).
+ * Returns true if the command was consumed. */
+static bool handle_hid_command(const char *cmd)
+{
+    long args[4];
+
+    if (strcmp(cmd, "hs") == 0) {
+        ble_console_logf("hid: connected=%u bonded=%u ready=%u conn_id=%u\n",
+                         (unsigned)ble_stack_is_connected(),
+                         (unsigned)ble_stack_is_bonded(),
+                         (unsigned)hid_output_is_ready(),
+                         (unsigned)hid_output_conn_id());
+        return true;
+    }
+
+    if (strncmp(cmd, "ac", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
+        /* ac <consumer_code> — e.g. `ac 205` = PLAY_PAUSE, `ac 233` = VOL_UP */
+        int n = parse_args(cmd, args, 1);
+        if (n < 1) {
+            ble_console_logf("usage: ac <code>  (%u=play/pause %u=vol+ %u=next)\n",
+                             (unsigned)HID_CONSUMER_PLAY_PAUSE,
+                             (unsigned)HID_CONSUMER_VOLUME_UP,
+                             (unsigned)HID_CONSUMER_SCAN_NEXT_TRK);
+            return true;
+        }
+        esp_err_t err = hid_output_send_consumer((uint8_t)args[0], 0);
+        ble_console_logf("consumer %ld -> %s\n", args[0], esp_err_to_name(err));
+        return true;
+    }
+
+    if (strncmp(cmd, "ak", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
+        /* ak <modifiers> <key> — e.g. `ak 8 4` = LeftGUI+A (Win+A) */
+        int n = parse_args(cmd, args, 2);
+        if (n < 2) {
+            ble_console_log("usage: ak <modifiers> <keycode>   e.g. 'ak 8 4' = Win+A\n"
+                            "  modifiers: 1=LCtrl 2=LShift 4=LAlt 8=LGui\n");
+            return true;
+        }
+        uint8_t keys[4] = { (uint8_t)args[1], 0, 0, 0 };
+        esp_err_t err = hid_output_send_keyboard((uint8_t)args[0], keys, 0);
+        ble_console_logf("keyboard mod=0x%02lx key=%ld -> %s\n",
+                         args[0], args[1], esp_err_to_name(err));
+        return true;
+    }
+
+    if (strncmp(cmd, "o", 1) == 0 && (cmd[1] == '\0' || cmd[1] == ' ')) {
+        /* o [path] — open Windows app via Win+R. No args = "notepad".
+         * Path is the rest of the line verbatim; spaces and ASCII punctuation
+         * are passed through unchanged. */
+        const char *path = cmd + 1;
+        while (*path == ' ' || *path == '\t') {
+            path++;
+        }
+        if (*path == '\0') {
+            path = "notepad";
+        }
+        esp_err_t err = hid_output_open_path(path);
+        ble_console_logf("open \"%s\" -> %s\n", path, esp_err_to_name(err));
+        return true;
+    }
+
+    if (strncmp(cmd, "seq", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' ')) {
+        /* seq <step>; <step>; ...   (Phase 8)
+         *
+         * The whole line after "seq" is split on ';' into steps. Each step
+         * starts with one of:
+         *   sleep <ms>          — worker-side delay, no HID traffic
+         *   key  <mod> <kc>     — keyboard press, hold HID_OUTPUT_DEFAULT_HOLD_MS, release
+         *   type <text>         — type ASCII (text is everything up to the next ';')
+         *   click left|right|middle|0..7  — mouse press+release
+         *   move <dx> <dy>      — single relative mouse report
+         *
+         * Notes:
+         *  - `type` deliberately eats the rest of the step (including spaces),
+         *    so a path with spaces must be split: `seq type hello world;` works.
+         *  - ';' inside `type` text is not escapable; for paths use `o` instead.
+         *  - The whole command is bounded by CMD_MAX_LEN (1024) — about 100
+         *    short steps, which is enough for the typical scripted open.
+         *  - GOTCHA: any `key` step that triggers an async window open (Win+R,
+         *    Win+E, Win+D, Win+L, ...) MUST be followed by a `sleep 350` (or
+         *    500 on slow hosts) before the next `type`/`key`. The Run dialog
+         *    takes ~150-250 ms to appear and grab focus, so the next step's
+         *    HID reports race the host's focus change. For "open app" use the
+         *    bundled `o <path>` command — it has the 350 ms wait built in. */
+        const char *p = cmd + 3;
+        while (*p == ' ' || *p == '\t') p++;
+
+        hid_seq_step_t steps[HID_SEQ_MAX_STEPS];
+        size_t n = 0;
+
+        while (*p && n < HID_SEQ_MAX_STEPS) {
+            /* End of this step = next ';' (exclusive) or end of string. */
+            const char *end = strchr(p, ';');
+            if (end == NULL) end = p + strlen(p);
+
+            /* Skip leading whitespace in the step. Empty steps (e.g. from a
+             * double ";;") are silently skipped — that way "seq sleep 100;;key 0 40"
+             * doesn't error out. */
+            const char *tok = p;
+            while (tok < end && (*tok == ' ' || *tok == '\t')) tok++;
+            if (tok >= end) {
+                p = (*end == ';') ? end + 1 : end;
+                continue;
+            }
+
+            /* Find end of first token. */
+            const char *tok_end = tok;
+            while (tok_end < end && *tok_end != ' ' && *tok_end != '\t') tok_end++;
+            size_t tlen = (size_t)(tok_end - tok);
+
+            if (tlen == 5 && strncmp(tok, "sleep", 5) == 0) {
+                long ms;
+                if (seq_parse_int(tok_end, end, &ms) == NULL || ms <= 0 || ms > 60000) {
+                    ble_console_logf("seq: bad sleep arg (want 1..60000 ms)\n");
+                    return true;
+                }
+                steps[n].kind      = HID_SEQ_SLEEP;
+                steps[n].u.sleep.ms = (uint16_t)ms;
+                n++;
+            } else if (tlen == 3 && strncmp(tok, "key", 3) == 0) {
+                long mod, kc;
+                if (seq_parse_two_ints(tok_end, end, &mod, &kc) == NULL) {
+                    ble_console_log("seq: usage: key <mod> <keycode>   e.g. 'key 8 4' = Win+A\n");
+                    return true;
+                }
+                steps[n].kind            = HID_SEQ_KEY;
+                steps[n].u.key.modifiers  = (uint8_t)mod;
+                steps[n].u.key.keycode    = (uint8_t)kc;
+                steps[n].u.key.hold_ms    = 0;   /* default */
+                n++;
+            } else if (tlen == 4 && strncmp(tok, "type", 4) == 0) {
+                /* `type` consumes the rest of the step, including any leading
+                 * whitespace after the token. This is what lets users type
+                 * "hello world" with a space inside the typed string. */
+                const char *text = tok_end;
+                while (text < end && (*text == ' ' || *text == '\t')) text++;
+                size_t text_len = (size_t)(end - text);
+                if (text_len == 0) {
+                    ble_console_log("seq: usage: type <text>   (text goes to next ';')\n");
+                    return true;
+                }
+                if (text_len > HID_SEQ_TEXT_MAX) {
+                    ble_console_logf("seq: type text too long (max %d, got %u) — "
+                                     "use multiple 'type' steps or 'o <path>'\n",
+                                     HID_SEQ_TEXT_MAX, (unsigned)text_len);
+                    return true;
+                }
+                steps[n].kind = HID_SEQ_TYPE;
+                memcpy(steps[n].u.type.text, text, text_len);
+                steps[n].u.type.text[text_len] = '\0';
+                steps[n].u.type.len = (uint8_t)text_len;
+                n++;
+            } else if (tlen == 5 && strncmp(tok, "click", 5) == 0) {
+                const char *arg = tok_end;
+                while (arg < end && (*arg == ' ' || *arg == '\t')) arg++;
+                size_t alen = (size_t)(end - arg);
+                uint8_t btn = 0;
+                if      (alen == 4 && strncmp(arg, "left",   4) == 0) btn = 1;
+                else if (alen == 5 && strncmp(arg, "right",  5) == 0) btn = 2;
+                else if (alen == 6 && strncmp(arg, "middle", 6) == 0) btn = 4;
+                else {
+                    /* Numeric fallback: 1=left, 2=right, 4=middle, or any combo. */
+                    long nb;
+                    if (seq_parse_int(arg, end, &nb) != NULL && nb >= 0 && nb <= 7) {
+                        btn = (uint8_t)nb;
+                    } else {
+                        ble_console_log("seq: usage: click <left|right|middle|0..7>\n");
+                        return true;
+                    }
+                }
+                steps[n].kind            = HID_SEQ_CLICK;
+                steps[n].u.click.buttons = btn;
+                n++;
+            } else if (tlen == 4 && strncmp(tok, "move", 4) == 0) {
+                long dx, dy;
+                if (seq_parse_two_ints(tok_end, end, &dx, &dy) == NULL) {
+                    ble_console_log("seq: usage: move <dx> <dy>   (-128..127)\n");
+                    return true;
+                }
+                if (dx < -128 || dx > 127 || dy < -128 || dy > 127) {
+                    ble_console_logf("seq: move dx/dy out of range (-128..127), got %ld %ld\n",
+                                     dx, dy);
+                    return true;
+                }
+                steps[n].kind       = HID_SEQ_MOVE;
+                steps[n].u.move.dx  = (int8_t)dx;
+                steps[n].u.move.dy  = (int8_t)dy;
+                n++;
+            } else {
+                ble_console_logf("seq: unknown step '%.*s'\n", (int)tlen, tok);
+                ble_console_log("  known: sleep <ms> | key <mod> <kc> | type <text> | "
+                                "click <btn> | move <dx> <dy>\n");
+                return true;
+            }
+
+            p = (*end == ';') ? end + 1 : end;
+        }
+
+        if (n == 0) {
+            ble_console_log("seq: no valid steps. usage: seq sleep 100; key 0 40; type hello; "
+                            "click left; move 10 20\n");
+            return true;
+        }
+        if (*p) {
+            /* We filled the array before consuming all input. */
+            ble_console_logf("seq: too many steps (max %d, more remain)\n", HID_SEQ_MAX_STEPS);
+            return true;
+        }
+
+        esp_err_t err = hid_output_send_seq(steps, n);
+        ble_console_logf("seq: %u steps -> %s\n", (unsigned)n, esp_err_to_name(err));
+        return true;
+    }
+
+    /* ── command config management ────────────────────────────────────── */
+
+#ifdef ENABLE_SERIAL_TRIGGER
+    if (strncmp(cmd, "command ", 8) == 0) {
+        /* command <id> — shorthand for "cmd run <id>" (debug build only) */
+        long id;
+        const char *p = cmd + 8;
+        while (*p == ' ') p++;
+        char *endp;
+        id = strtol(p, &endp, 10);
+        if (endp == p || id < 1 || id > CMD_CFG_MAX) {
+            ble_console_logf("usage: command <id>  (1..%d)\n", CMD_CFG_MAX);
+            return true;
+        }
+        esp_err_t err = cmd_config_execute((uint8_t)id);
+        ble_console_logf("cmd %ld -> %s\n", id, esp_err_to_name(err));
+        return true;
+    }
+#endif
+
+    if (strncmp(cmd, "cmd ", 4) == 0) {
+        const char *p = cmd + 4;
+        while (*p == ' ') p++;
+
+        /* cmd list */
+        if (strncmp(p, "list", 4) == 0 && (p[4] == '\0' || p[4] == ' ')) {
+            char buf[2048];
+            esp_err_t err = cmd_config_list(buf, sizeof(buf));
+            if (err == ESP_OK) {
+                ble_console_log(buf);
+            } else {
+                ble_console_log("cmd list: buffer too small\n");
+            }
+            return true;
+        }
+
+        /* cmd get <id> */
+        if (strncmp(p, "get ", 4) == 0) {
+            long id;
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd get <id>  (1..%d)\n", CMD_CFG_MAX);
+                return true;
+            }
+            const cmd_config_t *cfg = cmd_config_get((uint8_t)id);
+            if (!cfg) {
+                ble_console_logf("cmd get %ld: not found\n", id);
+                return true;
+            }
+            const char *tname = "none";
+            if (cfg->trigger_type == TRIGGER_GESTURE) {
+                switch (cfg->trigger_value) {
+                case GESTURE_NOD:        tname = "gesture:nod";       break;
+                case GESTURE_LOOK_UP:    tname = "gesture:look_up";   break;
+                case GESTURE_TILT_LEFT:  tname = "gesture:tilt_left"; break;
+                case GESTURE_TILT_RIGHT: tname = "gesture:tilt_right"; break;
+                default:                 tname = "gesture:?";         break;
+                }
+            }
+#ifdef ENABLE_SERIAL_TRIGGER
+            else if (cfg->trigger_type == TRIGGER_COMMAND) {
+                static char tbuf[24];
+                snprintf(tbuf, sizeof(tbuf), "command:%u", (unsigned)cfg->trigger_value);
+                tname = tbuf;
+            }
+#endif
+            ble_console_logf("cfg: id=%u name=\"%s\" trigger=%s n_steps=%u\n",
+                             (unsigned)cfg->id, cfg->name, tname, (unsigned)cfg->n_steps);
+            /* Show fuzzy matching parameters. */
+            if (cfg->fallback_value != 0 || cfg->cooldown_ms > 0 || cfg->min_confidence > 0) {
+                /* Format trigger bitmask as gesture names. */
+                char tb_buf[64] = "none";
+                {
+                    int pos = 0;
+                    if (cfg->trigger_value & (1 << GESTURE_NOD))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sNOD", pos ? "+" : "");
+                    if (cfg->trigger_value & (1 << GESTURE_LOOK_UP))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sLOOK_UP", pos ? "+" : "");
+                    if (cfg->trigger_value & (1 << GESTURE_TILT_LEFT))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sTILT_LEFT", pos ? "+" : "");
+                    if (cfg->trigger_value & (1 << GESTURE_TILT_RIGHT))
+                        pos += snprintf(tb_buf + pos, sizeof(tb_buf) - pos, "%sTILT_RIGHT", pos ? "+" : "");
+                }
+                ble_console_logf("  match: triggers=[%s] cooldown=%ums min_conf=%u%%\n",
+                                 tb_buf, (unsigned)cfg->cooldown_ms,
+                                 (unsigned)cfg->min_confidence);
+            }
+            char seq_buf[512];
+            if (cmd_config_format_seq(cfg, seq_buf, sizeof(seq_buf)) == ESP_OK) {
+                ble_console_logf("cfg: steps=%s\n", seq_buf);
+            }
+            return true;
+        }
+
+        /* cmd set <id> <name> <type> <value> <seq_text...> */
+        if (strncmp(p, "set ", 4) == 0) {
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+
+            long id;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd set <id> <name> <type> <value> <seq>\n"
+                                 "  type: none / gesture / command\n"
+                                 "  gesture values: 1=nod 2=look_up 3=tilt_left 4=tilt_right\n");
+                return true;
+            }
+            q = endp;
+
+            /* parse name (next token, no spaces) */
+            while (*q == ' ') q++;
+            const char *name_start = q;
+            while (*q && *q != ' ') q++;
+            size_t name_len = (size_t)(q - name_start);
+            if (name_len == 0 || name_len >= CMD_CFG_NAME_MAX) {
+                ble_console_log("cmd set: invalid name\n");
+                return true;
+            }
+
+            /* parse trigger type */
+            while (*q == ' ') q++;
+            const char *type_start = q;
+            while (*q && *q != ' ') q++;
+            size_t type_len = (size_t)(q - type_start);
+
+            cmd_trigger_type_t ttype = TRIGGER_NONE;
+            if (type_len == 4 && strncmp(type_start, "none", 4) == 0) {
+                ttype = TRIGGER_NONE;
+            } else if (type_len == 7 && strncmp(type_start, "gesture", 7) == 0) {
+                ttype = TRIGGER_GESTURE;
+            }
+#ifdef ENABLE_SERIAL_TRIGGER
+            else if (type_len == 7 && strncmp(type_start, "command", 7) == 0) {
+                ttype = TRIGGER_COMMAND;
+            }
+#endif
+            else {
+                ble_console_log("cmd set: trigger type must be none/gesture"
+#ifdef ENABLE_SERIAL_TRIGGER
+                                "/command"
+#endif
+                                "\n");
+                return true;
+            }
+
+            /* parse trigger value */
+            while (*q == ' ') q++;
+            long tval = 0;
+            if (ttype != TRIGGER_NONE) {
+                tval = strtol(q, &endp, 10);
+                if (endp == q) {
+                    ble_console_log("cmd set: invalid trigger value\n");
+                    return true;
+                }
+                q = endp;
+            }
+
+            /* parse seq text (rest of line) */
+            while (*q == ' ') q++;
+
+            cmd_config_t cfg;
+            memset(&cfg, 0, sizeof(cfg));
+            cfg.id = (uint8_t)id;
+            memcpy(cfg.name, name_start, name_len);
+            cfg.name[name_len] = '\0';
+            cfg.trigger_type = ttype;
+            cfg.trigger_value = (uint16_t)tval;
+
+            if (*q) {
+                size_t n_steps = 0;
+                esp_err_t err = cmd_config_parse_seq(q, cfg.steps, &n_steps);
+                cfg.n_steps = (uint8_t)n_steps;
+                if (err != ESP_OK) {
+                    ble_console_logf("cmd set: bad seq text: %s\n", esp_err_to_name(err));
+                    return true;
+                }
+            }
+
+            esp_err_t err = cmd_config_set(&cfg);
+            ble_console_logf("cmd set id=%u -> %s\n", (unsigned)id, esp_err_to_name(err));
+            return true;
+        }
+
+        /* cmd del <id> */
+        if (strncmp(p, "del ", 4) == 0) {
+            long id;
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd del <id>  (1..%d)\n", CMD_CFG_MAX);
+                return true;
+            }
+            esp_err_t err = cmd_config_delete((uint8_t)id);
+            ble_console_logf("cmd del %ld -> %s\n", id, esp_err_to_name(err));
+            return true;
+        }
+
+        /* cmd run <id> */
+        if (strncmp(p, "run ", 4) == 0) {
+            long id;
+            const char *q = p + 4;
+            while (*q == ' ') q++;
+            char *endp;
+            id = strtol(q, &endp, 10);
+            if (endp == q || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd run <id>  (1..%d)\n", CMD_CFG_MAX);
+                return true;
+            }
+            esp_err_t err = cmd_config_execute((uint8_t)id);
+            ble_console_logf("cmd run %ld -> %s\n", id, esp_err_to_name(err));
+            return true;
+        }
+
+        /* cmd fuzzy <id> <fallback_mask> <cooldown_ms> <min_confidence>
+         *
+         * Set fuzzy-matching parameters for an existing config.
+         *   fallback_mask  — gesture bitmask for fallback triggers
+         *                    (e.g. 2 = LOOK_UP, 5 = NOD+TILT_LEFT)
+         *   cooldown_ms    — per-config cooldown in ms (0 = global default)
+         *   min_confidence — minimum confidence 0–100 (0 = any confidence)
+         *
+         * Examples:
+         *   cmd fuzzy 1 2 2000 0     — cfg_1 also fires on LOOK_UP (fallback),
+         *                                2s cooldown, any confidence
+         *   cmd fuzzy 2 0 800 30     — cfg_2 no fallback, 800ms cooldown,
+         *                                min 30% confidence
+         */
+        if (strncmp(p, "fuzzy ", 6) == 0) {
+            const char *q = p + 6;
+            while (*q == ' ') q++;
+
+            long id, fb, cd, mc;
+            const char *r = seq_parse_int(q, q + 64, &id);
+            if (!r || id < 1 || id > CMD_CFG_MAX) {
+                ble_console_logf("usage: cmd fuzzy <id> <fallback_mask> <cooldown_ms> <min_confidence>\n"
+                                 "  gesture bits: 1=NOD 2=LOOK_UP 4=TILT_LEFT 8=TILT_RIGHT\n"
+                                 "  e.g. 'cmd fuzzy 1 2 2000 0' = cfg_1 also fires on LOOK_UP\n");
+                return true;
+            }
+            r = seq_parse_int(r, r + 64, &fb);
+            if (!r) { ble_console_log("cmd fuzzy: need <fallback_mask>\n"); return true; }
+            r = seq_parse_int(r, r + 64, &cd);
+            if (!r) { ble_console_log("cmd fuzzy: need <cooldown_ms>\n"); return true; }
+            r = seq_parse_int(r, r + 64, &mc);
+            if (!r) { ble_console_log("cmd fuzzy: need <min_confidence> (0-100)\n"); return true; }
+
+            if (mc < 0 || mc > 100) {
+                ble_console_log("cmd fuzzy: min_confidence must be 0–100\n");
+                return true;
+            }
+
+            esp_err_t err = cmd_config_set_fuzzy((uint8_t)id, (uint16_t)fb,
+                                                  (uint16_t)cd, (uint8_t)mc);
+            ble_console_logf("cmd fuzzy id=%ld -> %s\n", id, esp_err_to_name(err));
+            return true;
+        }
+
+        /* unknown cmd subcommand */
+        ble_console_log("cmd: list | get <id> | set <id> <name> <type> <value> <seq>\n");
+        ble_console_log("     del <id> | run <id> | fuzzy <id> <fb_mask> <cd_ms> <conf>\n");
+        ble_console_log("  type: none / gesture / command\n");
+        return true;
+    }
+
+    return false;
+}
+
+/* Execute one console command. Runs in cal_worker_task, so blocking
+ * calibration is fine here. */
 static void handle_command(const char *cmd)
 {
-    if (!s_detector_ready) {
-        ble_console_log("sensor not initialised — commands unavailable\n");
+    if (handle_hid_command(cmd)) {
         return;
     }
 
-    if (strcmp(cmd, "c") == 0 || strcmp(cmd, "cal") == 0) {
-        ble_console_log("triggering guided calibration...\n");
-        run_guided_calibration();
-    } else if (strcmp(cmd, "ca") == 0) {
-        ble_console_log("nod calibration only (do slow nods)...\n");
-        esp_err_t err = gesture_detect_calibrate_axes(4000);
-        ble_console_logf("nod calibration result: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-    } else if (strcmp(cmd, "ct") == 0) {
-        ble_console_log("tilt calibration only (do slow LEFT and RIGHT tilts)...\n");
-        esp_err_t err = gesture_detect_calibrate_tilt(4000);
-        ble_console_logf("tilt calibration result: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+    if (!s_detector_ready) {
+        ble_console_log("sensor not initialised — gesture commands unavailable\n");
+        return;
+    }
+
+    if (strcmp(cmd, "cr") == 0) {
+        ble_console_log("calibrating REST (keep your head STILL, 2s)...\n");
+        esp_err_t err = gesture_detect_calibrate_rest(2000);
+        if (err == ESP_OK) {
+            const gesture_sig_axes_t *axes = gesture_detect_get_sig_axes();
+            if (axes) {
+                ble_console_log("REST calibration: OK — signatures loaded, detection ENABLED\n");
+            } else {
+                ble_console_log("REST calibration: OK — no saved signatures, run cn/ctl/ctr\n");
+            }
+        } else {
+            ble_console_logf("REST calibration: %s\n", esp_err_to_name(err));
+        }
+    } else if (strcmp(cmd, "cn") == 0) {
+        ble_console_log("calibrating NOD (do a slow chin-down nod)...\n");
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_NOD, 4000);
+        ble_console_logf("NOD calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+        if (err == ESP_OK) {
+            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
+            ble_console_logf("  nod_axis=[%.3f %.3f %.3f]\n",
+                             sig.sig_nod[0], sig.sig_nod[1], sig.sig_nod[2]);
+        }
+    } else if (strcmp(cmd, "ctl") == 0) {
+        ble_console_log("calibrating TILT_LEFT (do a slow left tilt)...\n");
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_LEFT, 4000);
+        ble_console_logf("TILT_LEFT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+        if (err == ESP_OK) {
+            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
+            ble_console_logf("  tiltL_axis=[%.3f %.3f %.3f]\n",
+                             sig.sig_tiltL[0], sig.sig_tiltL[1], sig.sig_tiltL[2]);
+        }
+    } else if (strcmp(cmd, "ctr") == 0) {
+        ble_console_log("calibrating TILT_RIGHT (do a slow right tilt)...\n");
+        esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_RIGHT, 4000);
+        ble_console_logf("TILT_RIGHT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
+        if (err == ESP_OK) {
+            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
+            ble_console_logf("  tiltR_axis=[%.3f %.3f %.3f]\n",
+                             sig.sig_tiltR[0], sig.sig_tiltR[1], sig.sig_tiltR[2]);
+        }
     } else if (strcmp(cmd, "p") == 0) {
         const gesture_params_t *p = gesture_detect_get_params();
         ble_console_logf("params: trigger=%.1f vel=%.1f zone=%.1f debounce=%u "
@@ -148,6 +746,27 @@ static void handle_command(const char *cmd)
                          nod_eff[0], nod_eff[1], nod_eff[2]);
         ble_console_logf("  tilt_eff =[%.2f %.2f %.2f]\n",
                          tilt_eff[0], tilt_eff[1], tilt_eff[2]);
+        /* Show calibration signatures (3D rotation axes). */
+        gesture_signatures_t sig;
+        gesture_signatures_load_from_nvs(&sig);
+        if (sig.calibrated & GESTURE_SIG_F_NOD)
+            ble_console_logf("  nod_axis   =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_nod[0], sig.sig_nod[1], sig.sig_nod[2], sig.spread_nod_deg);
+        if (sig.calibrated & GESTURE_SIG_F_LOOKUP)
+            ble_console_logf("  look_axis  =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_lookup[0], sig.sig_lookup[1], sig.sig_lookup[2], sig.spread_lookup_deg);
+        if (sig.calibrated & GESTURE_SIG_F_TILTL)
+            ble_console_logf("  tiltL_axis =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_tiltL[0], sig.sig_tiltL[1], sig.sig_tiltL[2], sig.spread_tiltL_deg);
+        if (sig.calibrated & GESTURE_SIG_F_TILTR)
+            ble_console_logf("  tiltR_axis =[%.3f %.3f %.3f] spread=%.1f°\n",
+                             sig.sig_tiltR[0], sig.sig_tiltR[1], sig.sig_tiltR[2], sig.spread_tiltR_deg);
+        ble_console_logf("  sig_mask=0x%02x\n", sig.calibrated);
+        if (sig.peak_vel_nod > 0.0f)
+            ble_console_logf("  peak_vel: nod=%.0f tiltL=%.0f tiltR=%.0f deg/s\n",
+                             sig.peak_vel_nod, sig.peak_vel_tiltL, sig.peak_vel_tiltR);
+        ble_console_logf("  avg_cp: nod=%.4f tiltL=%.4f tiltR=%.4f\n",
+                         sig.avg_cp_nod, sig.avg_cp_tiltL, sig.avg_cp_tiltR);
     } else if (strcmp(cmd, "q") == 0) {
         /* Phase 5: standalone q_drift diagnostic. Reports the angle between
          * q_drift and q_neutral — the larger this gets, the more佩戴微调
@@ -157,10 +776,7 @@ static void handle_command(const char *cmd)
         const gesture_params_t *p = gesture_detect_get_params();
         float qd[4];
         gesture_detect_get_q_drift(qd);
-        float qn_conj[4], qdiff[4];
-        /* Use the same quat helpers the detector does. They aren't exposed
-         * in the public header, so we re-derive the angle inline: the angle
-         * between two unit quaternions is 2·acos(|dot|) degrees. */
+        /* Angle between two unit quaternions is 2·acos(|dot|) degrees. */
         float d = qd[0]*p->neutral.q_neutral[0] +
                   qd[1]*p->neutral.q_neutral[1] +
                   qd[2]*p->neutral.q_neutral[2] +
@@ -193,9 +809,9 @@ static void handle_command(const char *cmd)
         ble_console_logf("sign_roll flipped -> positive_roll_is_right=%u\n",
                          (unsigned)(params.sign_roll == 1));
     } else if (strcmp(cmd, "cd") == 0) {
-        /* Capture diagnostics for the v3 prototype. Shows how stable the last
-         * calibration was, which is the main knob we don't yet verify at
-         * runtime. Re-run after `c` to compare runs. */
+        /* DEAD CODE: s_last_cap is never populated (calibrate_axes is dead).
+         * The type gesture_detect_capture_t and get_last_capture are also
+         * commented out in the header.  This command is a no-op placeholder.
         gesture_detect_capture_t cap;
         gesture_detect_get_last_capture(&cap);
         ble_console_logf("cap diag: valid=%u used=%u sum_mag=%.1f drift=%.1f\n",
@@ -205,8 +821,124 @@ static void handle_command(const char *cmd)
                          cap.nod_axis[0], cap.nod_axis[1], cap.nod_axis[2]);
         ble_console_logf("  tilt=[%.2f %.2f %.2f]\n",
                          cap.tilt_axis[0], cap.tilt_axis[1], cap.tilt_axis[2]);
+        */
+        ble_console_log("cd: diagnostics unavailable (dead code)\n");
+    } else if (strncmp(cmd, "dc", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
+        /* dc [ms] — start data-capture session. Logs every frame's raw
+         * metrics at 50 Hz for offline analysis.  Default 30 s. */
+        long ms = 30000;
+        parse_args(cmd, &ms, 1);
+        gesture_detect_start_capture((uint32_t)ms);
+        ble_console_logf("capture started for %ld ms\n", ms);
+    } else if (strncmp(cmd, "mouse", 5) == 0 && (cmd[5] == '\0' || cmd[5] == ' ')) {
+        const char *p = cmd + 5;
+        while (*p == ' ') p++;
+
+        if (strcmp(p, "on") == 0) {
+            mouse_mode_set_enabled(true);
+            /* Ensure touch sensor is initialized */
+            if (!s_touch_ready) {
+                esp_err_t terr = touch_sensor_init(TOUCH_MIN_CHAN_ID + 1);
+                if (terr == ESP_OK) {
+                    s_touch_ready = true;
+                } else {
+                    ble_console_logf("mouse: touch sensor init failed: %s\n",
+                                     esp_err_to_name(terr));
+                }
+            }
+            ble_console_log("mouse: toggle detection ENABLED\n");
+            ble_console_log("  trigger: left tilt + right tilt + touch held\n");
+        } else if (strcmp(p, "off") == 0) {
+            mouse_mode_set_enabled(false);
+            ble_console_log("mouse: toggle detection DISABLED\n");
+        } else if (strcmp(p, "status") == 0) {
+            bool active = mouse_mode_is_active();
+            bool enabled = mouse_mode_is_enabled();
+            const mouse_mode_params_t *mp = mouse_mode_get_params();
+            /* Machine-parseable line for the config tool */
+            ble_console_logf("mouse_mode: enabled=%d active=%d dz=%.1f ref=%.1f "
+                             "max=%.0f dwell=%u\n",
+                             (int)enabled, (int)active, mp->dead_zone_deg,
+                             mp->speed_ref_deg, mp->max_speed,
+                             (unsigned)mp->dwell_ms);
+            /* Human-readable */
+            ble_console_logf("mouse: enabled=%d active=%d dz=%.1f ref=%.1f "
+                             "max=%.0f dwell=%u ms\n",
+                             (int)enabled, (int)active, mp->dead_zone_deg,
+                             mp->speed_ref_deg, mp->max_speed,
+                             (unsigned)mp->dwell_ms);
+        } else if (strncmp(p, "dz", 2) == 0 && (p[2] == '\0' || p[2] == ' ')) {
+            const char *q = p + 2;
+            while (*q == ' ') q++;
+            char *endp;
+            float val = strtof(q, &endp);
+            if (endp == q || val < 0.1f || val > 10.0f) {
+                ble_console_log("mouse dz: 0.1..10.0 °/frame\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.dead_zone_deg = val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse dz -> %.1f°/frame\n", mp.dead_zone_deg);
+            }
+        } else if (strncmp(p, "ref", 3) == 0 && (p[3] == '\0' || p[3] == ' ')) {
+            const char *q = p + 3;
+            while (*q == ' ') q++;
+            char *endp;
+            float val = strtof(q, &endp);
+            if (endp == q || val < 0.5f || val > 20.0f) {
+                ble_console_log("mouse ref: 0.5..20.0 °/frame (velocity for max speed)\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.speed_ref_deg = val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse ref -> %.1f°/frame\n", mp.speed_ref_deg);
+            }
+        } else if (strncmp(p, "max", 3) == 0 && (p[3] == '\0' || p[3] == ' ')) {
+            long val;
+            const char *q = p + 3;
+            while (*q == ' ') q++;
+            char *endp;
+            val = strtol(q, &endp, 10);
+            if (endp == q || val < 5 || val > 127) {
+                ble_console_log("mouse max: 5..127 px/frame\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.max_speed = (float)val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse max -> %.0f\n", mp.max_speed);
+            }
+        } else if (strncmp(p, "dwell", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            long val;
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            char *endp;
+            val = strtol(q, &endp, 10);
+            if (endp == q || val < 0 || val > 10000) {
+                ble_console_log("mouse dwell: 0..10000 ms (0=immediate)\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.dwell_ms = (uint32_t)val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse dwell -> %u ms\n", (unsigned)mp.dwell_ms);
+            }
+        } else {
+            ble_console_log("mouse: on|off|status|dz|ref|max|dwell\n");
+            ble_console_log("  dz <°/f>     velocity dead zone (0.1..10, default 0.3)\n");
+            ble_console_log("  ref <°/f>    velocity for max speed (0.5..20, default 3.0)\n");
+            ble_console_log("  max <px>     max speed (5..127, default 60)\n");
+            ble_console_log("  dwell <ms>   0=immediate, >0=dwell (default 0)\n");
+        }
     } else if (cmd[0] != '\0') {
-        ble_console_logf("unknown command: '%s' (try c, ca, ct, p, q, sp, sr, cd)\n", cmd);
+        ble_console_logf("unknown command: '%s'\n", cmd);
+        ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc\n");
+        ble_console_log("  mouse    : mouse on|off|status|dz|sens|acc|max|dwell\n");
+        ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
+        ble_console_log("  configs : cmd list|get|set|del|run|fuzzy\n");
+#ifdef ENABLE_SERIAL_TRIGGER
+        ble_console_log("            command <id> (debug)\n");
+#endif
+        ble_console_log("  seq     : sleep <ms>; key <mod> <kc>; type <text>; click <btn>; move <dx> <dy>\n");
+        ble_console_log("  prefix 'hmbc' optional on BLE (e.g. 'hmbc p')\n");
     }
 }
 
@@ -227,15 +959,113 @@ static void on_console_cmd(const char *cmd, size_t len)
 {
     (void)len;
     char buf[CMD_MAX_LEN];
-    strncpy(buf, cmd, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    size_t n = 0;
+    /* Phase 7.1: BLE NUS accepts both the bare command ("cr", "p", ...) used
+     * by the Electron config tool and the `hmbc <cmd>` prefix used by the
+     * UART REPL. Strip the prefix if present so a single command set
+     * survives both transports — and so the user can keep using the same
+     * syntax when the UART console times out (e.g. idf.py monitor on a chip
+     * whose USB-Serial-JTAG is the monitor's default port while the app's
+     * REPL lives on UART0). */
+    while (n < sizeof(buf) - 1 && cmd[n] != '\0') {
+        buf[n] = cmd[n];
+        n++;
+    }
+    buf[n] = '\0';
+    char *p = buf;
+    if (strncmp(p, "hmbc", 4) == 0) {
+        p += 4;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+    }
+    if (*p == '\0') {
+        return;  /* nothing left after stripping — ignore */
+    }
     if (s_cmd_q != NULL) {
-        (void)xQueueSend(s_cmd_q, buf, 0);  /* drop if worker is busy */
+        (void)xQueueSend(s_cmd_q, p, 0);  /* drop if worker is busy */
     }
 }
 
+/* ── UART console: `hmbc <cmd...>` ───────────────────────────────────────────
+ *
+ * Phase 7 addition. Re-joins argv into the same one-line form the BLE RX path
+ * produces and posts it to the SAME queue, so handle_command() stays the only
+ * dispatcher. Posting (rather than calling directly) also keeps the ~11 s
+ * calibration off the REPL task, which would otherwise stop echoing.
+ *
+ * esp_console picks UART vs USB-Serial-JTAG from CONFIG_ESP_CONSOLE_*, so this
+ * works on both ESP32-S3 board wirings without a code change.
+ */
+static int cmd_hmbc(int argc, char **argv)
+{
+    char buf[CMD_MAX_LEN];
+    size_t pos = 0;
+
+    for (int i = 1; i < argc; i++) {
+        size_t need = strlen(argv[i]) + (pos ? 1 : 0);
+        if (pos + need >= sizeof(buf)) {
+            printf("command too long (max %d chars)\n", CMD_MAX_LEN - 1);
+            return 1;
+        }
+        if (pos) {
+            buf[pos++] = ' ';
+        }
+        strcpy(buf + pos, argv[i]);
+        pos += strlen(argv[i]);
+    }
+    buf[pos] = '\0';
+
+    if (pos == 0) {
+        printf("usage: hmbc <command>   e.g. 'hmbc hs', 'hmbc ac 205'\n");
+        return 1;
+    }
+    if (s_cmd_q == NULL || xQueueSend(s_cmd_q, buf, 0) != pdTRUE) {
+        printf("command queue full — worker busy\n");
+        return 1;
+    }
+    return 0;
+}
+
+static esp_err_t start_uart_console(void)
+{
+    esp_console_repl_t        *repl        = NULL;
+    esp_console_repl_config_t  repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    repl_config.prompt          = "hmbc>";
+    repl_config.max_cmdline_length = 128;
+
+    const esp_console_cmd_t cmd = {
+        .command = "hmbc",
+        .help    = "Send a command to the gesture/HID controller "
+                   "(hs | ac <code> | ak <mods> <key> | o [path] | seq <steps> | cr | cn | p | ...)",
+        .hint    = NULL,
+        .func    = &cmd_hmbc,
+    };
+
+#if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    esp_console_dev_usb_serial_jtag_config_t dev_config =
+        ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_console_new_repl_usb_serial_jtag(&dev_config, &repl_config, &repl),
+                        TAG, "usb-serial-jtag repl");
+#elif defined(CONFIG_ESP_CONSOLE_USB_CDC)
+    esp_console_dev_usb_cdc_config_t dev_config = ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_console_new_repl_usb_cdc(&dev_config, &repl_config, &repl),
+                        TAG, "usb-cdc repl");
+#else
+    esp_console_dev_uart_config_t dev_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_console_new_repl_uart(&dev_config, &repl_config, &repl),
+                        TAG, "uart repl");
+#endif
+
+    ESP_RETURN_ON_ERROR(esp_console_cmd_register(&cmd), TAG, "register hmbc");
+    ESP_RETURN_ON_ERROR(esp_console_register_help_command(), TAG, "register help");
+    return esp_console_start_repl(repl);
+}
+
 /* BOOT-button task — offline fallback trigger. Posts "c" to the command
- * queue when held for BOOT_HOLD_MS. */
+ * queue when held for BOOT_HOLD_MS. NOTE: "c" has no handler in
+ * handle_command() yet — will hit "unknown command". TODO: implement
+ * a full guided calibration sequence for the "c" command. */
 static void boot_button_task(void *arg)
 {
     (void)arg;
@@ -301,6 +1131,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* 1b. Command configs — loaded from NVS, used by `cmd`/`command` handler. */
+    cmd_config_init();
+
+    /* 1c. Mouse mode — head-tracking cursor control. */
+    mouse_mode_init();
+
     /* 2. MPU6050 + DMP, BEFORE the BLE stack comes up.
      *
      *    Order matters: bringing Bluedroid up first starves the I2C driver
@@ -331,13 +1167,38 @@ void app_main(void)
         s_detector_ready = true;
     }
 
-    /* 4. Command queue + BLE console. Comes up even in degraded mode, so the
-     *    failure is visible in the config tool instead of only on UART. */
+    /* 4. Command queue, then the BLE profiles, then the radio.
+     *
+     *    Order matters: ble_stack_start() registers each profile's app_id with
+     *    Bluedroid, so every ble_stack_register_profile() call (made from
+     *    hid_output_init / ble_console_init) has to happen first. This all
+     *    comes up even in degraded mode, so a sensor failure is visible in the
+     *    config tool instead of only on UART. */
     s_cmd_q = xQueueCreate(CMD_QUEUE_LEN, CMD_MAX_LEN);
     ESP_ERROR_CHECK(s_cmd_q == NULL ? ESP_ERR_NO_MEM : ESP_OK);
-    ESP_ERROR_CHECK(ble_console_init(on_console_cmd));
-    xTaskCreate(cal_worker_task,  "cal_worker",  4096, NULL, 3, NULL);
+
+    ESP_ERROR_CHECK(hid_output_init());                 /* app_id 0x1812 */
+    ESP_ERROR_CHECK(ble_console_init(on_console_cmd));  /* app_id 0x0055 */
+    ESP_ERROR_CHECK(ble_stack_start(BLE_DEVICE_NAME));
+
+    xTaskCreate(cal_worker_task,  "cal_worker",  8192, NULL, 3, NULL);
     xTaskCreate(boot_button_task, "boot_button", 4096, NULL, 3, NULL);
+
+    /* 5. UART REPL — HID smoke tests without a BLE central. Started last so
+     *    its prompt lands after the noisy boot logs. */
+    esp_err_t cerr = start_uart_console();
+    if (cerr != ESP_OK) {
+        ESP_LOGW(TAG, "UART console unavailable: %s", esp_err_to_name(cerr));
+    }
+
+    /* 5b. Touch sensor → mouse-left button. [DISABLED]
+     *     Temporarily disabled — uncomment to re-enable.
+     *     Default channel is T2 (GPIO2 on ESP32-S3). Placed after the BLE
+     *     stack starts so the press/release worker can find a valid conn_id,
+     *     and after the UART console so the REPL prompt is reachable during
+     *     the ~6 s initial scan.
+     *     Independent of the MPU — runs in both healthy and degraded mode. */
+    // ESP_ERROR_CHECK(touch_sensor_init(TOUCH_MIN_CHAN_ID + 1));
 
     if (!s_detector_ready) {
         ble_console_logf("SENSOR FAIL: mpu_dmp_init=%u (%s)\n",
@@ -353,12 +1214,17 @@ void app_main(void)
     ESP_LOGI(TAG, "wear device, connect over BLE (\"HMBC-Console\"), then send `c` "
                   "to calibrate — or hold BOOT 1 s");
 
-    /* 5. Event queue + detector + consumer. */
+    /* 6. Event queue + detector + consumer. */
     QueueHandle_t q = xQueueCreate(EVENT_QUEUE_LEN, sizeof(gesture_event_t));
     ESP_ERROR_CHECK(q == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(gesture_detect_start(q));
 
     xTaskCreate(gesture_bridge_task, "gesture_bridge", 3072, q, 4, NULL);
+
+    /* 7. Battery quantity detection — ADC-based battery level monitoring with
+     *     3-LED indicator. Initialized last so all other hardware is ready
+     *     before the indicator lights up. init内部会立即读取并点亮LED. */
+    ESP_ERROR_CHECK(bat_quantity_detection_init());
 
     ble_console_log("boot complete — gestures stream here; send `c` to calibrate\n");
 }

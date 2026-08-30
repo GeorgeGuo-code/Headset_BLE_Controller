@@ -13,7 +13,7 @@
 #define GESTURE_DEFAULT_TRIGGER_VEL_DEG_S    50.0f   /*!< window peak d(proj)/dt to fire (°/s) — relaxed from 80°/s; peak in a typical slow nod is ~40-60°/s */
 #define GESTURE_DEFAULT_NEUTRAL_ZONE_DEG      2.5f   /*!< per-frame dead zone for re-arming (°) — smaller so the system re-arms quickly between gestures */
 #define GESTURE_DEFAULT_DEBOUNCE_MS          500     /*!< min ms the user must hold inside zone before re-arming */
-#define GESTURE_DEFAULT_COOLDOWN_MS          500     /*!< min ms between any two fired events (kills double-fire / phantom second gesture from return-swing) */
+#define GESTURE_DEFAULT_COOLDOWN_MS         1300     /*!< min ms between any two fired events — 1300ms covers the ~1220ms return-swing window after a nod, preventing false LOOK_UP */
 #define GESTURE_DEFAULT_SIGN_PITCH             1     /*!< 1: positive pitch = nod (chin-down) */
 #define GESTURE_DEFAULT_SIGN_ROLL              0     /*!< 0: positive roll = left-tilt (flip with `sr` if needed) */
 
@@ -134,5 +134,46 @@ esp_err_t gesture_params_load_from_nvs(gesture_params_t *out);
 esp_err_t gesture_params_save_to_nvs(const gesture_params_t *params);
 
 void gesture_params_load_default(gesture_params_t *out);
+
+/* ===== Gesture signatures (cross-product axis) ============================
+ * Stored separately from gesture_params_t so the 64-byte NVS blob is
+ * not disturbed.  Each signature is a unit 3D vector — the rotation
+ * axis — computed by cross-producting consecutive orientation vectors
+ * during calibration.
+ *
+ * Bitmask `calibrated` tracks which gestures have been captured:
+ *   bit 0 = NOD,  bit 1 = LOOK_UP,  bit 2 = TILT_LEFT,  bit 3 = TILT_RIGHT
+ */
+
+#define GESTURE_NVS_KEY_SIG   "sig"    /*!< NVS key for gesture_signatures_t */
+
+#define GESTURE_SIG_F_NOD       (1 << 0)
+#define GESTURE_SIG_F_LOOKUP    (1 << 1)
+#define GESTURE_SIG_F_TILTL     (1 << 2)
+#define GESTURE_SIG_F_TILTR     (1 << 3)
+#define GESTURE_SIG_F_ALL       0x0F    /*!< all 4 gestures calibrated */
+#define GESTURE_SIG_F_MINIMUM   (GESTURE_SIG_F_NOD | GESTURE_SIG_F_TILTL | GESTURE_SIG_F_TILTR) /*!< nod + tiltL + tiltR = enough for 3-axis classification */
+
+typedef struct __attribute__((packed)) {
+    float   sig_nod[3];         /*!< unit rotation axis for NOD */
+    float   sig_lookup[3];      /*!< unit rotation axis for LOOK_UP */
+    float   sig_tiltL[3];       /*!< unit rotation axis for TILT_LEFT */
+    float   sig_tiltR[3];       /*!< unit rotation axis for TILT_RIGHT */
+    float   spread_nod_deg;     /*!< angular std-dev for NOD */
+    float   spread_lookup_deg;  /*!< angular std-dev for LOOK_UP */
+    float   spread_tiltL_deg;   /*!< angular std-dev for TILT_LEFT */
+    float   spread_tiltR_deg;   /*!< angular std-dev for TILT_RIGHT */
+    float   peak_vel_nod;       /*!< peak angular velocity during NOD calibration (deg/s) */
+    float   peak_vel_tiltL;     /*!< peak angular velocity during TILT_LEFT calibration (deg/s) */
+    float   peak_vel_tiltR;     /*!< peak angular velocity during TILT_RIGHT calibration (deg/s) */
+    float   avg_cp_nod;        /*!< avg cross-product magnitude during NOD calibration */
+    float   avg_cp_tiltL;      /*!< avg cross-product magnitude during TILT_LEFT calibration */
+    float   avg_cp_tiltR;      /*!< avg cross-product magnitude during TILT_RIGHT calibration */
+    uint8_t calibrated;         /*!< bitmask of GESTURE_SIG_F_* */
+    uint8_t reserved[3];
+} gesture_signatures_t;
+
+esp_err_t gesture_signatures_load_from_nvs(gesture_signatures_t *out);
+esp_err_t gesture_signatures_save_to_nvs(const gesture_signatures_t *sig);
 
 #endif /* GESTURE_PARAMS_H_ */

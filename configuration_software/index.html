@@ -24,19 +24,25 @@
     <main>
       <section class="panel span2">
         <h2>校准</h2>
-        <div class="row">
-          <button data-cmd="c" class="primary need-conn" disabled>完整校准（3 步）</button>
-          <button data-cmd="ca" class="need-conn" disabled>仅点头轴</button>
-          <button data-cmd="ct" class="need-conn" disabled>仅左右倾斜</button>
+        <div class="cal-section">
+          <h3>手势校准（4 步）<span class="hint" style="margin-left:8px;text-transform:none">—— 先静止采基准，再点头+左倾+右倾（仰头复用点头轴）</span></h3>
+          <div class="row sig-btns">
+            <button data-cmd="cr"  class="need-conn" disabled>① 保持静止</button>
+            <button data-cmd="cn"  class="need-conn" disabled>② 点头 NOD</button>
+            <button data-cmd="ctl" class="need-conn" disabled>③ 左倾 TILT_L</button>
+            <button data-cmd="ctr" class="need-conn" disabled>④ 右倾 TILT_R</button>
+          </div>
+          <ol id="sig-steps">
+            <li class="step" data-step="1"><span class="mark"></span>
+              <span class="text">保持静止（2 s）—— 头部自然朝前，不要动</span></li>
+            <li class="step" data-step="2"><span class="mark"></span>
+              <span class="text">做几次点头到最低点并保持（4 s）—— 仰头复用此轴</span></li>
+            <li class="step" data-step="3"><span class="mark"></span>
+              <span class="text">做几次左耳朝左肩倾斜并保持（4 s）</span></li>
+            <li class="step" data-step="4"><span class="mark"></span>
+              <span class="text">做几次右耳朝右肩倾斜并保持（4 s）</span></li>
+          </ol>
         </div>
-        <ol id="steps">
-          <li class="step" data-step="1"><span class="mark"></span>
-            <span class="text">保持头部静止（基准姿态，2 s）</span></li>
-          <li class="step" data-step="2"><span class="mark"></span>
-            <span class="text">缓慢点头几次（点头轴，4 s）</span></li>
-          <li class="step" data-step="3"><span class="mark"></span>
-            <span class="text">缓慢左右倾头（倾斜轴，4 s）</span></li>
-        </ol>
         <div id="cal-progress"><div id="cal-bar"></div></div>
         <p id="cal-result" class="result"></p>
       </section>
@@ -53,9 +59,38 @@
       </section>
 
       <section class="panel">
-        <h2>手势事件</h2>
+        <h2>手势事件 <button id="btn-gesture-clear" class="btn-inline">清空</button></h2>
         <div id="gesture-badges"></div>
         <p id="gesture-last" class="hint">等待手势…</p>
+      </section>
+
+      <section class="panel span2">
+        <h2>模拟鼠标</h2>
+        <div class="row">
+          <span id="mouse-status-text" class="hint">未读取</span>
+          <button id="btn-mouse-toggle" class="need-conn" disabled>开启</button>
+        </div>
+        <div id="mouse-params" class="mouse-params hidden">
+          <span class="hint">死区: <span id="mouse-dz">-</span>°</span>
+          <span class="hint">速度参考: <span id="mouse-ref">-</span>°</span>
+          <span class="hint">最大速度: <span id="mouse-max">-</span></span>
+          <span class="hint">停用: <span id="mouse-dwell">-</span></span>
+        </div>
+        <p class="hint" style="margin-top:8px">触发：左倾 + 右倾（立即）<br>停用：左倾 + 右倾 + 鼠标左键（立即）</p>
+      </section>
+
+      <section class="panel span2">
+        <h2>命令配置</h2>
+        <div class="row">
+          <button id="btn-cfg-new" class="primary">新建配置</button>
+          <button id="btn-cfg-sync" class="need-conn" disabled>同步到设备</button>
+          <button id="btn-cfg-read" class="need-conn" disabled>从设备读取</button>
+          <button id="btn-cfg-del-all" class="need-conn" disabled>删除设备全部配置</button>
+          <button id="btn-cfg-save">保存配置文件</button>
+          <button id="btn-cfg-load">加载配置文件</button>
+        </div>
+        <div id="cfg-list"></div>
+        <p id="cfg-empty" class="hint">暂无配置。点击"新建配置"创建，或"加载配置文件"导入。</p>
       </section>
 
       <section class="panel span2">
@@ -70,11 +105,44 @@
         </div>
         <pre id="log"></pre>
         <div class="row">
-          <input id="cmd-input" placeholder="自定义命令：c / ca / ct / p / sp / sr">
+          <input id="cmd-input" placeholder="自定义命令：cr / cn / cl / ctl / ctr / p / sp / sr">
           <button id="btn-send" class="need-conn" disabled>发送</button>
         </div>
       </section>
     </main>
+
+    <!-- Key capture dialog -->
+    <div id="key-dialog" class="dialog-overlay hidden">
+      <div class="dialog dialog-sm">
+        <h3>按键录入</h3>
+        <p id="key-status" class="dialog-center-text hint">
+          请按下键盘按键…
+        </p>
+        <div id="key-result" class="dialog-center hidden">
+          <div id="key-display" class="dialog-key-display"></div>
+          <div id="key-detail" class="hint dialog-key-detail"></div>
+        </div>
+        <div class="row mt12 dialog-center">
+          <button id="key-dialog-ok" class="primary" disabled>确认</button>
+          <button id="key-dialog-cancel">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sleep duration dialog -->
+    <div id="sleep-dialog" class="dialog-overlay hidden">
+      <div class="dialog dialog-sm">
+        <h3>等待时间</h3>
+        <div class="dialog-center mt12">
+          <input id="sleep-input" type="number" min="1" max="60000" value="350" placeholder="毫秒">
+          <span class="hint">毫秒</span>
+        </div>
+        <div class="row mt12 dialog-center">
+          <button id="sleep-dialog-ok" class="primary">确认</button>
+          <button id="sleep-dialog-cancel">取消</button>
+        </div>
+      </div>
+    </div>
 
     <script src="./renderer.js"></script>
   </body>
