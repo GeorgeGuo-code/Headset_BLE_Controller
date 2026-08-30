@@ -24,6 +24,7 @@
 #include "inv_mpu.h"
 #include "gesture_detect.h"
 #include "gesture_params.h"
+#include "mouse_mode.h"
 
 static const char *TAG = "gesture_detect";
 
@@ -334,6 +335,19 @@ esp_err_t gesture_detect_init(void)
                  loaded.neutral_zone_deg, (unsigned)loaded.debounce_ms);
     }
     esp_err_t ret = gesture_detect_apply_params(&loaded);
+
+    /* Load previously calibrated gesture signatures from NVS.
+     * These are the cross-product rotation axes captured during
+     * cn/ctl/ctr calibration.  They persist across reboots. */
+    esp_err_t sig_err = gesture_signatures_load_from_nvs(&s_gd.sig);
+    if (sig_err == ESP_OK && s_gd.sig.calibrated != 0) {
+        ESP_LOGI(TAG, "signatures loaded from NVS: calibrated=0x%02x "
+                 "nod=[%.3f %.3f %.3f] tiltL=[%.3f %.3f %.3f] tiltR=[%.3f %.3f %.3f]",
+                 (unsigned)s_gd.sig.calibrated,
+                 s_gd.sig.sig_nod[0], s_gd.sig.sig_nod[1], s_gd.sig.sig_nod[2],
+                 s_gd.sig.sig_tiltL[0], s_gd.sig.sig_tiltL[1], s_gd.sig.sig_tiltL[2],
+                 s_gd.sig.sig_tiltR[0], s_gd.sig.sig_tiltR[1], s_gd.sig.sig_tiltR[2]);
+    }
 
     /* If NVS had valid params with a real nod axis (not the placeholder
      * [0,1,0]), skip the calibration requirement — the device was
@@ -1071,6 +1085,49 @@ static void detector_task(void *arg)
             s_vel_still_since = 0;
         }
 
+        /* ── Mouse mode: send cursor reports or skip gesture emission ── */
+        if (mouse_mode_is_active()) {
+            /* Feed tilt events into the toggle state machine even while
+             * mouse_mode is active — this detects the deactivation
+             * left+right tilt sequence.
+             * NOTE: best_sig_idx==2 means the roll axis matched (both
+             * TILT_LEFT and TILT_RIGHT share this axis). Direction is
+             * determined by the sign of the projection onto the tilt
+             * signature, NOT by best_sig_idx. */
+            if (best_sig_idx == 2 && s_gd.smooth_axis_valid) {
+                float sig_tiltL_a[3];
+                memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
+                float roll_proj = v3_dot(s_gd.smooth_axis, sig_tiltL_a);
+                gesture_type_t toggle_gest = (roll_proj >= 0.0f)
+                    ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
+                mouse_mode_toggle_step((int)toggle_gest, now_ms);
+            }
+
+            /* Send cursor movement HID reports.
+             * mouse_mode_tick computes its own effective axes relative
+             * to q_mouse_rest (not q_drift), so the passed-in nod_eff/
+             * tilt_eff are unused. */
+            mouse_mode_tick(qcur, s_gd.q_drift, r_mag, vel);
+
+            /* Skip gesture event emission and accumulation — mouse mode
+             * suppresses all gesture-triggered cmd_configs. */
+            goto tick_end;
+        }
+
+        /* Non-mouse-mode: feed tilt events into toggle detection for
+         * activation. This runs AFTER emit_event so normal gesture
+         * processing is unaffected — toggle is purely additive.
+         * Same axis+direction logic as the mouse_mode branch above. */
+        if (best_sig_idx == 2 && s_gd.smooth_axis_valid) {
+            float sig_tiltL_a[3];
+            memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
+            float roll_proj = v3_dot(s_gd.smooth_axis, sig_tiltL_a);
+            gesture_type_t toggle_gest = (roll_proj >= 0.0f)
+                ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
+            mouse_mode_toggle_step((int)toggle_gest, now_ms);
+        }
+
+tick_end:
         vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
     }
     s_gd.task = NULL;
@@ -1101,6 +1158,20 @@ void gesture_detect_start_capture(uint32_t duration_ms)
     s_dc_until_ms = now + duration_ms;
     ESP_LOGI(TAG, "data capture ON for %u ms — perform gestures now",
              (unsigned)duration_ms);
+}
+
+const gesture_sig_axes_t *gesture_detect_get_sig_axes(void)
+{
+    if (!(s_gd.sig.calibrated & GESTURE_SIG_F_NOD) &&
+        !(s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) &&
+        !(s_gd.sig.calibrated & GESTURE_SIG_F_TILTR)) {
+        return NULL;  /* not calibrated */
+    }
+    static gesture_sig_axes_t s_axes;
+    memcpy(s_axes.sig_nod,   s_gd.sig.sig_nod,   sizeof(float)*3);
+    memcpy(s_axes.sig_tiltL, s_gd.sig.sig_tiltL, sizeof(float)*3);
+    memcpy(s_axes.sig_tiltR, s_gd.sig.sig_tiltR, sizeof(float)*3);
+    return &s_axes;
 }
 
 #if 0
@@ -1722,6 +1793,28 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
     ESP_LOGI(TAG, "rest captured (%u samples) q=[%.3f %.3f %.3f %.3f]",
              (unsigned)count, s_cal_rest_q[0], s_cal_rest_q[1],
              s_cal_rest_q[2], s_cal_rest_q[3]);
+
+    /* ── Quick-calibrate path ───────────────────────────────────────────
+     * Update q_neutral to the freshly captured rest pose.  If gesture
+     * signatures were already loaded from NVS (from a previous full
+     * calibration), we can enable detection immediately — the user only
+     * needed to re-do the rest pose because the headset was repositioned. */
+    neutral_pose_aligned_t np;
+    gesture_params_get_neutral_aligned(&np);
+    memcpy(np.q_neutral, s_cal_rest_q, sizeof(np.q_neutral));
+    gesture_params_set_neutral_aligned(&np);
+    /* set_neutral_aligned → apply_params already syncs q_drift
+     * and resets q_drift_valid so the detector re-syncs on next tick. */
+
+    if (s_gd.sig.calibrated & GESTURE_SIG_F_MINIMUM) {
+        s_gd.calibrated = true;
+        ESP_LOGI(TAG, "signatures already calibrated (0x%02x) — "
+                 "detection enabled with new rest pose",
+                 (unsigned)s_gd.sig.calibrated);
+    } else {
+        ESP_LOGW(TAG, "no gesture signatures yet — run cn/ctl/ctr to calibrate axes");
+    }
+
     return ESP_OK;
 }
 

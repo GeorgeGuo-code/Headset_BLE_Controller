@@ -150,6 +150,22 @@ void gesture_detect_get_last_capture(gesture_detect_capture_t *out);
  */
 void gesture_detect_start_capture(uint32_t duration_ms);
 
+/**
+ * @brief Read-only access to the 3 calibrated gesture signatures.
+ *        Pointer is to the detector's internal copy; do not modify.
+ *        Returns NULL if not yet calibrated.
+ *
+ *        Signatures are unit rotation axes in the q_drift frame:
+ *          sig[0] = nod, sig[1] = tiltL, sig[2] = tiltR
+ */
+typedef struct {
+    float sig_nod[3];
+    float sig_tiltL[3];
+    float sig_tiltR[3];
+} gesture_sig_axes_t;
+
+const gesture_sig_axes_t *gesture_detect_get_sig_axes(void);
+
 #ifdef __cplusplus
 }
 #endif
