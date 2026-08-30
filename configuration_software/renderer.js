@@ -390,12 +390,13 @@ function clearGestures () {
   $('gesture-last').textContent = '等待手势…'
 }
 
-/* "GESTURE NOD ts=12345 peak=23.4° vel=88°/s conf=0.62 [HIGH]"
- * Also matches old format without conf: "GESTURE NOD ts=12345 peak=23.4 vel=88.1" */
+/* "GESTURE NOD ts=12345 peak=23.4 vel=88 conf=[NOD=0.70 LK=0.82 TL=0.85 TR=0.70] best=2" */
 function trackGesture (line) {
-  const m = line.match(/^GESTURE\s+(\w+)\s+ts=(\d+)\s+peak=(-?[\d.]+)°?\s+vel=(-?[\d.]+)°?\/?s?\s*(?:conf=(-?[\d.]+)\s*\[(\w+)\])?/)
+  const m = line.match(/^GESTURE\s+(\w+)\s+ts=(\d+)\s+peak=(-?[\d.]+)\s+vel=(-?[\d.]+)\s+conf=\[NOD=(-?[\d.]+)\s+LK=(-?[\d.]+)\s+TL=(-?[\d.]+)\s+TR=(-?[\d.]+)\]\s*best=(-?\d+)/)
   if (!m) return
-  const [, name, ts, peak, vel, conf, confLabel] = m
+  const [, name, ts, peak, vel, cNod, cLk, cTl, cTr, bestIdx] = m
+  const confArr = [parseFloat(cNod), parseFloat(cLk), parseFloat(cTl), parseFloat(cTr)]
+
   if (name in gestureCounts) {
     gestureCounts[name]++
     renderGestures()
@@ -405,12 +406,16 @@ function trackGesture (line) {
       setTimeout(() => card.classList.remove('hit'), 400)
     }
   }
-  let info = `${GESTURE_LABEL[name] || name}  峰值 ${peak}°  角速度 ${vel}°/s`
-  if (conf !== undefined) {
-    info += `  置信度 ${(parseFloat(conf) * 100).toFixed(0)}% [${confLabel}]`
-  }
-  info += `  (ts=${ts})`
-  $('gesture-last').textContent = '最近：' + info
+
+  const confStr = confArr.map((v, i) => {
+    const label = ['NOD', 'LK', 'TL', 'TR'][i]
+    const pct = (v * 100).toFixed(0)
+    const isBest = i === parseInt(bestIdx)
+    return `${label}:${pct}%${isBest ? '*' : ''}`
+  }).join('  ')
+
+  $('gesture-last').textContent =
+    `最近：${GESTURE_LABEL[name] || name}  峰值 ${peak}°  角速度 ${vel}°/s  [${confStr}]  (ts=${ts})`
 }
 
 /* ── BLE ──────────────────────────────────────────────────────────────────── */
@@ -461,6 +466,7 @@ function onTxChunk (event) {
     trackParams(line)
     trackGesture(line)
     trackConfigResponse(line)
+    trackMouseMode(line)
   }
 }
 
@@ -1211,6 +1217,8 @@ async function readConfigsFromDevice () {
   cfgResponseBuf = []
   pushLog('正在从设备读取配置…', 'sys')
   await sendCmd('cmd list', true)
+  /* Also read mouse mode status */
+  await sendCmd('mouse status', true)
   setTimeout(() => processConfigList(), 500)
 }
 
@@ -1250,6 +1258,51 @@ async function deleteAllConfigsFromDevice () {
 
 function trackConfigResponse (line) {
   if (/^cfg:/.test(line)) cfgResponseBuf.push(line)
+}
+
+/* ── 鼠标模式状态追踪 ─────────────────────────────────────────────────── */
+
+let mouseModeEnabled = false
+let mouseModeActive = false
+
+function trackMouseMode (line) {
+  /* Machine-parseable: "mouse_mode: enabled=1 active=0 dz=0.3 ref=3.0 max=60 dwell=0" */
+  const m = line.match(/^mouse_mode:\s*enabled=(\d)\s+active=(\d)\s+dz=([\d.]+)\s+ref=([\d.]+)\s+max=([\d.]+)\s+dwell=(\d+)/)
+  if (m) {
+    mouseModeEnabled = m[1] === '1'
+    mouseModeActive = m[2] === '1'
+    $('mouse-dz').textContent = m[3]
+    $('mouse-ref').textContent = m[4]
+    $('mouse-max').textContent = m[5]
+    $('mouse-dwell').textContent = m[6] === '0' ? '立即' : m[6] + 'ms'
+    $('mouse-params').classList.remove('hidden')
+    renderMouseStatus()
+    return
+  }
+  /* Real-time toggle events from firmware BLE log */
+  if (/\[MOUSE\]\s*ACTIVATED/.test(line)) {
+    mouseModeActive = true
+    renderMouseStatus()
+  } else if (/\[MOUSE\]\s*DEACTIVATED/.test(line)) {
+    mouseModeActive = false
+    renderMouseStatus()
+  }
+}
+
+function renderMouseStatus () {
+  const el = $('mouse-status-text')
+  const btn = $('btn-mouse-toggle')
+  if (mouseModeEnabled) {
+    el.textContent = mouseModeActive ? '● 已激活' : '○ 已启用（等待手势触发）'
+    el.style.color = mouseModeActive ? '#4caf50' : ''
+    btn.textContent = '关闭'
+    btn.classList.add('active')
+  } else {
+    el.textContent = '○ 已禁用'
+    el.style.color = ''
+    btn.textContent = '开启'
+    btn.classList.remove('active')
+  }
 }
 
 function processConfigList () {
@@ -1348,6 +1401,13 @@ $('btn-cfg-del-all').addEventListener('click', deleteAllConfigsFromDevice)
 $('btn-cfg-save').addEventListener('click', saveConfigsToFile)
 $('btn-cfg-load').addEventListener('click', loadConfigsFromFile)
 $('btn-gesture-clear').addEventListener('click', clearGestures)
+$('btn-mouse-toggle').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = mouseModeEnabled ? 'mouse off' : 'mouse on'
+  await sendCmd(cmd)
+  mouseModeEnabled = !mouseModeEnabled
+  renderMouseStatus()
+})
 
 /* ── 初始化 ─────────────────────────────────────────────────────────────── */
 

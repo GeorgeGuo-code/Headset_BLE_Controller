@@ -65,6 +65,21 @@
       </section>
 
       <section class="panel span2">
+        <h2>模拟鼠标</h2>
+        <div class="row">
+          <span id="mouse-status-text" class="hint">未读取</span>
+          <button id="btn-mouse-toggle" class="need-conn" disabled>开启</button>
+        </div>
+        <div id="mouse-params" class="mouse-params hidden">
+          <span class="hint">死区: <span id="mouse-dz">-</span>°</span>
+          <span class="hint">速度参考: <span id="mouse-ref">-</span>°</span>
+          <span class="hint">最大速度: <span id="mouse-max">-</span></span>
+          <span class="hint">停用: <span id="mouse-dwell">-</span></span>
+        </div>
+        <p class="hint" style="margin-top:8px">触发：左倾 + 右倾（立即）<br>停用：左倾 + 右倾 + 鼠标左键（立即）</p>
+      </section>
+
+      <section class="panel span2">
         <h2>命令配置</h2>
         <div class="row">
           <button id="btn-cfg-new" class="primary">新建配置</button>

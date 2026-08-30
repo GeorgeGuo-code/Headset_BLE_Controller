@@ -292,3 +292,13 @@ button.small { padding: 4px 10px; font-size: 12px; }
 .dialog-key-display { font-size: 20px; font-family: Consolas, monospace; margin: 8px 0; }
 .dialog-key-detail { margin: 4px 0; }
 .dialog-status-warn { color: var(--warn); }
+
+/* mouse mode section */
+.mouse-params {
+  display: flex; flex-wrap: wrap; gap: 8px 16px;
+  margin-top: 8px; padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+#btn-mouse-toggle.active {
+  background: var(--err);
+}
