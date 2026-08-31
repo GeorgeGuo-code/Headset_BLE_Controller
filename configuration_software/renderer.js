@@ -768,6 +768,13 @@ function stepDesc (s) {
       return `按键 ${mods.length ? mods.join('+') + '+' : ''}${kname}`
     }
     case 'type': return `输入 "${s.text}"`
+    case 'click': {
+      const names = { 1: '左键', 2: '右键', 4: '中键' }
+      return `鼠标${names[s.button] || '?'}`
+    }
+    case 'scroll': {
+      return `滚轮 ${s.clicks > 0 ? '↑' : '↓'}`
+    }
     default: return '?'
   }
 }
@@ -777,6 +784,8 @@ function stepToSeqText (s) {
     case 'sleep': return `sleep ${s.ms}`
     case 'key': return `key ${s.mod} ${s.kc}`
     case 'type': return `type ${s.text}`
+    case 'click': return `click ${s.button}`
+    case 'scroll': return `scroll ${s.clicks}`
     default: return ''
   }
 }
@@ -948,7 +957,11 @@ function renderConfigs () {
     btnSleep.textContent = '⏱ 等待'
     btnSleep.addEventListener('click', () => addSleep(cmd))
 
-    addBar.append(btnRun, btnKey, btnSleep)
+    const btnUrl = document.createElement('button')
+    btnUrl.textContent = '🔗 打开网址'
+    btnUrl.addEventListener('click', () => addOpenUrl(cmd))
+
+    addBar.append(btnRun, btnKey, btnSleep, btnUrl)
     targetField.append(stepsList, addBar)
     row3.append(targetLabel, targetField)
 
@@ -1047,6 +1060,47 @@ $('sleep-input').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeSleepDialog()
 })
 
+/* ── 打开网址对话框 ─────────────────────────────────────────────────────── */
+
+let urlDialogTarget = null
+
+function addOpenUrl (cmd) {
+  urlDialogTarget = cmd
+  $('url-input').value = ''
+  $('url-dialog').classList.remove('hidden')
+  $('url-input').focus()
+}
+
+function closeUrlDialog () {
+  $('url-dialog').classList.add('hidden')
+  urlDialogTarget = null
+}
+
+function confirmUrlDialog () {
+  if (!urlDialogTarget) return
+  const url = $('url-input').value.trim()
+  if (!url) { pushLog('请输入网址', 'err'); return }
+  if (!urlDialogTarget.steps) urlDialogTarget.steps = []
+  urlDialogTarget.steps.push(
+    { kind: 'key', mod: 8, kc: 21 },       // Win+R
+    { kind: 'sleep', ms: 350 },
+    { kind: 'type', text: url },
+    { kind: 'key', mod: 0, kc: 40 }        // Enter
+  )
+  closeUrlDialog()
+  renderConfigs()
+}
+
+$('url-dialog-ok').addEventListener('click', confirmUrlDialog)
+$('url-dialog-cancel').addEventListener('click', closeUrlDialog)
+$('url-dialog').addEventListener('click', (e) => {
+  if (e.target === $('url-dialog')) closeUrlDialog()
+})
+$('url-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') confirmUrlDialog()
+  if (e.key === 'Escape') closeUrlDialog()
+})
+
 /* ── 新建配置 ────────────────────────────────────────────────────────────── */
 
 function addNewConfig () {
@@ -1078,33 +1132,41 @@ function addNewCommand () {
 let keyDialogTarget = null
 let keyDialogKeys = {}
 let keyDialogLastCombo = null  /* 松开按键后保存的最终组合 */
+let keyDialogMousePending = null  /* 鼠标事件临时存储（无需等待松开） */
 
 function openKeyDialog (cmd) {
   keyDialogTarget = cmd
   keyDialogKeys = {}
   keyDialogLastCombo = null
-  $('key-status').textContent = '请按下键盘按键…'
+  keyDialogMousePending = null
+  $('key-status').textContent = '请按下键盘按键或鼠标按钮…'
   $('key-status').classList.remove('dialog-status-warn')
   $('key-result').classList.add('hidden')
   $('key-dialog-ok').disabled = true
   $('key-dialog').classList.remove('hidden')
   document.addEventListener('keydown', onKeyDialogDown)
   document.addEventListener('keyup', onKeyDialogUp)
+  document.addEventListener('mousedown', onKeyDialogMouseDown)
+  document.addEventListener('wheel', onKeyDialogWheel, { passive: false })
 }
 
 function closeKeyDialog () {
   $('key-dialog').classList.add('hidden')
   document.removeEventListener('keydown', onKeyDialogDown)
   document.removeEventListener('keyup', onKeyDialogUp)
+  document.removeEventListener('mousedown', onKeyDialogMouseDown)
+  document.removeEventListener('wheel', onKeyDialogWheel)
   keyDialogTarget = null
   keyDialogKeys = {}
   keyDialogLastCombo = null
+  keyDialogMousePending = null
 }
 
 function onKeyDialogDown (e) {
   e.preventDefault()
   e.stopPropagation()
   keyDialogKeys[e.code] = e
+  keyDialogMousePending = null
   updateKeyDisplay()
 }
 
@@ -1112,10 +1174,48 @@ function onKeyDialogUp (e) {
   e.preventDefault()
   e.stopPropagation()
   delete keyDialogKeys[e.code]
-  if (Object.keys(keyDialogKeys).length === 0) {
+  if (Object.keys(keyDialogKeys).length === 0 && !keyDialogMousePending) {
     /* keyDialogLastCombo 已由 updateKeyDisplay 在按下时保存 */
     $('key-dialog-ok').disabled = false
   }
+}
+
+const MOUSE_BTN_LABEL = { 0: '鼠标左键', 2: '鼠标右键', 1: '鼠标中键' }
+const MOUSE_BTN_HID   = { 0: { kind: 'click', button: 1 },
+                           1: { kind: 'click', button: 4 },
+                           2: { kind: 'click', button: 2 } }
+
+function onKeyDialogMouseDown (e) {
+  e.preventDefault()
+  e.stopPropagation()
+  /* 忽略对话框内的确认/取消按钮 */
+  if (e.target.closest('#key-dialog-ok, #key-dialog-cancel, .dialog-close')) return
+  const info = MOUSE_BTN_HID[e.button]
+  if (!info) return
+  keyDialogKeys = {}
+  keyDialogMousePending = { ...info }
+  $('key-status').textContent = `松开鼠标后点击确认`
+  $('key-status').classList.add('dialog-status-warn')
+  $('key-result').classList.remove('hidden')
+  $('key-display').textContent = MOUSE_BTN_LABEL[e.button] || `鼠标按钮 ${e.button}`
+  $('key-detail').textContent = `HID: click ${info.button}`
+  keyDialogLastCombo = keyDialogMousePending
+  $('key-dialog-ok').disabled = false
+}
+
+function onKeyDialogWheel (e) {
+  e.preventDefault()
+  e.stopPropagation()
+  keyDialogKeys = {}
+  const clicks = e.deltaY < 0 ? 1 : -1   /* 上滚=1, 下滚=-1 */
+  keyDialogMousePending = { kind: 'scroll', clicks }
+  $('key-status').textContent = '滚轮已识别，点击确认'
+  $('key-status').classList.add('dialog-status-warn')
+  $('key-result').classList.remove('hidden')
+  $('key-display').textContent = clicks > 0 ? '滚轮 ↑' : '滚轮 ↓'
+  $('key-detail').textContent = `HID: scroll ${clicks}`
+  keyDialogLastCombo = keyDialogMousePending
+  $('key-dialog-ok').disabled = false
 }
 
 function updateKeyDisplay () {
@@ -1171,6 +1271,16 @@ function isModifier (code) {
 $('key-dialog-ok').addEventListener('click', () => {
   if (!keyDialogTarget || !keyDialogLastCombo) return
 
+  /* 鼠标点击 / 滚轮事件：keyDialogLastCombo 带有 kind 属性 */
+  if (keyDialogLastCombo.kind === 'click' || keyDialogLastCombo.kind === 'scroll') {
+    if (!keyDialogTarget.steps) keyDialogTarget.steps = []
+    keyDialogTarget.steps.push({ ...keyDialogLastCombo })
+    closeKeyDialog()
+    renderConfigs()
+    return
+  }
+
+  /* 键盘按键事件 */
   const snap = keyDialogLastCombo._modifierSnapshot || {}
   let mod = 0
   if (snap.ctrl)  mod |= 1
@@ -1349,6 +1459,7 @@ async function fetchConfigSeqs (idx) {
 }
 
 function parseSeqTextToSteps (text) {
+  const CLICK_NAME_MAP = { left: 1, right: 2, middle: 4, 1: 1, 2: 2, 4: 4 }
   const steps = []
   for (const seg of text.split(';')) {
     const t = seg.trim()
@@ -1361,6 +1472,11 @@ function parseSeqTextToSteps (text) {
       steps.push({ kind: 'key', mod: parseInt(parts[1], 10), kc: parseInt(parts[2], 10) })
     } else if (kw === 'type') {
       steps.push({ kind: 'type', text: parts.slice(1).join(' ') })
+    } else if (kw === 'click' && parts[1]) {
+      const btn = CLICK_NAME_MAP[parts[1]] || parseInt(parts[1], 10)
+      steps.push({ kind: 'click', button: btn })
+    } else if (kw === 'scroll' && parts[1]) {
+      steps.push({ kind: 'scroll', clicks: parseInt(parts[1], 10) })
     }
   }
   return steps
@@ -1401,6 +1517,25 @@ $('btn-cfg-del-all').addEventListener('click', deleteAllConfigsFromDevice)
 $('btn-cfg-save').addEventListener('click', saveConfigsToFile)
 $('btn-cfg-load').addEventListener('click', loadConfigsFromFile)
 $('btn-gesture-clear').addEventListener('click', clearGestures)
+
+/* ── 触发难度设置 ────────────────────────────────────────────────────────── */
+
+$('btn-set-conf').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const v = parseInt($('conf-input').value, 10)
+  if (isNaN(v) || v < 0 || v > 100) {
+    pushLog('触发难度必须在 0–100 之间', 'err')
+    return
+  }
+  /* 发送 cmd fuzzy 只给已存在的配置槽位。 */
+  $('conf-result').textContent = '发送中…'
+  for (const cmd of commands) {
+    await sendCmd(`cmd fuzzy ${cmd.id} 0 0 ${v}`, true)
+    await new Promise((r) => setTimeout(r, 50))
+  }
+  $('conf-result').textContent = `已设置 (conf=${v})`
+  pushLog(`触发难度已设置为 ${v}`, 'ok')
+})
 $('btn-mouse-toggle').addEventListener('click', async () => {
   if (!rxChar) { pushLog('未连接', 'err'); return }
   const cmd = mouseModeEnabled ? 'mouse off' : 'mouse on'

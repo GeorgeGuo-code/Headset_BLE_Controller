@@ -25,6 +25,15 @@
       <section class="panel span2">
         <h2>校准</h2>
         <div class="cal-section">
+          <h3>设置触发难度</h3>
+          <p class="hint" style="margin:0 0 8px 0">范围 0–100，数值越高，触发越严格。影响所有已配置手势的最低置信度阈值。</p>
+          <div class="row">
+            <input id="conf-input" type="number" min="0" max="100" value="50" style="width:80px">
+            <button id="btn-set-conf" class="need-conn" disabled>确定</button>
+            <span id="conf-result" class="hint"></span>
+          </div>
+        </div>
+        <div class="cal-section">
           <h3>手势校准（4 步）<span class="hint" style="margin-left:8px;text-transform:none">—— 先静止采基准，再点头+左倾+右倾（仰头复用点头轴）</span></h3>
           <div class="row sig-btns">
             <button data-cmd="cr"  class="need-conn" disabled>① 保持静止</button>
@@ -114,9 +123,9 @@
     <!-- Key capture dialog -->
     <div id="key-dialog" class="dialog-overlay hidden">
       <div class="dialog dialog-sm">
-        <h3>按键录入</h3>
+        <h3>按键 / 鼠标录入</h3>
         <p id="key-status" class="dialog-center-text hint">
-          请按下键盘按键…
+          请按下键盘按键或鼠标按钮…
         </p>
         <div id="key-result" class="dialog-center hidden">
           <div id="key-display" class="dialog-key-display"></div>
@@ -140,6 +149,21 @@
         <div class="row mt12 dialog-center">
           <button id="sleep-dialog-ok" class="primary">确认</button>
           <button id="sleep-dialog-cancel">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Open URL dialog -->
+    <div id="url-dialog" class="dialog-overlay hidden">
+      <div class="dialog dialog-sm">
+        <h3>打开网址</h3>
+        <p class="hint">将通过 Win+R 在默认浏览器中打开</p>
+        <div class="dialog-center mt12">
+          <input id="url-input" type="url" placeholder="https://www.example.com" style="width:360px">
+        </div>
+        <div class="row mt12 dialog-center">
+          <button id="url-dialog-ok" class="primary">确认</button>
+          <button id="url-dialog-cancel">取消</button>
         </div>
       </div>
     </div>

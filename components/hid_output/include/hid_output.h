@@ -130,6 +130,7 @@ typedef enum {
     HID_SEQ_TYPE,     /**< type an ASCII string char-by-char */
     HID_SEQ_CLICK,    /**< press + release a mouse button (left/right/middle) */
     HID_SEQ_MOVE,     /**< relative mouse motion (dx, dy) — single report, no release */
+    HID_SEQ_SCROLL,   /**< scroll wheel (clicks, positive = up) */
 } hid_seq_kind_t;
 
 /** A single step in a sequence. Union layout keeps the step ~40 B so 16
@@ -156,6 +157,9 @@ typedef struct {
         struct {
             int8_t   dx, dy;     /**< relative motion */
         } move;
+        struct {
+            int8_t   clicks;     /**< positive = up, negative = down */
+        } scroll;
     } u;
 } hid_seq_step_t;
 

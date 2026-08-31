@@ -329,6 +329,11 @@ static void hid_worker_task(void *arg)
                     /* Pure relative motion, no press/release. Buttons stay 0. */
                     esp_hidd_send_mouse_value(id, 0, s->u.move.dx, s->u.move.dy);
                     break;
+
+                case HID_SEQ_SCROLL:
+                    /* Scroll wheel: positive clicks = up, negative = down. */
+                    esp_hidd_send_mouse_value_full(id, 0, 0, 0, s->u.scroll.clicks);
+                    break;
                 }
             }
             if (completed) {

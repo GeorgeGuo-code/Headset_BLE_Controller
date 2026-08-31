@@ -349,16 +349,6 @@ esp_err_t gesture_detect_init(void)
                  s_gd.sig.sig_tiltR[0], s_gd.sig.sig_tiltR[1], s_gd.sig.sig_tiltR[2]);
     }
 
-    /* If NVS had valid params with a real nod axis (not the placeholder
-     * [0,1,0]), skip the calibration requirement — the device was
-     * previously calibrated and the stored axes are usable. */
-    if (err == ESP_OK &&
-        (loaded.neutral.nod_axis[0] != 0.0f ||
-         loaded.neutral.nod_axis[1] != 1.0f ||
-         loaded.neutral.nod_axis[2] != 0.0f)) {
-        s_gd.calibrated = true;
-        ESP_LOGI(TAG, "previous calibration restored — skipping guided calibration");
-    }
     return ret;
 }
 
@@ -443,6 +433,15 @@ void gesture_detect_reset_q_drift(void)
     s_gd.still_since_ms = 0;
     s_gd.smooth_vel_nod  = 0.0f;
     s_gd.smooth_vel_tilt = 0.0f;
+}
+
+void gesture_detect_reset_calibration(void)
+{
+    if (s_gd.calibrated) {
+        ESP_LOGI(TAG, "calibration reset on new BLE connection — re-calibration required");
+    }
+    s_gd.calibrated = false;
+    s_cal_rest_valid = false;
 }
 
 /* ===== Event helper ====================================================== */
@@ -592,6 +591,13 @@ static void detector_task(void *arg)
          * skips this tick and yields back. DMP FIFO packets produced
          * during the skip window sit in the FIFO buffer, never lost. */
         if (s_gd.calibrating) {
+            vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
+            continue;
+        }
+
+        /* Require a full calibration before gesture detection is active.
+         * Reset on each BLE connection via gesture_detect_reset_calibration(). */
+        if (!s_gd.calibrated) {
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
         }
@@ -1807,9 +1813,8 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
      * and resets q_drift_valid so the detector re-syncs on next tick. */
 
     if (s_gd.sig.calibrated & GESTURE_SIG_F_MINIMUM) {
-        s_gd.calibrated = true;
         ESP_LOGI(TAG, "signatures already calibrated (0x%02x) — "
-                 "detection enabled with new rest pose",
+                 "rest pose updated, but full re-calibration (cn/ctl/ctr) required",
                  (unsigned)s_gd.sig.calibrated);
     } else {
         ESP_LOGW(TAG, "no gesture signatures yet — run cn/ctl/ctr to calibrate axes");
@@ -2064,6 +2069,10 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
     if ((s_gd.sig.calibrated & GESTURE_SIG_F_MINIMUM) == GESTURE_SIG_F_MINIMUM) {
         ESP_LOGI(TAG, "3 axes calibrated - inferring signs...");
         gesture_detect_infer_signs();
+        if (!s_gd.calibrated && s_cal_rest_valid) {
+            s_gd.calibrated = true;
+            ESP_LOGI(TAG, "full calibration complete (cr + cn + ctl + ctr) — detection enabled");
+        }
     }
 
     return ESP_OK;

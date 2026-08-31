@@ -32,6 +32,12 @@ extern "C" {
 #define CMD_CFG_NAME_MAX  32
 #define CMD_CFG_MAX       16
 
+/** Global default minimum confidence (0–100). When a config's
+ *  `min_confidence` is 0 (unset), this value is used instead.
+ *  Set to 50 to filter out low-confidence misclassifications
+ *  that the detector fires when the rotation axis is ambiguous. */
+#define CMD_CFG_DEFAULT_MIN_CONFIDENCE  50
+
 /** Trigger types — what causes a config to fire. */
 typedef enum {
     TRIGGER_NONE    = 0,    /*!< manual only (via `command N` or `cmd run N`) */

@@ -132,7 +132,7 @@ esp_err_t mouse_mode_init(void)
 {
     memset(&s_mm, 0, sizeof(s_mm));
     s_mm.state = MM_IDLE;
-    s_mm.enabled = true;   /* toggle detection on by default */
+    s_mm.enabled = false;  /* off by default — enable via "mouse on" / config tool */
     s_mm.dwell_since_ms = 0;
     s_mm.dwell_active = false;
 
@@ -142,8 +142,8 @@ esp_err_t mouse_mode_init(void)
     s_mm.params.max_speed     = MOUSE_DEFAULT_MAX_SPEED;
     s_mm.params.dwell_ms      = MOUSE_DEFAULT_DWELL_MS;
 
-    ESP_LOGI(TAG, "mouse_mode init: dz=%.1f ref=%.1f max=%.0f dwell=%u",
-             s_mm.params.dead_zone_deg, s_mm.params.speed_ref_deg,
+    ESP_LOGI(TAG, "mouse_mode init: enabled=%d dz=%.1f ref=%.1f max=%.0f dwell=%u",
+             (int)s_mm.enabled, s_mm.params.dead_zone_deg, s_mm.params.speed_ref_deg,
              s_mm.params.max_speed, (unsigned)s_mm.params.dwell_ms);
     return ESP_OK;
 }
@@ -157,7 +157,7 @@ esp_err_t mouse_mode_activate(void)
     s_mm.dwell_since_ms = 0;
     s_mm.dwell_active = false;
     s_mm.state = MM_ACTIVE;
-    ESP_LOGI(TAG, "mouse_mode ACTIVATED — head controls cursor");
+    ESP_LOGI(TAG, "[MOUSE] ACTIVATED — enabled=%d", (int)s_mm.enabled);
     ble_console_logf("[MOUSE] ACTIVATED\n");
     return ESP_OK;
 }
@@ -416,12 +416,15 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
     if (!s_mm.enabled && !mouse_mode_is_active()) {
         return;
     }
+    ESP_LOGI(TAG, "[TOGGLE] gest=%d en=%d act=%d state=%d",
+             gesture, (int)s_mm.enabled, (int)mouse_mode_is_active(),
+             (int)s_tg.state);
     switch (s_tg.state) {
     case TG_IDLE:
         if (gesture == 3) {  /* GESTURE_TILT_LEFT */
             s_tg.state = TG_LEFT_SEEN;
             s_tg.left_seen_ms = now_ms;
-            ESP_LOGD(TAG, "toggle: LEFT_SEEN at %u", (unsigned)now_ms);
+            ESP_LOGI(TAG, "[TOGGLE] LEFT_SEEN at %u", (unsigned)now_ms);
         }
         break;
 
@@ -433,20 +436,19 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
                 if (mouse_mode_is_active()) {
                     /* Deactivation requires touch held (left click pressed) */
                     if (!touch_sensor_is_pressed()) {
-                        ESP_LOGD(TAG, "toggle: deactivation ignored — "
+                        ESP_LOGI(TAG, "[TOGGLE] deactivation ignored — "
                                       "touch not held");
                         s_tg.state = TG_IDLE;
                         break;
                     }
                     if (s_mm.params.dwell_ms == 0) {
                         /* Immediate deactivation */
-                        ESP_LOGI(TAG, "toggle: deactivation sequence detected");
+                        ESP_LOGI(TAG, "[TOGGLE] deactivation sequence detected");
                         ble_console_logf("[MOUSE] toggle: deactivation sequence\n");
                         mouse_mode_deactivate();
                     } else {
                         /* Dwell-based deactivation */
-                        ESP_LOGI(TAG, "toggle: deactivation sequence detected — "
-                                      "waiting for dwell");
+                        ESP_LOGI(TAG, "[TOGGLE] deactivation — waiting dwell");
                         ble_console_logf("[MOUSE] toggle: deactivation sequence — "
                                          "waiting for dwell (%u ms)\n",
                                          (unsigned)s_mm.params.dwell_ms);
@@ -455,12 +457,12 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
                     }
                 } else {
                     /* Activating */
-                    ESP_LOGI(TAG, "toggle: activation sequence detected");
+                    ESP_LOGI(TAG, "[TOGGLE] activation sequence detected");
                     ble_console_logf("[MOUSE] toggle: activation sequence detected\n");
                     mouse_mode_activate();
                 }
             } else {
-                ESP_LOGD(TAG, "toggle: window expired (left was %u ms ago)",
+                ESP_LOGI(TAG, "[TOGGLE] window expired (left was %u ms ago)",
                          (unsigned)(now_ms - s_tg.left_seen_ms));
             }
             s_tg.state = TG_IDLE;
@@ -474,7 +476,7 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
         /* Also check timeout */
         if (s_tg.state == TG_LEFT_SEEN &&
             (now_ms - s_tg.left_seen_ms) > TOGGLE_WINDOW_MS) {
-            ESP_LOGD(TAG, "toggle: LEFT_SEEN timeout");
+            ESP_LOGI(TAG, "[TOGGLE] LEFT_SEEN timeout");
             s_tg.state = TG_IDLE;
         }
         break;

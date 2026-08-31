@@ -73,6 +73,13 @@ void gesture_detect_get_effective_axes(float out_nod[3], float out_tilt[3]);
  *        at a very different angle). See gesture_detect.c. */
 void gesture_detect_reset_q_drift(void);
 
+/**
+ * @brief Reset calibration state so gestures are inactive until the user
+ *        re-runs the guided calibration flow.  Called on each new BLE
+ *        connection so the user must calibrate every session.
+ */
+void gesture_detect_reset_calibration(void);
+
 /* --- DEAD CODE: old 2-axis calibration (neutral + axes + tilt).
  * Replaced by the rest→gesture flow (cr/cn/ctl/ctr commands).
  * Never called from main.c.
