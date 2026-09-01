@@ -50,7 +50,9 @@ static const char *TAG = "gesture_detect";
 /* ===== Accumulation-based detection thresholds ============================ */
 #define TRIG_VEL_FRAC     0.35f  /*!< trigger velocity = peak × this fraction */
 #define END_VEL_FRAC      0.20f  /*!< end velocity = peak × this fraction */
-#define END_HOLD_FRAMES   3      /*!< frames below end_vel before firing (3×20ms = 60ms) */
+#define END_HOLD_FRAMES   2      /*!< frames below end_vel before firing (2×20ms = 40ms) */
+#define MIN_FIRE_R_MAG    3.0f   /*!< minimum smooth_r magnitude to fire (°) — prevents
+                                      firing at neutral position after return motion */
 #define FIRE_COOLDOWN_MS  1000   /*!< minimum ms between two fired events */
 #define MIN_ACC_MAG       3.0f   /*!< minimum |accumulated| to fire (filters tiny noisy motions) */
 #define MIN_PITCH_SUM     0.05f  /*!< minimum |pitch_sum| to decide NOD vs LOOK_UP direction */
@@ -165,6 +167,7 @@ static uint32_t s_consec_above_trigger = 0;
 static int      s_consistent_idx = -1;
 static int      s_consistent_count = 0;
 static float    s_pitch_dot_sum = 0.0f;
+static float    s_tilt_dot_sum  = 0.0f;   /*!< accumulated r·sig_tiltL for tilt direction */
 static bool     s_had_high_vel  = false;  /*!< set when vel > trigger_vel; gates fire */
 
 /* ===== small math ======================================================== */
@@ -672,6 +675,7 @@ static void detector_task(void *arg)
             s_consistent_idx = -1;
             s_consistent_count = 0;
             s_pitch_dot_sum = 0.0f;
+            s_tilt_dot_sum  = 0.0f;
             s_had_high_vel = false;
             GD_DBGI("DBG-CAL-FLUSH FIFO reset + %d samples discarded, "
                      "detector state cleared", discarded);
@@ -987,8 +991,18 @@ static void detector_task(void *arg)
                 s_consistent_count = 1;
             }
             if (vel > trigger_vel) {
-                s_had_high_vel = true;
                 s_consec_above_trigger++;
+                /* Only arm fire gate after TRIG_RESET_FRAMES consecutive
+                 * high-velocity frames.  A single-frame settling spike
+                 * (return-motion or micro-movement) will NOT re-arm,
+                 * preventing re-fire from the same static tilted position
+                 * after cooldown expires. */
+                {
+                    const int TRIG_ARM_FRAMES = 3;
+                    if (s_consec_above_trigger >= TRIG_ARM_FRAMES) {
+                        s_had_high_vel = true;
+                    }
+                }
                 /* Cross-axis consistency: only accumulate if the raw cp
                  * direction is consistent with the detected gesture's
                  * signature.  Removed cons_ok gate — confidence-based
@@ -1016,7 +1030,16 @@ static void detector_task(void *arg)
                 /* Accumulate pitch direction OUTSIDE axis_ok — the cross-product
                  * direction is perpendicular to the rotation vector, so axis_ok
                  * can block accumulation during genuine nod/look-up motions. */
-                s_pitch_dot_sum += r_raw_dot_nod;
+                s_pitch_dot_sum += apply_sign_pitch(r_raw_dot_nod,
+                                                    s_gd.params.sign_pitch);
+                /* Accumulate tilt direction similarly — r·sig_tiltL accumulates
+                 * net roll motion.  apply_sign_roll normalises the sign so
+                 * that a positive sum always means the user's chosen
+                 * gesture direction. */
+                if (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) {
+                    s_tilt_dot_sum += apply_sign_roll(v3_dot(r, sig_tiltL_a),
+                                                      s_gd.params.sign_roll);
+                }
             } else {
                 s_consec_above_trigger = 0;
                 if (vel < end_vel && best_sig_idx >= 0 &&
@@ -1029,7 +1052,16 @@ static void detector_task(void *arg)
                      * is perpendicular to the rotation-vector signatures. */
                     s_end_hold++;
                     if (s_end_hold >= END_HOLD_FRAMES) {
-                        if (now_ms >= s_gd.cooldown_until_ms) {
+                        /* Guard: don't fire if the raw rotation vector r_mag
+                         * (in degrees) is too small — the head has returned
+                         * to neutral and we'd be firing on noise.
+                         * NOTE: smooth_r is normalized to unit length, so
+                         * we must use r_mag (raw), NOT v3_norm(smooth_r). */
+                        if (r_mag < MIN_FIRE_R_MAG) {
+                            /* Head at neutral — don't fire, but don't reset
+                             * all state either; the gesture motion was real. */
+                            s_end_hold = 0;
+                        } else if (now_ms >= s_gd.cooldown_until_ms) {
                             static const gesture_type_t sig_gt[] = {
                                 GESTURE_NOD, GESTURE_LOOK_UP,
                                 GESTURE_TILT_LEFT, GESTURE_TILT_RIGHT
@@ -1038,21 +1070,27 @@ static void detector_task(void *arg)
                             gesture_type_t gt = sig_gt[best_sig_idx];
                             if (best_sig_idx == 0) {
                                 /* Pitch axis: use pitch_dot_sum for direction.
-                                 * nod_axis[0] > 0, so:
-                                 *   NOD (chin-down) → r[0]<0 → pitch_sum<0
-                                 *   LOOK_UP (chin-up) → r[0]>0 → pitch_sum>0 */
+                                 * apply_sign_pitch() has already normalised the
+                                 * sign so that positive = NOD (chin-down) for
+                                 * any sensor orientation. */
                                 if (fabsf(s_pitch_dot_sum) >= MIN_PITCH_SUM) {
-                                    gt = (s_pitch_dot_sum < 0.0f)
+                                    gt = (s_pitch_dot_sum > 0.0f)
                                         ? GESTURE_NOD : GESTURE_LOOK_UP;
                                 }
                                 /* else: pitch_sum too weak, keep default (NOD) */
                             }
                             if (best_sig_idx == 2) {
-                                /* Roll axis: use smooth_r projection for direction. */
-                                float tilt_dot = v3_dot(s_gd.smooth_r, sig_tiltL_a);
-                                if (tilt_dot < 0.0f) {
-                                    gt = GESTURE_TILT_RIGHT;
+                                /* Roll axis: use accumulated tilt_dot_sum for
+                                 * direction.  apply_sign_roll() normalises the
+                                 * sign so that positive = LEFT for any sensor
+                                 * orientation.  At fire time smooth_r may have
+                                 * drifted back to neutral, making its projection
+                                 * unreliable — the accumulated sum is more robust. */
+                                if (fabsf(s_tilt_dot_sum) >= MIN_PITCH_SUM) {
+                                    gt = (s_tilt_dot_sum < 0.0f)
+                                        ? GESTURE_TILT_RIGHT : GESTURE_TILT_LEFT;
                                 }
+                                /* else: tilt_sum too weak, keep default (TILT_LEFT) */
                             }
 
                             /* Split confidence by direction:
@@ -1067,8 +1105,7 @@ static void detector_task(void *arg)
                                     split_conf[0] = 0.0f;  /* kill NOD */
                                 }
                             } else if (best_sig_idx == 2) {
-                                float tilt_dot = v3_dot(s_gd.smooth_r, sig_tiltL_a);
-                                if (tilt_dot >= 0.0f) {
+                                if (gt == GESTURE_TILT_LEFT) {
                                     split_conf[3] = 0.0f;  /* kill TILT_RIGHT */
                                 } else {
                                     split_conf[2] = 0.0f;  /* kill TILT_LEFT */
@@ -1078,26 +1115,41 @@ static void detector_task(void *arg)
                             emit_event(gt, r_mag, vel,
                                        split_conf, best_sig_idx);
                             ESP_LOGI(TAG, "DETECT %s idx=%d r=%.1f vel=%.0f "
-                                     "pitch_sum=%.2f "
+                                     "pitch_sum=%.2f tilt_sum=%.2f "
                                      "NOD=%.2f LK=%.2f TL=%.2f TR=%.2f",
                                      (gt == GESTURE_NOD) ? "NOD" :
                                      (gt == GESTURE_LOOK_UP) ? "LOOK_UP" :
                                      (gt == GESTURE_TILT_LEFT) ? "TILT_LEFT" :
                                      (gt == GESTURE_TILT_RIGHT) ? "TILT_RIGHT" : "?",
                                      best_sig_idx, r_mag, vel,
-                                     s_pitch_dot_sum,
+                                     s_pitch_dot_sum, s_tilt_dot_sum,
                                      s_gd.last_conf[0], s_gd.last_conf[1],
                                      s_gd.last_conf[2], s_gd.last_conf[3]);
+
+                            /* ---- Post-fire state reset ----
+                             * Reset smooth_r_valid: force smooth_r to
+                             * re-initialize from the current r vector.  This is
+                             * now safe because s_had_high_vel requires
+                             * TRIG_ARM_FRAMES (3) consecutive high-velocity
+                             * frames to re-arm — a single settling spike during
+                             * return motion cannot re-arm, so the re-init'd
+                             * smooth_r can't cause an immediate second fire.
+                             * Keeping smooth_r valid would let it track the
+                             * tilted position indefinitely, causing re-fire
+                             * after cooldown from the same static posture. */
+                            memset(s_gd.accum, 0, sizeof(s_gd.accum));
+                            s_gd.accum_armed = true;
+                            s_end_hold = 0; s_peak_sign_dot = 0.0f;
+                            s_pitch_dot_sum = 0.0f;
+                            s_tilt_dot_sum  = 0.0f;
+                            s_consistent_count = 0; s_consistent_idx = -1;
+                            s_consec_above_trigger = 0;
+                            s_had_high_vel = false;
+                            s_gd.smooth_r_valid = false;
+                        } else {
+                            /* Cooldown active — just reset hold counter. */
+                            s_end_hold = 0;
                         }
-                        /* Reset state regardless. */
-                        memset(s_gd.accum, 0, sizeof(s_gd.accum));
-                        s_gd.accum_armed = true;
-                        s_end_hold = 0; s_peak_sign_dot = 0.0f;
-                        s_pitch_dot_sum = 0.0f;
-                        s_consistent_count = 0; s_consistent_idx = -1;
-                        s_consec_above_trigger = 0;
-                        s_gd.smooth_r_valid = false;
-                        s_had_high_vel = false;
                     }
                 }
             }
@@ -1108,6 +1160,7 @@ static void detector_task(void *arg)
             s_gd.accum_armed = true;
             s_end_hold = 0; s_peak_sign_dot = 0.0f;
             s_pitch_dot_sum = 0.0f;
+            s_tilt_dot_sum  = 0.0f;
             s_consistent_count = 0; s_consistent_idx = -1;
             s_consec_above_trigger = 0;
             s_had_high_vel = false;
