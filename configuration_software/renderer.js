@@ -1374,17 +1374,19 @@ function trackConfigResponse (line) {
 
 let mouseModeEnabled = false
 let mouseModeActive = false
+let mouseFourDir = false
 
 function trackMouseMode (line) {
-  /* Machine-parseable: "mouse_mode: enabled=1 active=0 dz=0.3 ref=3.0 max=60 dwell=0" */
-  const m = line.match(/^mouse_mode:\s*enabled=(\d)\s+active=(\d)\s+dz=([\d.]+)\s+ref=([\d.]+)\s+max=([\d.]+)\s+dwell=(\d+)/)
+  /* Machine-parseable: "mouse_mode: enabled=1 active=0 fourdir=0 dz=2.0 ref=8.0 max=60 dwell=0" */
+  const m = line.match(/^mouse_mode:\s*enabled=(\d)\s+active=(\d)\s+fourdir=(\d)\s+dz=([\d.]+)\s+ref=([\d.]+)\s+max=([\d.]+)\s+dwell=(\d+)/)
   if (m) {
     mouseModeEnabled = m[1] === '1'
     mouseModeActive = m[2] === '1'
-    $('mouse-dz').textContent = m[3]
-    $('mouse-ref').textContent = m[4]
-    $('mouse-max').textContent = m[5]
-    $('mouse-dwell').textContent = m[6] === '0' ? '立即' : m[6] + 'ms'
+    mouseFourDir = m[3] === '1'
+    $('mouse-dz').textContent = m[4]
+    $('mouse-ref').textContent = m[5]
+    $('mouse-max').textContent = m[6]
+    $('mouse-dwell').textContent = m[7] === '0' ? '立即' : m[7] + 'ms'
     $('mouse-params').classList.remove('hidden')
     renderMouseStatus()
     return
@@ -1412,6 +1414,15 @@ function renderMouseStatus () {
     el.style.color = ''
     btn.textContent = '开启'
     btn.classList.remove('active')
+  }
+  const btn4 = $('btn-mouse-fourdir')
+  if (btn4) {
+    btn4.textContent = mouseFourDir ? '四向移动: 开' : '四向移动: 关'
+    if (mouseFourDir) {
+      btn4.classList.add('active')
+    } else {
+      btn4.classList.remove('active')
+    }
   }
 }
 
@@ -1542,6 +1553,14 @@ $('btn-mouse-toggle').addEventListener('click', async () => {
   await sendCmd(cmd)
   mouseModeEnabled = !mouseModeEnabled
   renderMouseStatus()
+})
+$('btn-mouse-fourdir').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = mouseFourDir ? 'mouse fourdir off' : 'mouse fourdir on'
+  await sendCmd(cmd)
+  mouseFourDir = !mouseFourDir
+  renderMouseStatus()
+  pushLog(mouseFourDir ? '四向移动模式已开启' : '四向移动模式已关闭', 'ok')
 })
 
 /* ── 初始化 ─────────────────────────────────────────────────────────────── */

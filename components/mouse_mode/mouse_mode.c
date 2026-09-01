@@ -3,7 +3,13 @@
  *
  * Active when the user triggers mouse mode via the tilt_left + tilt_right
  * toggle gesture. Head pitch/roll directly controls the cursor via a
- * dead-zone + acceleration response curve.
+ * dead-zone + linear speed mapping.
+ *
+ * Cursor displacement is derived from the raw rotation vector r (q_drift
+ * frame, in degrees) projected onto the calibrated signature axes.  Both
+ * r and the axes share the same frame, so no rotation is needed.  r carries
+ * actual angle information and returns to ~0 at rest, which is essential
+ * for position-based cursor control.
  *
  * The module does NOT own a FreeRTOS task or read the DMP. It is called
  * from gesture_detect's detector_task at 50 Hz via mouse_mode_tick().
@@ -33,12 +39,19 @@ typedef struct {
 } msig_axes_t;
 extern const msig_axes_t *gesture_detect_get_sig_axes(void);
 
+/* Forward declaration: sign_pitch / sign_roll are read from gesture params
+ * to normalise the direction convention for mouse cursor axes. */
+extern uint8_t gesture_detect_get_sign_pitch(void);
+extern uint8_t gesture_detect_get_sign_roll(void);
+
 /* ===== Default parameters ================================================ */
 
-#define MOUSE_DEFAULT_DEAD_ZONE_DEG   0.3f   /*!< velocity dead zone °/frame — filters jitter */
-#define MOUSE_DEFAULT_SPEED_REF_DEG   3.0f   /*!< °/frame that maps to max_speed */
+#define MOUSE_DEFAULT_DEAD_ZONE_DEG   2.0f   /*!< position dead zone ° — filters natural sway */
+#define MOUSE_DEFAULT_SPEED_REF_DEG   8.0f   /*!< ° from rest that maps to max_speed */
 #define MOUSE_DEFAULT_MAX_SPEED      60.0f
 #define MOUSE_DEFAULT_DWELL_MS     0       /*!< 0 = deactivate immediately */
+
+#define FOUR_DIR_SPEED             10.0f   /*!< four-dir: constant px/frame */
 
 /* ===== Module state ====================================================== */
 
@@ -50,8 +63,7 @@ typedef enum {
 typedef struct {
     mm_state_t          state;
     bool                enabled;        /*!< toggle detection enabled */
-    float               q_prev[4];      /*!< previous frame's quaternion (for incremental delta) */
-    bool                q_prev_valid;
+    bool                four_dir;       /*!< four-direction (d-pad) mode */
     mouse_mode_params_t params;
 
     /* Dwell detection for deactivation */
@@ -61,69 +73,11 @@ typedef struct {
 
 static mm_t s_mm;
 
-/* ===== Quaternion helpers (local copies — same as gesture_detect) ======== */
-
 static inline float absf(float v) { return v < 0.0f ? -v : v; }
-
-static void quat_conj(const float a[4], float out[4])
-{
-    out[0] = a[0]; out[1] = -a[1]; out[2] = -a[2]; out[3] = -a[3];
-}
-
-static void quat_mul(const float a[4], const float b[4], float out[4])
-{
-    out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
-    out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
-    out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
-    out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
-}
-
-static void quat_normalize(float a[4])
-{
-    float n = sqrtf(a[0]*a[0] + a[1]*a[1] + a[2]*a[2] + a[3]*a[3]);
-    if (n < 1e-9f) { a[0] = 1.0f; a[1] = a[2] = a[3] = 0.0f; return; }
-    float inv = 1.0f / n;
-    a[0] *= inv; a[1] *= inv; a[2] *= inv; a[3] *= inv;
-}
 
 static inline float v3_dot(const float a[3], const float b[3])
 {
     return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
-}
-
-/* Rotate vector v by quaternion q: out = q ⊗ (0,v) ⊗ conj(q). */
-static void quat_rotate_vec(const float q[4], const float v[3], float out[3])
-{
-    float qv[4]  = { 0.0f, v[0], v[1], v[2] };
-    float qc[4]; quat_conj(q, qc);
-    float t[4];  quat_mul(q, qv, t);
-    float r[4];  quat_mul(t, qc, r);
-    out[0] = r[1]; out[1] = r[2]; out[2] = r[3];
-}
-
-/**
- * @brief Rotate 3 signature axes from q_drift frame to a target frame.
- *
- *        Signatures are captured during calibration in the q_drift frame.
- *        For mouse mode, r_delta is computed relative to q_prev (≈ qcur),
- *        so we rotate the axes into the same frame.
- *
- *        Rotation: q_td = conj(q_target) ⊗ q_drift
- *        For each axis: axis_target = rotate(axis_drift, q_td)
- */
-static void rotate_sigs_to_mouse_frame(const float q_mouse_rest[4],
-                                       const float q_drift[4],
-                                       const msig_axes_t *sigs,
-                                       float nod_out[3],
-                                       float tiltL_out[3],
-                                       float tiltR_out[3])
-{
-    float qr_conj[4]; quat_conj(q_mouse_rest, qr_conj);
-    float q_md[4];    quat_mul(qr_conj, q_drift, q_md);
-    quat_normalize(q_md);
-    quat_rotate_vec(q_md, sigs->sig_nod,   nod_out);
-    quat_rotate_vec(q_md, sigs->sig_tiltL, tiltL_out);
-    quat_rotate_vec(q_md, sigs->sig_tiltR, tiltR_out);
 }
 
 /* ===== Public API ======================================================== */
@@ -153,7 +107,6 @@ esp_err_t mouse_mode_activate(void)
     if (s_mm.state == MM_ACTIVE) {
         return ESP_ERR_INVALID_STATE;
     }
-    s_mm.q_prev_valid = false;
     s_mm.dwell_since_ms = 0;
     s_mm.dwell_active = false;
     s_mm.state = MM_ACTIVE;
@@ -168,7 +121,6 @@ esp_err_t mouse_mode_deactivate(void)
         return ESP_ERR_INVALID_STATE;
     }
     s_mm.state = MM_IDLE;
-    s_mm.q_prev_valid = false;
     s_mm.dwell_since_ms = 0;
     s_mm.dwell_active = false;
     ESP_LOGI(TAG, "mouse_mode DEACTIVATED");
@@ -192,6 +144,17 @@ void mouse_mode_set_enabled(bool enable)
     ESP_LOGI(TAG, "toggle detection %s", enable ? "ENABLED" : "DISABLED");
 }
 
+void mouse_mode_set_four_dir(bool enable)
+{
+    s_mm.four_dir = enable;
+    ESP_LOGI(TAG, "four-dir mode %s", enable ? "ENABLED" : "DISABLED");
+}
+
+bool mouse_mode_is_four_dir(void)
+{
+    return s_mm.four_dir;
+}
+
 const mouse_mode_params_t *mouse_mode_get_params(void)
 {
     return &s_mm.params;
@@ -208,118 +171,84 @@ void mouse_mode_set_params(const mouse_mode_params_t *params)
 
 /* ===== Tick: called from detector_task at 50 Hz ========================= */
 
-/**
- * @brief Check if the head is still (for dwell detection).
- *
- *        "Still" means the rotation magnitude from the rest reference
- *        is small AND the angular velocity is low.
- */
-static bool is_still(const float r[3], float r_mag, float vel)
-{
-    /* Use a relaxed still threshold — slightly larger than the dead zone
-     * so the cursor stops moving but the head doesn't have to be frozen. */
-    const float STILL_ANGLE = 5.0f;   /* degrees from rest */
-    const float STILL_VEL   = 20.0f;  /* °/s */
-    return (r_mag < STILL_ANGLE) && (vel < STILL_VEL);
-}
-
-void mouse_mode_tick(const float qcur[4], const float q_drift[4],
+void mouse_mode_tick(const float r[3], bool r_valid,
                      float r_mag, float vel)
 {
     if (s_mm.state != MM_ACTIVE) {
         return;
     }
 
-    /* First frame: capture baseline. Don't send HID — just establish
-     * the starting point for incremental rotation tracking. */
-    if (!s_mm.q_prev_valid) {
-        memcpy(s_mm.q_prev, qcur, sizeof(s_mm.q_prev));
-        s_mm.q_prev_valid = true;
-        ESP_LOGI(TAG, "baseline captured: q=[%.3f %.3f %.3f %.3f]",
-                 qcur[0], qcur[1], qcur[2], qcur[3]);
+    if (!r_valid) {
         return;
     }
 
-    /* Compute incremental rotation: delta = conj(q_prev) × qcur.
-     * This gives the rotation that happened in the last 20 ms.
-     * Converted to a rotation vector, its magnitude is the angular
-     * velocity (degrees/frame) and its direction is the rotation axis. */
-    float qc[4];
-    quat_conj(s_mm.q_prev, qc);
-    float qdelta[4];
-    quat_mul(qc, qcur, qdelta);
-    quat_normalize(qdelta);
-
-    /* Save current quaternion for next frame */
-    memcpy(s_mm.q_prev, qcur, sizeof(s_mm.q_prev));
-
-    /* Convert qdelta to rotation vector (degrees) */
-    float w = qdelta[0];
-    if (w < 0.0f) { w = -w; }
-    if (w > 1.0f) w = 1.0f;
-    float s = sqrtf(1.0f - w*w);
-    float angle_deg = 2.0f * acosf(w) * 57.29578f;
-    float r_delta[3];
-    if (s < 1e-6f) {
-        r_delta[0] = qdelta[1] * 2.0f * 57.29578f;
-        r_delta[1] = qdelta[2] * 2.0f * 57.29578f;
-        r_delta[2] = qdelta[3] * 2.0f * 57.29578f;
-    } else {
-        float k = angle_deg / s;
-        r_delta[0] = qdelta[1] * k;
-        r_delta[1] = qdelta[2] * k;
-        r_delta[2] = qdelta[3] * k;
-    }
-
-    /* Rotate the 3 signature axes from q_drift frame to current qcur frame.
-     * We need the axes in the same frame as r_delta (which is relative to
-     * q_prev, approximately qcur for small deltas). */
     const msig_axes_t *sigs = gesture_detect_get_sig_axes();
     if (sigs == NULL) return;
-    float nod_a[3], tiltL_a[3], tiltR_a[3];
-    rotate_sigs_to_mouse_frame(qcur, q_drift, sigs,
-                               nod_a, tiltL_a, tiltR_a);
 
-    /* Project incremental rotation onto axes → angular velocity (°/frame) */
-    float vel_nod   = v3_dot(r_delta, nod_a);
-    float vel_tiltL = v3_dot(r_delta, tiltL_a);
-    float vel_tiltR = v3_dot(r_delta, tiltR_a);
+    /* Read sign convention so cursor direction matches the calibrated
+     * gesture directions (same sign logic as gesture_detect). */
+    const uint8_t sp = gesture_detect_get_sign_pitch();
+    const uint8_t sr = gesture_detect_get_sign_roll();
 
-    /* Pitch velocity: positive = chin-down = cursor down */
-    float pitch_vel = vel_nod;
+    /* Project r onto signature axes → angular displacement (degrees).
+     * r is in the q_drift frame; the signature axes are also in the
+     * q_drift frame, so no rotation is needed.  r carries actual angle
+     * information and returns to ~0 at rest. */
+    float proj_nod   = v3_dot(r, sigs->sig_nod);
+    float proj_tiltL = v3_dot(r, sigs->sig_tiltL);
 
-    /* Roll velocity: tiltL - tiltR, negated so left = cursor left */
-    float roll_vel = -(vel_tiltL - vel_tiltR);
+    /* Apply sign convention:
+     *   pitch: positive = NOD (chin down)
+     *   roll:  positive = LEFT tilt
+     *
+     * NOTE: only proj_tiltL is used for roll direction.  sign_roll was
+     * designed for the tiltL axis; applying it to tiltR would invert
+     * the direction. */
+    float pitch_disp = sp ? proj_nod : -proj_nod;
+    float roll_disp  = sr ? proj_tiltL : -proj_tiltL;
 
-    /* Speed mapping: angular velocity → pixel velocity.
-     * The raw values are small (~0.1-5°/frame at 50 Hz).
-     * dead_zone = velocity dead zone (°/frame), not angle.
-     * speed_ref = velocity that gives max_speed (°/frame). */
-    float dx_f = 0.0f;
-    float dy_f = 0.0f;
+    float abs_pitch = fabsf(pitch_disp);
+    float abs_roll  = fabsf(roll_disp);
 
-    float ramp_range = s_mm.params.speed_ref_deg - s_mm.params.dead_zone_deg;
-    if (ramp_range < 0.1f) ramp_range = 0.1f;
+    int dx = 0, dy = 0;
 
-    float abs_roll = fabsf(roll_vel);
-    if (abs_roll > s_mm.params.dead_zone_deg) {
-        float speed = s_mm.params.max_speed *
-                      (abs_roll - s_mm.params.dead_zone_deg) / ramp_range;
-        if (speed > s_mm.params.max_speed) speed = s_mm.params.max_speed;
-        dx_f = (roll_vel > 0.0f) ? speed : -speed;
+    if (s_mm.four_dir) {
+        /* ── Four-direction (d-pad) mode ──
+         * Determine the dominant axis; only move in that axis at a
+         * constant slow speed.  This avoids diagonal movement and
+         * gives a predictable, easy-to-control cursor. */
+        bool pitch_active = abs_pitch > s_mm.params.dead_zone_deg;
+        bool roll_active  = abs_roll  > s_mm.params.dead_zone_deg;
+
+        if (pitch_active || roll_active) {
+            int speed = (int)FOUR_DIR_SPEED;
+            if (pitch_active && abs_pitch >= abs_roll) {
+                /* Dominant axis is pitch → vertical only */
+                dy = (pitch_disp > 0.0f) ? speed : -speed;
+            } else if (roll_active) {
+                /* Dominant axis is roll → horizontal only */
+                dx = (roll_disp > 0.0f) ? -speed : speed;
+            }
+        }
+    } else {
+        /* ── Proportional mode: same constant speed as four-dir,
+         *     but both axes can move simultaneously. ── */
+        int speed = (int)FOUR_DIR_SPEED;
+
+        if (abs_pitch > s_mm.params.dead_zone_deg) {
+            dy = (pitch_disp > 0.0f) ? speed : -speed;
+        }
+
+        if (abs_roll > s_mm.params.dead_zone_deg) {
+            /* Positive roll_disp = left tilt.
+             * In proportional mode the simultaneous pitch movement can
+             * make the perceived direction feel wrong, so we negate here
+             * to match the user's expectation: tilt left → cursor left. */
+            dx = (roll_disp > 0.0f) ? speed : -speed;
+        }
     }
 
-    float abs_pitch = fabsf(pitch_vel);
-    if (abs_pitch > s_mm.params.dead_zone_deg) {
-        float speed = s_mm.params.max_speed *
-                      (abs_pitch - s_mm.params.dead_zone_deg) / ramp_range;
-        if (speed > s_mm.params.max_speed) speed = s_mm.params.max_speed;
-        dy_f = (pitch_vel > 0.0f) ? speed : -speed;
-    }
-
-    /* Convert to integers, clamping to HID range [-127, 127] */
-    int dx = (int)dx_f;
-    int dy = (int)dy_f;
+    /* Clamp to HID range [-127, 127] */
     if (dx < -127) dx = -127;
     if (dx >  127) dx =  127;
     if (dy < -127) dy = -127;
@@ -330,10 +259,11 @@ void mouse_mode_tick(const float qcur[4], const float q_drift[4],
         static uint32_t s_frame = 0;
         s_frame++;
         if ((s_frame % 50) == 1) {
-            ESP_LOGI(TAG, "MOUSE dv=[%.2f %.2f %.2f] "
-                     "p_v=%.2f r_v=%.2f dx=%d dy=%d",
-                     r_delta[0], r_delta[1], r_delta[2],
-                     pitch_vel, roll_vel, dx, dy);
+            ESP_LOGI(TAG, "MOUSE r=[%.2f %.2f %.2f] "
+                     "p=%.1f r=%.1f dx=%d dy=%d%s",
+                     r[0], r[1], r[2],
+                     pitch_disp, roll_disp, dx, dy,
+                     s_mm.four_dir ? " [4dir]" : "");
         }
     }
 
@@ -416,15 +346,11 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
     if (!s_mm.enabled && !mouse_mode_is_active()) {
         return;
     }
-    ESP_LOGI(TAG, "[TOGGLE] gest=%d en=%d act=%d state=%d",
-             gesture, (int)s_mm.enabled, (int)mouse_mode_is_active(),
-             (int)s_tg.state);
     switch (s_tg.state) {
     case TG_IDLE:
         if (gesture == 3) {  /* GESTURE_TILT_LEFT */
             s_tg.state = TG_LEFT_SEEN;
             s_tg.left_seen_ms = now_ms;
-            ESP_LOGI(TAG, "[TOGGLE] LEFT_SEEN at %u", (unsigned)now_ms);
         }
         break;
 
@@ -436,34 +362,31 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
                 if (mouse_mode_is_active()) {
                     /* Deactivation requires touch held (left click pressed) */
                     if (!touch_sensor_is_pressed()) {
-                        ESP_LOGI(TAG, "[TOGGLE] deactivation ignored — "
-                                      "touch not held");
+                        ESP_LOGD(TAG, "toggle deactivate ignored — touch not held");
                         s_tg.state = TG_IDLE;
                         break;
                     }
                     if (s_mm.params.dwell_ms == 0) {
                         /* Immediate deactivation */
-                        ESP_LOGI(TAG, "[TOGGLE] deactivation sequence detected");
-                        ble_console_logf("[MOUSE] toggle: deactivation sequence\n");
+                        ESP_LOGI(TAG, "toggle deactivate (immediate)");
+                        ble_console_logf("[MOUSE] toggle: deactivated\n");
                         mouse_mode_deactivate();
                     } else {
                         /* Dwell-based deactivation */
-                        ESP_LOGI(TAG, "[TOGGLE] deactivation — waiting dwell");
-                        ble_console_logf("[MOUSE] toggle: deactivation sequence — "
-                                         "waiting for dwell (%u ms)\n",
+                        ESP_LOGI(TAG, "toggle deactivate (dwell %u ms)",
+                                 (unsigned)s_mm.params.dwell_ms);
+                        ble_console_logf("[MOUSE] toggle: deactivating — "
+                                         "dwell %u ms\n",
                                          (unsigned)s_mm.params.dwell_ms);
                         s_mm.dwell_active = true;
                         s_mm.dwell_since_ms = 0;
                     }
                 } else {
                     /* Activating */
-                    ESP_LOGI(TAG, "[TOGGLE] activation sequence detected");
-                    ble_console_logf("[MOUSE] toggle: activation sequence detected\n");
+                    ESP_LOGI(TAG, "toggle activate");
+                    ble_console_logf("[MOUSE] toggle: activated\n");
                     mouse_mode_activate();
                 }
-            } else {
-                ESP_LOGI(TAG, "[TOGGLE] window expired (left was %u ms ago)",
-                         (unsigned)(now_ms - s_tg.left_seen_ms));
             }
             s_tg.state = TG_IDLE;
         } else if (gesture == 3) {
@@ -476,7 +399,6 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
         /* Also check timeout */
         if (s_tg.state == TG_LEFT_SEEN &&
             (now_ms - s_tg.left_seen_ms) > TOGGLE_WINDOW_MS) {
-            ESP_LOGI(TAG, "[TOGGLE] LEFT_SEEN timeout");
             s_tg.state = TG_IDLE;
         }
         break;

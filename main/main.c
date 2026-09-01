@@ -829,6 +829,12 @@ static void handle_command(const char *cmd)
             ble_console_log("mouse: toggle detection ENABLED\n");
             ble_console_log("  trigger: left tilt + right tilt + touch held\n");
         } else if (strcmp(p, "off") == 0) {
+            /* If mouse mode is currently active, deactivate it first.
+             * Otherwise the cursor keeps moving after toggle detection
+             * is disabled. */
+            if (mouse_mode_is_active()) {
+                mouse_mode_deactivate();
+            }
             mouse_mode_set_enabled(false);
             ble_console_log("mouse: toggle detection DISABLED\n");
         } else if (strcmp(p, "status") == 0) {
@@ -836,17 +842,29 @@ static void handle_command(const char *cmd)
             bool enabled = mouse_mode_is_enabled();
             const mouse_mode_params_t *mp = mouse_mode_get_params();
             /* Machine-parseable line for the config tool */
-            ble_console_logf("mouse_mode: enabled=%d active=%d dz=%.1f ref=%.1f "
-                             "max=%.0f dwell=%u\n",
-                             (int)enabled, (int)active, mp->dead_zone_deg,
+            ble_console_logf("mouse_mode: enabled=%d active=%d fourdir=%d "
+                             "dz=%.1f ref=%.1f max=%.0f dwell=%u\n",
+                             (int)enabled, (int)active,
+                             (int)mouse_mode_is_four_dir(),
+                             mp->dead_zone_deg,
                              mp->speed_ref_deg, mp->max_speed,
                              (unsigned)mp->dwell_ms);
             /* Human-readable */
-            ble_console_logf("mouse: enabled=%d active=%d dz=%.1f ref=%.1f "
-                             "max=%.0f dwell=%u ms\n",
-                             (int)enabled, (int)active, mp->dead_zone_deg,
+            ble_console_logf("mouse: enabled=%d active=%d fourdir=%d "
+                             "dz=%.1f ref=%.1f max=%.0f dwell=%u ms\n",
+                             (int)enabled, (int)active,
+                             (int)mouse_mode_is_four_dir(),
+                             mp->dead_zone_deg,
                              mp->speed_ref_deg, mp->max_speed,
                              (unsigned)mp->dwell_ms);
+        } else if (strcmp(p, "fourdir on") == 0 ||
+                   strcmp(p, "fourdir 1") == 0) {
+            mouse_mode_set_four_dir(true);
+            ble_console_logf("mouse: four-dir mode ENABLED\n");
+        } else if (strcmp(p, "fourdir off") == 0 ||
+                   strcmp(p, "fourdir 0") == 0) {
+            mouse_mode_set_four_dir(false);
+            ble_console_logf("mouse: four-dir mode DISABLED\n");
         } else if (strncmp(p, "dz", 2) == 0 && (p[2] == '\0' || p[2] == ' ')) {
             const char *q = p + 2;
             while (*q == ' ') q++;
@@ -911,7 +929,7 @@ static void handle_command(const char *cmd)
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);
         ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc\n");
-        ble_console_log("  mouse    : mouse on|off|status|dz|sens|acc|max|dwell\n");
+        ble_console_log("  mouse    : mouse on|off|status|fourdir|dz|sens|acc|max|dwell\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
         ble_console_log("  configs : cmd list|get|set|del|run|fuzzy\n");
 #ifdef ENABLE_SERIAL_TRIGGER

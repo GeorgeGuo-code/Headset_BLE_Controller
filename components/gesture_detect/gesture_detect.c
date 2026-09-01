@@ -1173,7 +1173,14 @@ static void detector_task(void *arg)
         bool vel_still  = (vel < 15.0f);
         static uint32_t s_vel_still_since = 0;
 
-        if (proj_still) {
+        /* Freeze q_drift while mouse mode is active.  Otherwise the
+         * baseline would slowly track the user's head position, causing
+         * the rotation vector r to shrink and eventually reverse —
+         * the cursor would move in the wrong direction after a few
+         * seconds of holding the head still. */
+        bool drift_frozen = mouse_mode_is_active();
+
+        if (!drift_frozen && proj_still) {
             if (s_gd.still_since_ms == 0) {
                 s_gd.still_since_ms = now_ms;
             } else if ((now_ms - s_gd.still_since_ms) >= STILL_DURATION_MS) {
@@ -1193,7 +1200,7 @@ static void detector_task(void *arg)
             s_gd.still_since_ms = 0;
         }
 
-        if (vel_still && !proj_still) {
+        if (!drift_frozen && vel_still && !proj_still) {
             if (s_vel_still_since == 0) {
                 s_vel_still_since = now_ms;
             } else if ((now_ms - s_vel_still_since) >= 120) {
@@ -1224,17 +1231,20 @@ static void detector_task(void *arg)
             if (best_sig_idx == 2 && s_gd.smooth_r_valid) {
                 float sig_tiltL_a[3];
                 memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
-                float roll_proj = v3_dot(s_gd.smooth_r, sig_tiltL_a);
+                float roll_proj = apply_sign_roll(v3_dot(s_gd.smooth_r, sig_tiltL_a),
+                                                  s_gd.params.sign_roll);
                 gesture_type_t toggle_gest = (roll_proj >= 0.0f)
                     ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
                 mouse_mode_toggle_step((int)toggle_gest, now_ms);
             }
 
             /* Send cursor movement HID reports.
-             * mouse_mode_tick computes its own effective axes relative
-             * to q_mouse_rest (not q_drift), so the passed-in nod_eff/
-             * tilt_eff are unused. */
-            mouse_mode_tick(qcur, s_gd.q_drift, r_mag, vel);
+             * mouse_mode_tick uses raw r (q_drift frame) projected
+             * onto the calibrated signature axes (also q_drift frame).
+             * r carries actual angle information (degrees) unlike
+             * smooth_r which is normalised to unit length. */
+            mouse_mode_tick(r, s_gd.smooth_r_valid,
+                            r_mag, vel);
 
             /* Skip gesture event emission and accumulation — mouse mode
              * suppresses all gesture-triggered cmd_configs. */
@@ -1248,7 +1258,8 @@ static void detector_task(void *arg)
         if (best_sig_idx == 2 && s_gd.smooth_r_valid) {
             float sig_tiltL_a[3];
             memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
-            float roll_proj = v3_dot(s_gd.smooth_r, sig_tiltL_a);
+            float roll_proj = apply_sign_roll(v3_dot(s_gd.smooth_r, sig_tiltL_a),
+                                              s_gd.params.sign_roll);
             gesture_type_t toggle_gest = (roll_proj >= 0.0f)
                 ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
             mouse_mode_toggle_step((int)toggle_gest, now_ms);
@@ -1299,6 +1310,16 @@ const gesture_sig_axes_t *gesture_detect_get_sig_axes(void)
     memcpy(s_axes.sig_tiltL, s_gd.sig.sig_tiltL, sizeof(float)*3);
     memcpy(s_axes.sig_tiltR, s_gd.sig.sig_tiltR, sizeof(float)*3);
     return &s_axes;
+}
+
+uint8_t gesture_detect_get_sign_pitch(void)
+{
+    return s_gd.params.sign_pitch;
+}
+
+uint8_t gesture_detect_get_sign_roll(void)
+{
+    return s_gd.params.sign_roll;
 }
 
 #if 0
