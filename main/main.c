@@ -680,12 +680,7 @@ static void handle_command(const char *cmd)
         ble_console_log("calibrating REST (keep your head STILL, 2s)...\n");
         esp_err_t err = gesture_detect_calibrate_rest(2000);
         if (err == ESP_OK) {
-            const gesture_sig_axes_t *axes = gesture_detect_get_sig_axes();
-            if (axes) {
-                ble_console_log("REST calibration: OK — signatures loaded, detection ENABLED\n");
-            } else {
-                ble_console_log("REST calibration: OK — no saved signatures, run cn/ctl/ctr\n");
-            }
+            ble_console_log("REST calibration: OK — now run cn/ctl/ctr to calibrate gestures\n");
         } else {
             ble_console_logf("REST calibration: %s\n", esp_err_to_name(err));
         }
@@ -693,29 +688,14 @@ static void handle_command(const char *cmd)
         ble_console_log("calibrating NOD (do a slow chin-down nod)...\n");
         esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_NOD, 4000);
         ble_console_logf("NOD calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-        if (err == ESP_OK) {
-            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
-            ble_console_logf("  nod_axis=[%.3f %.3f %.3f]\n",
-                             sig.sig_nod[0], sig.sig_nod[1], sig.sig_nod[2]);
-        }
     } else if (strcmp(cmd, "ctl") == 0) {
         ble_console_log("calibrating TILT_LEFT (do a slow left tilt)...\n");
         esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_LEFT, 4000);
         ble_console_logf("TILT_LEFT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-        if (err == ESP_OK) {
-            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
-            ble_console_logf("  tiltL_axis=[%.3f %.3f %.3f]\n",
-                             sig.sig_tiltL[0], sig.sig_tiltL[1], sig.sig_tiltL[2]);
-        }
     } else if (strcmp(cmd, "ctr") == 0) {
         ble_console_log("calibrating TILT_RIGHT (do a slow right tilt)...\n");
         esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_RIGHT, 4000);
         ble_console_logf("TILT_RIGHT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-        if (err == ESP_OK) {
-            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
-            ble_console_logf("  tiltR_axis=[%.3f %.3f %.3f]\n",
-                             sig.sig_tiltR[0], sig.sig_tiltR[1], sig.sig_tiltR[2]);
-        }
     } else if (strcmp(cmd, "p") == 0) {
         const gesture_params_t *p = gesture_detect_get_params();
         ble_console_logf("params: trigger=%.1f vel=%.1f zone=%.1f debounce=%u "

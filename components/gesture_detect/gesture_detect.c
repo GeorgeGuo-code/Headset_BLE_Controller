@@ -117,6 +117,13 @@ typedef struct {
     float           prev_proj_axis;
     float           accum[3];
     bool            accum_armed;
+    /* Smoothed rotation vector for classification (EMA of r).
+     * Replaces smooth_axis (EMA of cross-product) for the dot-product
+     * classification.  The rotation vector r aligns with the calibrated
+     * PCA signatures; the cross-product cp is perpendicular to the
+     * rotation axis and caused misclassification (nod → tilt). */
+    float           smooth_r[3];
+    bool            smooth_r_valid;
     /* Per-gesture confidence snapshot (carried to emit_event) */
     float           last_conf[4];   /*!< [0]=NOD [1]=LOOK_UP [2]=TILTL [3]=TILTR */
 } gd_t;
@@ -147,6 +154,18 @@ static gd_t s_gd;
 
 static float s_cal_rest_q[4] = {1, 0, 0, 0};
 static bool  s_cal_rest_valid = false;
+static bool  s_cal_just_completed = false;  /*!< true after first tick post-calibration (FIFO flushed) */
+
+/* Accumulation-path state — declared at file scope so the post-calibration
+ * flush code can reset them.  Originally function-local statics inside
+ * detector_task. */
+static uint32_t s_end_hold = 0;
+static float    s_peak_sign_dot = 0.0f;
+static uint32_t s_consec_above_trigger = 0;
+static int      s_consistent_idx = -1;
+static int      s_consistent_count = 0;
+static float    s_pitch_dot_sum = 0.0f;
+static bool     s_had_high_vel  = false;  /*!< set when vel > trigger_vel; gates fire */
 
 /* ===== small math ======================================================== */
 
@@ -437,11 +456,12 @@ void gesture_detect_reset_q_drift(void)
 
 void gesture_detect_reset_calibration(void)
 {
-    if (s_gd.calibrated) {
-        ESP_LOGI(TAG, "calibration reset on new BLE connection — re-calibration required");
-    }
+    ESP_LOGI(TAG, "RESET_CAL: calibrated was %d, sig.calibrated was 0x%02x — clearing all",
+             (int)s_gd.calibrated, (unsigned)s_gd.sig.calibrated);
     s_gd.calibrated = false;
+    s_gd.sig.calibrated = 0;
     s_cal_rest_valid = false;
+    s_cal_just_completed = false;
 }
 
 /* ===== Event helper ====================================================== */
@@ -598,7 +618,63 @@ static void detector_task(void *arg)
         /* Require a full calibration before gesture detection is active.
          * Reset on each BLE connection via gesture_detect_reset_calibration(). */
         if (!s_gd.calibrated) {
+            s_cal_just_completed = false;
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
+            continue;
+        }
+
+        /* First tick after calibration — flush the DMP FIFO that
+         * accumulated stale samples during calibration (DMP runs at
+         * 100 Hz but the calibrator only drains at ~50 Hz).
+         * Step 1: reset FIFO hardware.  Step 2: wait 100 ms for the
+         * DMP to produce fresh quaternion data.  Step 3: read and
+         * discard up to 5 samples to flush any residual stale data
+         * and prime prev_fwd / prev_r_mag with current values.
+         * Step 4: reset all detector state so stale accum / smooth /
+         * hold counters don't leak into the first real gesture. */
+        if (!s_cal_just_completed) {
+            s_cal_just_completed = true;
+            mpu_reset_fifo();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            /* Discard up to 5 samples, keeping the last one as q_drift seed. */
+            float qdiscard[4];
+            int discarded = 0;
+            for (int d = 0; d < 5; d++) {
+                if (mpu_dmp_get_quat(&qdiscard[0], &qdiscard[1],
+                                     &qdiscard[2], &qdiscard[3]) == 0) {
+                    discarded++;
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            /* Seed q_drift from the freshest sample. */
+            if (discarded > 0) {
+                memcpy(s_gd.q_drift, qdiscard, sizeof(s_gd.q_drift));
+                s_gd.q_drift_valid = true;
+                s_gd.still_since_ms = 0;
+            }
+            /* Reset all detector state so stale data can't trigger. */
+            prev_r_mag = 0.0f;
+            prev_valid = false;
+            memset(s_gd.prev_fwd, 0, sizeof(s_gd.prev_fwd));
+            s_gd.prev_fwd_valid = false;
+            memset(s_gd.smooth_axis, 0, sizeof(s_gd.smooth_axis));
+            s_gd.smooth_axis_valid = false;
+            memset(s_gd.smooth_r, 0, sizeof(s_gd.smooth_r));
+            s_gd.smooth_r_valid = false;
+            memset(s_gd.accum, 0, sizeof(s_gd.accum));
+            s_gd.accum_armed = true;
+            s_gd.smooth_vel_nod = 0.0f;
+            s_gd.smooth_vel_tilt = 0.0f;
+            /* Reset file-scope accumulation state. */
+            s_end_hold = 0;
+            s_peak_sign_dot = 0.0f;
+            s_consec_above_trigger = 0;
+            s_consistent_idx = -1;
+            s_consistent_count = 0;
+            s_pitch_dot_sum = 0.0f;
+            s_had_high_vel = false;
+            GD_DBGI("DBG-CAL-FLUSH FIFO reset + %d samples discarded, "
+                     "detector state cleared", discarded);
             continue;
         }
 
@@ -739,18 +815,7 @@ static void detector_task(void *arg)
         prev_r_mag = r_mag;
         prev_valid = true;
 
-        /* Accumulation state (declared early so DC output can reference them) */
-        static uint32_t s_end_hold = 0;
-        static float    s_peak_sign_dot = 0.0f;
-        /* Anti-glitch: only reset hold after N consecutive frames above trigger.
-         * A single DMP glitch (vel→0) followed by recovery won't reset hold. */
-        static uint32_t s_consec_above_trigger = 0;
-        /* Temporal consistency: require N consecutive frames with same
-         * classification before allowing accumulation.  Prevents brief
-         * cross-axis matches (e.g. nod's roll component → tiltL) from
-         * accumulating and firing. */
-        static int s_consistent_idx = -1;
-        static int s_consistent_count = 0;
+        /* Accumulation state (file-scope statics, reset in post-cal flush) */
 
         /* ---- 3-axis classification via dot product with signatures ----
          * Copy packed sig arrays to aligned locals to avoid
@@ -760,43 +825,58 @@ static void detector_task(void *arg)
         memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
         memcpy(sig_tiltR_a, s_gd.sig.sig_tiltR, sizeof(sig_tiltR_a));
 
-        /* Capture raw cp direction BEFORE flip (flip destroys pitch sign).
-         * Used later to distinguish NOD from LOOK_UP at emit time. */
-        float cp_raw_dot_nod = 0.0f;
-        if ((s_gd.sig.calibrated & GESTURE_SIG_F_NOD) && cp_valid) {
-            cp_raw_dot_nod = v3_dot(cp, sig_nod_a);
+        /* Capture raw r direction for NOD vs LOOK_UP direction split.
+         * Uses r (rotation vector) to stay in the same space as the
+         * PCA signatures. */
+        float r_raw_dot_nod = 0.0f;
+        if ((s_gd.sig.calibrated & GESTURE_SIG_F_NOD) && r_mag > 0.1f) {
+            r_raw_dot_nod = v3_dot(r, sig_nod_a);
         }
 
         int best_sig_idx = -1;
         float classification_confidence = 0.0f;  /*!< dot product of best matching signature — carried to emit */
-        static float s_pitch_dot_sum = 0.0f;
-        if (s_gd.sig.calibrated != 0 && cp_valid) {
-            /* Capture raw pitch direction BEFORE flip (flip destroys sign) */
-            if (!s_gd.smooth_axis_valid) {
-                s_gd.smooth_axis[0] = cp[0]; s_gd.smooth_axis[1] = cp[1]; s_gd.smooth_axis[2] = cp[2];
-                s_gd.smooth_axis_valid = true;
+        if (s_gd.sig.calibrated != 0 && r_mag > 0.1f) {
+            /* Classify using the rotation vector r (not the cross-product
+             * cp).  The PCA signatures (sig_nod, sig_tiltL, sig_tiltR)
+             * are rotation-vector axes, so the dot product must be in the
+             * same space.  Using cp (which is perpendicular to the
+             * rotation axis) caused nod to be misclassified as tilt. */
+            if (!s_gd.smooth_r_valid) {
+                s_gd.smooth_r[0] = r[0]; s_gd.smooth_r[1] = r[1]; s_gd.smooth_r[2] = r[2];
+                s_gd.smooth_r_valid = true;
             } else {
-                float d = v3_dot(cp, s_gd.smooth_axis);
-                if (d < 0.0f) { cp[0]=-cp[0]; cp[1]=-cp[1]; cp[2]=-cp[2]; }
-                const float AX_ALPHA = 0.2f;
-                s_gd.smooth_axis[0] = s_gd.smooth_axis[0]*(1-AX_ALPHA) + cp[0]*AX_ALPHA;
-                s_gd.smooth_axis[1] = s_gd.smooth_axis[1]*(1-AX_ALPHA) + cp[1]*AX_ALPHA;
-                s_gd.smooth_axis[2] = s_gd.smooth_axis[2]*(1-AX_ALPHA) + cp[2]*AX_ALPHA;
-                float sm = v3_norm(s_gd.smooth_axis);
-                if (sm > 0.001f) { s_gd.smooth_axis[0]/=sm; s_gd.smooth_axis[1]/=sm; s_gd.smooth_axis[2]/=sm; }
+                /* Flip r if it points opposite to smooth_r to avoid
+                 * sign-flip artifacts across the singularity. */
+                float d = v3_dot(r, s_gd.smooth_r);
+                float ru[3] = { r[0], r[1], r[2] };
+                if (d < 0.0f) { ru[0]=-ru[0]; ru[1]=-ru[1]; ru[2]=-ru[2]; }
+                const float R_ALPHA = 0.65f;
+                s_gd.smooth_r[0] = s_gd.smooth_r[0]*(1-R_ALPHA) + ru[0]*R_ALPHA;
+                s_gd.smooth_r[1] = s_gd.smooth_r[1]*(1-R_ALPHA) + ru[1]*R_ALPHA;
+                s_gd.smooth_r[2] = s_gd.smooth_r[2]*(1-R_ALPHA) + ru[2]*R_ALPHA;
+                float sm = v3_norm(s_gd.smooth_r);
+                if (sm > 0.001f) { s_gd.smooth_r[0]/=sm; s_gd.smooth_r[1]/=sm; s_gd.smooth_r[2]/=sm; }
             }
             /* Only classify against calibrated signatures.
              * NOD/LOOK_UP share one axis (opposite directions).
              * TILT_LEFT/TILT_RIGHT share one axis (opposite directions).
-             * Use fabsf for axis alignment — the sign (direction) is
-             * determined at emit time by s_pitch_dot_sum (pitch) and
-             * the accumulated sign (roll).  This way the confidence
-             * reflects "how well does the axis match" regardless of
-             * which direction along the axis the head is moving. */
+             *
+             * Axis-purity weighting: the raw dot product with the PCA
+             * signature can be misleading when signatures overlap across
+             * axes (e.g. nod_axis has a Y component that aligns with
+             * tilt motions).  We weight each confidence by how much of
+             * the smooth_r's energy lies in the expected axis:
+             *   pitch gestures (NOD/LOOK_UP) → X component only
+             *   roll gestures (TILT_L/TILT_R) → Y+Z components only
+             * This ensures a purely vertical tilt motion (Y-dominant)
+             * cannot score high on the pitch axis, and vice versa. */
+            float sr_x = fabsf(s_gd.smooth_r[0]);
+            float sr_roll = sqrtf(s_gd.smooth_r[1]*s_gd.smooth_r[1]
+                                + s_gd.smooth_r[2]*s_gd.smooth_r[2]);
             float dn  = (s_gd.sig.calibrated & GESTURE_SIG_F_NOD)
-                ? fabsf(v3_dot(s_gd.smooth_axis, sig_nod_a))   : 0.0f;
+                ? fabsf(v3_dot(s_gd.smooth_r, sig_nod_a))   * sr_x    : 0.0f;
             float dtl = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL)
-                ? fabsf(v3_dot(s_gd.smooth_axis, sig_tiltL_a)) : 0.0f;
+                ? fabsf(v3_dot(s_gd.smooth_r, sig_tiltL_a)) * sr_roll : 0.0f;
             /* Index 0=NOD 1=LOOK_UP 2=TILTL 3=TILTR
              * NOD and LOOK_UP share axis → same alignment confidence.
              * TILT_LEFT and TILT_RIGHT share axis → same alignment.
@@ -899,20 +979,22 @@ static void detector_task(void *arg)
                 case 2:         msig = sig_tiltL_a;  break;
                 case 3:         msig = sig_tiltR_a;  break;
             }
-            /* Temporal consistency tracking */
+            /* Temporal consistency tracking (kept for diagnostics) */
             if (best_sig_idx == s_consistent_idx) {
                 s_consistent_count++;
             } else {
                 s_consistent_idx = best_sig_idx;
                 s_consistent_count = 1;
             }
-            const int CONSIST_FRAMES = 3;
             if (vel > trigger_vel) {
+                s_had_high_vel = true;
                 s_consec_above_trigger++;
                 /* Cross-axis consistency: only accumulate if the raw cp
                  * direction is consistent with the detected gesture's
-                 * signature AND classification has been stable for
-                 * CONSIST_FRAMES consecutive frames. */
+                 * signature.  Removed cons_ok gate — confidence-based
+                 * classification (smooth_r) already handles temporal
+                 * consistency; the old cons_ok gate caused accum to
+                 * stall whenever the classification briefly flipped. */
                 bool axis_ok = true;
                 if (msig) {
                     float cp_n = v3_norm(cp);
@@ -921,8 +1003,7 @@ static void detector_task(void *arg)
                         if (cp_dot_msig < 0.3f) axis_ok = false;
                     }
                 }
-                bool cons_ok = (s_consistent_count >= CONSIST_FRAMES);
-                if (axis_ok && cons_ok) {
+                if (axis_ok) {
                     /* Accumulate scaled cross product. */
                     s_gd.accum[0] += cp_sc[0]; s_gd.accum[1] += cp_sc[1]; s_gd.accum[2] += cp_sc[2];
                     /* Only reset hold after N consecutive frames above trigger.
@@ -931,106 +1012,92 @@ static void detector_task(void *arg)
                     if (s_consec_above_trigger >= TRIG_RESET_FRAMES) {
                         s_end_hold = 0;
                     }
-                    /* Accumulate raw pitch direction for NOD/LOOK_UP distinction */
-                    s_pitch_dot_sum += cp_raw_dot_nod;
                 }
-                /* Record sign at peak velocity. */
-                if (msig && vel > trigger_vel * 0.8f && axis_ok && cons_ok) {
-                    s_peak_sign_dot = v3_dot(s_gd.accum, msig);
-                }
+                /* Accumulate pitch direction OUTSIDE axis_ok — the cross-product
+                 * direction is perpendicular to the rotation vector, so axis_ok
+                 * can block accumulation during genuine nod/look-up motions. */
+                s_pitch_dot_sum += r_raw_dot_nod;
             } else {
                 s_consec_above_trigger = 0;
-                if (vel < end_vel && v3_norm(s_gd.accum) > MIN_ACC_MAG) {
-                    /* Velocity dropped below end_vel — start hold timer. */
+                if (vel < end_vel && best_sig_idx >= 0 &&
+                    s_gd.smooth_r_valid && s_had_high_vel) {
+                    /* Velocity dropped below end_vel — start hold timer.
+                     * Fire condition: confidence-based classification (smooth_r)
+                     * is stable, velocity dropped, and there was recent fast
+                     * motion.  Removed acc-based MIN_ACC_MAG / sign_match /
+                     * axis_dominance — those used cross-product space which
+                     * is perpendicular to the rotation-vector signatures. */
                     s_end_hold++;
                     if (s_end_hold >= END_HOLD_FRAMES) {
-                        /* Check: accumulated sign matches peak sign? */
-                        float dot_final = msig ? v3_dot(s_gd.accum, msig) : 0.0f;
-                        bool sign_match = (dot_final * s_peak_sign_dot > 0.0f);
-
-                        /* ── Axis dominance guard ──────────────────────────────
-                         * The accumulated vector's alignment with the winning
-                         * axis must exceed the runner-up by AXIS_DOMINANCE.
-                         * This prevents small noisy gestures from firing when
-                         * the vector points between two axes. */
-                        if (sign_match && best_sig_idx >= 0) {
-                            float nod_dot  = fabsf(v3_dot(s_gd.accum, sig_nod_a));
-                            float tilt_dot = fabsf(v3_dot(s_gd.accum, sig_tiltL_a));
-                            float win_dot = (best_sig_idx < 2) ? nod_dot : tilt_dot;
-                            float lose_dot = (best_sig_idx < 2) ? tilt_dot : nod_dot;
-                            if (win_dot - lose_dot < AXIS_DOMINANCE) {
-                                ESP_LOGD(TAG, "SKIP weak dominance: "
-                                         "win=%.2f lose=%.2f margin=%.2f < %.2f",
-                                         win_dot, lose_dot,
-                                         win_dot - lose_dot, AXIS_DOMINANCE);
-                                sign_match = false;
-                            }
-                        }
-
-                        if (sign_match && now_ms >= s_gd.cooldown_until_ms) {
+                        if (now_ms >= s_gd.cooldown_until_ms) {
                             static const gesture_type_t sig_gt[] = {
-                                GESTURE_NOD, GESTURE_LOOK_UP, GESTURE_TILT_LEFT, GESTURE_TILT_RIGHT
+                                GESTURE_NOD, GESTURE_LOOK_UP,
+                                GESTURE_TILT_LEFT, GESTURE_TILT_RIGHT
                             };
-                            /* Determine gesture from direction. */
+                            /* Determine gesture type. */
                             gesture_type_t gt = sig_gt[best_sig_idx];
                             if (best_sig_idx == 0) {
-                                /* Pitch axis: require minimum pitch_sum magnitude
-                                 * to avoid noise-driven NOD↔LOOK_UP flip. */
+                                /* Pitch axis: use pitch_dot_sum for direction.
+                                 * nod_axis[0] > 0, so:
+                                 *   NOD (chin-down) → r[0]<0 → pitch_sum<0
+                                 *   LOOK_UP (chin-up) → r[0]>0 → pitch_sum>0 */
                                 if (fabsf(s_pitch_dot_sum) >= MIN_PITCH_SUM) {
                                     gt = (s_pitch_dot_sum < 0.0f)
-                                        ? GESTURE_LOOK_UP : GESTURE_NOD;
+                                        ? GESTURE_NOD : GESTURE_LOOK_UP;
                                 }
                                 /* else: pitch_sum too weak, keep default (NOD) */
                             }
-                            if (best_sig_idx == 2 && dot_final < 0.0f) {
-                                gt = GESTURE_TILT_RIGHT;
+                            if (best_sig_idx == 2) {
+                                /* Roll axis: use smooth_r projection for direction. */
+                                float tilt_dot = v3_dot(s_gd.smooth_r, sig_tiltL_a);
+                                if (tilt_dot < 0.0f) {
+                                    gt = GESTURE_TILT_RIGHT;
+                                }
                             }
 
                             /* Split confidence by direction:
-                             * The raw conf array has equal values for both
-                             * gestures on the same axis (NOD==LOOK_UP, TL==TR).
                              * Zero out the opposite direction so only the
                              * matched gesture shows confidence. */
                             float split_conf[4];
                             memcpy(split_conf, s_gd.last_conf, sizeof(split_conf));
                             if (best_sig_idx == 0) {
-                                /* Pitch axis: use same direction as gt */
                                 if (gt == GESTURE_NOD) {
                                     split_conf[1] = 0.0f;  /* kill LOOK_UP */
                                 } else {
                                     split_conf[0] = 0.0f;  /* kill NOD */
                                 }
                             } else if (best_sig_idx == 2) {
-                                /* Roll axis: direction from dot_final */
-                                if (dot_final >= 0.0f) {
+                                float tilt_dot = v3_dot(s_gd.smooth_r, sig_tiltL_a);
+                                if (tilt_dot >= 0.0f) {
                                     split_conf[3] = 0.0f;  /* kill TILT_RIGHT */
                                 } else {
                                     split_conf[2] = 0.0f;  /* kill TILT_LEFT */
                                 }
                             }
 
-                            emit_event(gt, v3_norm(s_gd.accum), vel,
+                            emit_event(gt, r_mag, vel,
                                        split_conf, best_sig_idx);
-                            ESP_LOGI(TAG, "DETECT %s idx=%d acc=%.1f vel=%.0f "
+                            ESP_LOGI(TAG, "DETECT %s idx=%d r=%.1f vel=%.0f "
                                      "pitch_sum=%.2f "
                                      "NOD=%.2f LK=%.2f TL=%.2f TR=%.2f",
                                      (gt == GESTURE_NOD) ? "NOD" :
                                      (gt == GESTURE_LOOK_UP) ? "LOOK_UP" :
                                      (gt == GESTURE_TILT_LEFT) ? "TILT_LEFT" :
                                      (gt == GESTURE_TILT_RIGHT) ? "TILT_RIGHT" : "?",
-                                     best_sig_idx, v3_norm(s_gd.accum), vel,
+                                     best_sig_idx, r_mag, vel,
                                      s_pitch_dot_sum,
                                      s_gd.last_conf[0], s_gd.last_conf[1],
                                      s_gd.last_conf[2], s_gd.last_conf[3]);
                         }
-                        /* Reset accumulator regardless. */
+                        /* Reset state regardless. */
                         memset(s_gd.accum, 0, sizeof(s_gd.accum));
                         s_gd.accum_armed = true;
                         s_end_hold = 0; s_peak_sign_dot = 0.0f;
                         s_pitch_dot_sum = 0.0f;
                         s_consistent_count = 0; s_consistent_idx = -1;
                         s_consec_above_trigger = 0;
-                        s_gd.smooth_axis_valid = false;
+                        s_gd.smooth_r_valid = false;
+                        s_had_high_vel = false;
                     }
                 }
             }
@@ -1043,6 +1110,7 @@ static void detector_task(void *arg)
             s_pitch_dot_sum = 0.0f;
             s_consistent_count = 0; s_consistent_idx = -1;
             s_consec_above_trigger = 0;
+            s_had_high_vel = false;
         }
 
         /* ---- Phase 5: sliding baseline snap --------------------------- */
@@ -1100,10 +1168,10 @@ static void detector_task(void *arg)
              * TILT_LEFT and TILT_RIGHT share this axis). Direction is
              * determined by the sign of the projection onto the tilt
              * signature, NOT by best_sig_idx. */
-            if (best_sig_idx == 2 && s_gd.smooth_axis_valid) {
+            if (best_sig_idx == 2 && s_gd.smooth_r_valid) {
                 float sig_tiltL_a[3];
                 memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
-                float roll_proj = v3_dot(s_gd.smooth_axis, sig_tiltL_a);
+                float roll_proj = v3_dot(s_gd.smooth_r, sig_tiltL_a);
                 gesture_type_t toggle_gest = (roll_proj >= 0.0f)
                     ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
                 mouse_mode_toggle_step((int)toggle_gest, now_ms);
@@ -1124,10 +1192,10 @@ static void detector_task(void *arg)
          * activation. This runs AFTER emit_event so normal gesture
          * processing is unaffected — toggle is purely additive.
          * Same axis+direction logic as the mouse_mode branch above. */
-        if (best_sig_idx == 2 && s_gd.smooth_axis_valid) {
+        if (best_sig_idx == 2 && s_gd.smooth_r_valid) {
             float sig_tiltL_a[3];
             memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
-            float roll_proj = v3_dot(s_gd.smooth_axis, sig_tiltL_a);
+            float roll_proj = v3_dot(s_gd.smooth_r, sig_tiltL_a);
             gesture_type_t toggle_gest = (roll_proj >= 0.0f)
                 ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
             mouse_mode_toggle_step((int)toggle_gest, now_ms);
@@ -1820,6 +1888,9 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
         ESP_LOGW(TAG, "no gesture signatures yet — run cn/ctl/ctr to calibrate axes");
     }
 
+    /* Flush FIFO so the detector doesn't process stale samples from
+     * this calibration when it resumes. */
+    mpu_reset_fifo();
     return ESP_OK;
 }
 
@@ -1946,8 +2017,8 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                     prev_fwd_cal[0] = fwd_cal[0]; prev_fwd_cal[1] = fwd_cal[1]; prev_fwd_cal[2] = fwd_cal[2];
                     prev_fwd_cal_valid = true;
                 }
-                /* Debug: output every 5th frame during calibration */
-                if (n_frames % 5 == 0) {
+                /* Debug: output every 20th frame during calibration (less BLE noise) */
+                if (n_frames % 20 == 0) {
                     ESP_LOGI(TAG, "CAL-%s f=%u r=[%+.1f %+.1f %+.1f] mag=%.1f vel=%.0f "
                              "best_mag=%.1f best_vel=%.0f",
                              names[type], (unsigned)n_frames, r[0], r[1], r[2], mag, vel_now,
@@ -2067,14 +2138,23 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
              (unsigned)avg_count, (unsigned)gesture_count, s_gd.sig.calibrated);
 
     if ((s_gd.sig.calibrated & GESTURE_SIG_F_MINIMUM) == GESTURE_SIG_F_MINIMUM) {
-        ESP_LOGI(TAG, "3 axes calibrated - inferring signs...");
+        ESP_LOGI(TAG, "3 axes calibrated (0x%02x) - inferring signs...",
+                 (unsigned)s_gd.sig.calibrated);
         gesture_detect_infer_signs();
         if (!s_gd.calibrated && s_cal_rest_valid) {
             s_gd.calibrated = true;
             ESP_LOGI(TAG, "full calibration complete (cr + cn + ctl + ctr) — detection enabled");
+        } else if (!s_cal_rest_valid) {
+            ESP_LOGW(TAG, "3 axes done but no rest pose — run cr first");
         }
+    } else {
+        ESP_LOGI(TAG, "sig.calibrated=0x%02x, need 0x%02x — keep calibrating",
+                 (unsigned)s_gd.sig.calibrated, (unsigned)GESTURE_SIG_F_MINIMUM);
     }
 
+    /* Flush FIFO so stale samples from this calibration don't leak
+     * into the detector's first real tick. */
+    mpu_reset_fifo();
     return ESP_OK;
 }
 
