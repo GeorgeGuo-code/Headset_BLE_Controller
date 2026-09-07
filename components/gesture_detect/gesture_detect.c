@@ -29,7 +29,7 @@
 static const char *TAG = "gesture_detect";
 
 /* ===== Task timing ======================================================= */
-#define GD_TASK_PERIOD_MS    20      /*!< 50 Hz polling */
+#define GD_TASK_PERIOD_MS    10      /*!< 100 Hz polling — doubled for finer temporal resolution */
 #define GD_TASK_STACK_WORDS  4096
 #define GD_TASK_PRIORITY     5
 
@@ -50,7 +50,7 @@ static const char *TAG = "gesture_detect";
 /* ===== Accumulation-based detection thresholds ============================ */
 #define TRIG_VEL_FRAC     0.35f  /*!< trigger velocity = peak × this fraction */
 #define END_VEL_FRAC      0.20f  /*!< end velocity = peak × this fraction */
-#define END_HOLD_FRAMES   2      /*!< frames below end_vel before firing (2×20ms = 40ms) */
+#define END_HOLD_FRAMES   4      /*!< frames below end_vel before firing (4×10ms = 40ms at 100 Hz) */
 #define MIN_FIRE_R_MAG    3.0f   /*!< minimum smooth_r magnitude to fire (°) — prevents
                                       firing at neutral position after return motion */
 #define FIRE_COOLDOWN_MS  1000   /*!< minimum ms between two fired events */
@@ -110,11 +110,24 @@ typedef struct {
     /* Direction-based dominance signatures */
     gesture_signatures_t sig;
 
-    /* Cross-product instantaneous rotation axis */
+    /* Cross-product instantaneous rotation axis (kept for diagnostics) */
     float           prev_fwd[3];
     bool            prev_fwd_valid;
     float           smooth_axis[3];
     bool            smooth_axis_valid;
+
+    /* Quaternion-based angular velocity: prev_qcur stores the previous
+     * frame's DMP quaternion so we can compute the true inter-frame
+     * rotation angle via quaternion dot product, replacing the flawed
+     * |Δr_mag|/dt metric which is 0 when rotation direction changes
+     * at constant magnitude. */
+    float           prev_qcur[4];
+    bool            prev_qcur_valid;
+
+    /* Rotation vector history: prev_r stores the previous frame's r
+     * for the OLD velocity calculation (kept for diagnostic comparison). */
+    float           prev_r[3];
+    bool            prev_r_valid;
     /* Accumulation-based trigger */
     float           prev_proj_axis;
     float           accum[3];
@@ -169,6 +182,16 @@ static int      s_consistent_count = 0;
 static float    s_pitch_dot_sum = 0.0f;
 static float    s_tilt_dot_sum  = 0.0f;   /*!< accumulated r·sig_tiltL for tilt direction */
 static bool     s_had_high_vel  = false;  /*!< set when vel > trigger_vel; gates fire */
+
+/* Old cp-based accumulation (kept for diagnostic comparison only).
+ * s_cp_accum accumulates the scaled cross-product each frame while the
+ * new s_gd.accum accumulates the rotation vector r.  The diagnostic
+ * output shows both so the user can compare. */
+static float    s_cp_accum[3]   = {0.0f, 0.0f, 0.0f};
+
+/* Mouse-mode tick divider: at 100 Hz, mouse_mode only needs ~50 Hz.
+ * Skip every other frame to keep cursor speed unchanged. */
+static int      s_mouse_tick_div = 0;
 
 /* ===== small math ======================================================== */
 
@@ -231,6 +254,8 @@ static void quat_normalize(float a[4])
  * axes — at 25° the tilt projection from a nod was already ~7° and
  * growing, risking misclassification. */
 #define Q_DRIFT_MAX_DEG  15.0f
+
+#define RAD2DEG  57.29577951f   /*!< radians → degrees */
 
 /* After any snap that sets q_drift = qcur, call this to ensure
  * q_drift doesn't rotate more than Q_DRIFT_MAX_DEG from q_neutral.
@@ -605,6 +630,7 @@ static void detector_task(void *arg)
     TickType_t last = xTaskGetTickCount();
     float prev_r_mag = 0.0f;
     bool  prev_valid = false;
+    uint32_t prev_ms = 0;   /*!< actual ms timestamp of previous frame for real dt */
 
     while (s_gd.running) {
         /* During a calibration (calibrate_neutral / _axes / _tilt) the
@@ -639,15 +665,15 @@ static void detector_task(void *arg)
             s_cal_just_completed = true;
             mpu_reset_fifo();
             vTaskDelay(pdMS_TO_TICKS(100));
-            /* Discard up to 5 samples, keeping the last one as q_drift seed. */
+            /* Discard up to 10 samples, keeping the last one as q_drift seed. */
             float qdiscard[4];
             int discarded = 0;
-            for (int d = 0; d < 5; d++) {
+            for (int d = 0; d < 10; d++) {
                 if (mpu_dmp_get_quat(&qdiscard[0], &qdiscard[1],
                                      &qdiscard[2], &qdiscard[3]) == 0) {
                     discarded++;
                 }
-                vTaskDelay(pdMS_TO_TICKS(20));
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
             /* Seed q_drift from the freshest sample. */
             if (discarded > 0) {
@@ -677,6 +703,14 @@ static void detector_task(void *arg)
             s_pitch_dot_sum = 0.0f;
             s_tilt_dot_sum  = 0.0f;
             s_had_high_vel = false;
+            /* Reset quaternion/r history for velocity calculation. */
+            memset(s_gd.prev_qcur, 0, sizeof(s_gd.prev_qcur));
+            s_gd.prev_qcur_valid = false;
+            memset(s_gd.prev_r, 0, sizeof(s_gd.prev_r));
+            s_gd.prev_r_valid = false;
+            memset(s_cp_accum, 0, sizeof(s_cp_accum));
+            s_mouse_tick_div = 0;
+            prev_ms = 0;
             GD_DBGI("DBG-CAL-FLUSH FIFO reset + %d samples discarded, "
                      "detector state cleared", discarded);
             continue;
@@ -690,6 +724,17 @@ static void detector_task(void *arg)
         }
 
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+        /* Compute actual dt from previous frame.  DMP FIFO misses cause
+         * irregular frame gaps (30-100ms); using fixed GD_TASK_PERIOD_MS
+         * inflates velocity and breaks glitch detection. */
+        float dt_s = 0.01f;  /* fallback for first frame */
+        if (prev_ms > 0 && now_ms > prev_ms) {
+            dt_s = (float)(now_ms - prev_ms) / 1000.0f;
+            if (dt_s < 0.001f) dt_s = 0.001f;  /* clamp min */
+            if (dt_s > 0.200f) dt_s = 0.200f;  /* clamp max */
+        }
+        prev_ms = now_ms;
 
         /* Pull a stack-local aligned copy of the neutral pose so the
          * quaternion/vector helpers can take its members as float* without
@@ -714,6 +759,7 @@ static void detector_task(void *arg)
             s_gd.q_drift_valid  = true;
             s_gd.still_since_ms = 0;
             prev_valid = false;
+            prev_ms = 0;  /* reset so first real frame gets correct dt */
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
         }
@@ -732,20 +778,47 @@ static void detector_task(void *arg)
          * projection leaks into the tilt axis (e.g. 90° yaw + 10° nod
          * gives proj_nod ≈ proj_tilt ≈ 8°). By extracting the yaw
          * quaternion qyaw and computing qnotyaw = conj(qyaw) ⊗ qrel,
-         * only the pitch/roll residual enters the rotation vector. */
+         * only the pitch/roll residual enters the rotation vector.
+         *
+         * OPTIMIZATION: for small yaw angles (|v_dot_up| < 0.1, i.e.
+         * < ~12°), use the approximation atan2(x,y) ≈ x/y and
+         * cos(θ)≈1, sin(θ)≈θ to avoid the expensive atan2+sin+cos
+         * trio.  This covers the majority of frames during normal head
+         * gestures where yaw drift is small. */
         float world_up[3] = {0.0f, 0.0f, 1.0f};
         float up_body[3]; quat_rotate_vec(qd_conj, world_up, up_body);
         float r[3];
         if (v3_normalize(up_body) > 1e-6f) {
             float v_dot_up = qrel[1]*up_body[0] + qrel[2]*up_body[1] + qrel[3]*up_body[2];
-            float yaw_half = atan2f(v_dot_up, qrel[0]);
-            float qyaw[4] = { cosf(yaw_half),
-                              sinf(yaw_half)*up_body[0],
-                              sinf(yaw_half)*up_body[1],
-                              sinf(yaw_half)*up_body[2] };
-            float qyaw_conj[4]; quat_conj(qyaw, qyaw_conj);
-            float qnotyaw[4]; quat_mul(qyaw_conj, qrel, qnotyaw);
-            quat_normalize(qnotyaw);
+            float qnotyaw[4];
+            if (fabsf(v_dot_up) < 0.1f && qrel[0] > 0.5f) {
+                /* Small-angle path: yaw_half ≈ v_dot_up / qrel[0]
+                 * cos(yaw_half) ≈ 1, sin(yaw_half) ≈ yaw_half
+                 * qyaw ≈ [1, yaw_half × up_body]
+                 * qnotyaw ≈ qrel - qyaw × qrel (first-order) */
+                float yh = v_dot_up / qrel[0];
+                float syh_up[3] = {yh*up_body[0], yh*up_body[1], yh*up_body[2]};
+                /* qnotyaw ≈ conj(qyaw) ⊗ qrel, first order:
+                 *   w ≈ qrel.w
+                 *   vec ≈ qrel.vec - yh × up_body × qrel.w */
+                qnotyaw[0] = qrel[0];
+                qnotyaw[1] = qrel[1] - syh_up[0]*qrel[0];
+                qnotyaw[2] = qrel[2] - syh_up[1]*qrel[0];
+                qnotyaw[3] = qrel[3] - syh_up[2]*qrel[0];
+                quat_normalize(qnotyaw);
+            } else {
+                /* Full path for large yaw angles */
+                float yaw_half = atan2f(v_dot_up, qrel[0]);
+                float cos_yh = cosf(yaw_half);
+                float sin_yh = sinf(yaw_half);
+                float qyaw[4] = { cos_yh,
+                                  sin_yh*up_body[0],
+                                  sin_yh*up_body[1],
+                                  sin_yh*up_body[2] };
+                float qyaw_conj[4]; quat_conj(qyaw, qyaw_conj);
+                quat_mul(qyaw_conj, qrel, qnotyaw);
+                quat_normalize(qnotyaw);
+            }
             quat_to_rotvec_deg(qnotyaw, r);
         } else {
             quat_to_rotvec_deg(qrel, r);
@@ -753,28 +826,35 @@ static void detector_task(void *arg)
 
         /* Runtime glitch filter: reject DMP samples where the relative
          * rotation exceeds what a human head can physically produce.
-         * At 50 Hz, 45°/frame = 2250°/s, already 10× the human limit
-         * (~200°/s). Anything above this is either a DMP FIFO glitch
-         * (single-frame spike) or a q_drift that has drifted far from
-         * the current pose (persistent large |r|). We distinguish the
-         * two with a streak counter: a real glitch is 1-2 frames, a
-         * drift is 5+ consecutive frames. On drift, snap q_drift to
-         * qcur to recover instead of rejecting forever. */
-        const float R_MAX_RUNTIME = 45.0f;
-        const uint32_t GLITCH_RESYNC_FRAMES = 5;
+         *
+         * FIX (v2): use angular velocity (°/s) instead of per-frame
+         * rotation (°/frame) for the threshold.  Per-frame thresholds
+         * break with irregular frame timing (DMP FIFO misses cause
+         * 30-100ms gaps, inflating per-frame rotation 3-10×).
+         * Angular velocity normalises by actual dt, so a 37° rotation
+         * in 30ms (1233°/s) correctly exceeds the 500°/s limit,
+         * while a 5° rotation in 10ms (500°/s) does not.
+         *
+         * GLITCH_RESYNC_FRAMES increased from 10 to 30 (300ms at 100Hz)
+         * to distinguish fast gestures (200-300ms) from persistent drift
+         * (seconds).  A gesture produces large |r| for 200-300ms then
+         * returns to neutral; drift stays large indefinitely. */
+        const float R_MAX_RUNTIME_VEL = 500.0f;  /* °/s — human limit ~200°/s */
+        const uint32_t GLITCH_RESYNC_FRAMES = 30;  /* 300 ms at 100 Hz */
         static uint32_t s_glitch_streak = 0;
         float r_mag = v3_norm(r);
-        if (r_mag > R_MAX_RUNTIME) {
+        float r_vel = (dt_s > 0.001f) ? (r_mag / dt_s) : 0.0f;  /* °/s */
+        if (r_vel > R_MAX_RUNTIME_VEL) {
             s_glitch_streak++;
             if (s_glitch_streak >= GLITCH_RESYNC_FRAMES) {
                 /* Persistent offset: q_drift has drifted from the actual
                  * device orientation. Snap q_drift to qcur (same as
                  * `q reset` but automatic) so detection can resume.
-                 * Note: do NOT constrain_q_drift here — if qcur is far
-                 * from q_neutral, constraining would keep |r| > R_MAX
-                 * and cause an infinite resync loop.  The still-snap
-                 * paths will gradually pull q_drift back toward
-                 * q_neutral once the user is at rest. */
+                 * NOTE: no constrain_q_drift here — if qcur is far from
+                 * q_neutral, constraining would keep |r| high and cause
+                 * an infinite resync loop.  The still-snap paths will
+                 * gradually pull q_drift back toward q_neutral once the
+                 * user is at rest. */
                 float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
                           qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
                 if (d < 0.0f) {
@@ -785,12 +865,11 @@ static void detector_task(void *arg)
                 }
                 s_glitch_streak = 0;
                 prev_valid = false;
-                GD_DBGW("DBG-RESYNC q_drift→qcur after %u stale frames (|r| was %.1f°)",
-                         (unsigned)GLITCH_RESYNC_FRAMES, r_mag);
+                GD_DBGW("DBG-RESYNC q_drift→qcur after %u stale frames "
+                         "(r_vel was %.0f°/s, r_mag=%.1f°)",
+                         (unsigned)GLITCH_RESYNC_FRAMES, r_vel, r_mag);
             } else {
                 prev_valid = false;
-                GD_DBGW("DBG-GLITCH |r|=%.1f° (max %.0f°) streak=%u",
-                         r_mag, R_MAX_RUNTIME, (unsigned)s_glitch_streak);
             }
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
@@ -811,10 +890,36 @@ static void detector_task(void *arg)
         s_gd.prev_fwd[0] = fwd[0]; s_gd.prev_fwd[1] = fwd[1]; s_gd.prev_fwd[2] = fwd[2];
         s_gd.prev_fwd_valid = true;
 
-        /* ---- Angular velocity (deg/s) from rotation magnitude change -- */
-        float vel = 0.0f;
+        /* ---- Angular velocity (deg/s) ----------------------------------
+         * NEW: quaternion differential — the true inter-frame rotation
+         * angle.  dot(qcur, qprev) gives cos(angle/2) between consecutive
+         * orientations; 2*acos(dot) is the rotation in radians.
+         * OLD: |Δr_mag|/dt — flawed because it's 0 when rotation direction
+         * changes at constant magnitude.  Kept as vel_old for diagnostics.
+         *
+         * dt_s is computed earlier (after now_ms) using actual elapsed
+         * time instead of fixed GD_TASK_PERIOD_MS. */
+
+        float vel = 0.0f;       /* NEW: quaternion differential */
+        float vel_old = 0.0f;   /* OLD: |Δr_mag|/dt (for diagnostics) */
+
+        /* NEW velocity: quaternion dot product → rotation angle */
+        if (s_gd.prev_qcur_valid) {
+            float qdot = qcur[0]*s_gd.prev_qcur[0] + qcur[1]*s_gd.prev_qcur[1] +
+                         qcur[2]*s_gd.prev_qcur[2] + qcur[3]*s_gd.prev_qcur[3];
+            /* q and -q represent the same rotation.  A negative dot
+             * product means the quaternions are in opposite hemispheres;
+             * take |qdot| so acos gives the correct acute angle. */
+            if (qdot < 0.0f) qdot = -qdot;
+            if (qdot > 1.0f) qdot = 1.0f;
+            vel = 2.0f * acosf(qdot) / dt_s * RAD2DEG;  /* deg/s */
+        }
+        memcpy(s_gd.prev_qcur, qcur, sizeof(s_gd.prev_qcur));
+        s_gd.prev_qcur_valid = true;
+
+        /* OLD velocity: |Δr_mag|/dt (kept for diagnostic comparison) */
         if (prev_valid) {
-            vel = fabsf(r_mag - prev_r_mag) / ((float)GD_TASK_PERIOD_MS / 1000.0f);
+            vel_old = fabsf(r_mag - prev_r_mag) / dt_s;
         }
         prev_r_mag = r_mag;
         prev_valid = true;
@@ -922,39 +1027,6 @@ static void detector_task(void *arg)
             }
         }
 
-        /* Data-capture mode: log frame metrics at 50 Hz. */
-        if (s_dc_active) {
-            if (now_ms >= s_dc_until_ms) {
-                s_dc_active = false;
-                ESP_LOGI(TAG, "data capture OFF");
-            } else {
-                /* Line 1: raw data + rotation axis + velocity */
-                ESP_LOGI(TAG, "DC1 t=%u r=[%+.1f %+.1f %+.1f] rm=%.1f "
-                         "cp=[%.4f %.4f %.4f] sc=[%.2f %.2f %.2f] vel=%.0f",
-                         (unsigned)now_ms,
-                         r[0], r[1], r[2], r_mag,
-                         cp_valid ? cp[0] : 0.0f,
-                         cp_valid ? cp[1] : 0.0f,
-                         cp_valid ? cp[2] : 0.0f,
-                         cp_sc[0], cp_sc[1], cp_sc[2],
-                         vel);
-                /* Line 2: accumulation + classification */
-                float acc_mag = v3_norm(s_gd.accum);
-                float acc_n = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_nod_a) / acc_mag : 0.0f;
-                float acc_tL = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltL_a) / acc_mag : 0.0f;
-                float acc_tR = acc_mag > 0.01f ? v3_dot(s_gd.accum, sig_tiltR_a) / acc_mag : 0.0f;
-                ESP_LOGI(TAG, "DC2 idx=%d acc=[%.1f %.1f %.1f] |acc|=%.1f "
-                         "dot(n=%.2f tL=%.2f tR=%.2f) hold=%u p=%.1f "
-                         "conf=[NOD=%.2f LK=%.2f TL=%.2f TR=%.2f]",
-                         best_sig_idx,
-                         s_gd.accum[0], s_gd.accum[1], s_gd.accum[2],
-                         acc_mag, acc_n, acc_tL, acc_tR,
-                         (unsigned)s_end_hold, s_pitch_dot_sum,
-                         s_gd.last_conf[0], s_gd.last_conf[1],
-                         s_gd.last_conf[2], s_gd.last_conf[3]);
-            }
-        }
-
         /* ---- Per-gesture velocity thresholds (from calibration) ------- */
         float trigger_vel = 50.0f, end_vel = 30.0f, peak_vel_ref = 100.0f;
         if (best_sig_idx == 0 && s_gd.sig.peak_vel_nod > 10.0f)
@@ -968,15 +1040,76 @@ static void detector_task(void *arg)
         trigger_vel = peak_vel_ref * TRIG_VEL_FRAC;
         end_vel     = peak_vel_ref * END_VEL_FRAC;
 
-        /* ---- Accumulation-based trigger --------------------------------
-         * Accumulate raw cross-product vectors while velocity > trigger.
-         * Record the sign of the accumulation at peak velocity.
-         * Fire when velocity drops below end_vel for END_HOLD_FRAMES
-         * and the accumulated sign matches the peak sign.
-         * The return stroke produces opposite-sign cross products,
-         * so the accumulator is naturally cancelled. */
+        /* Data-capture mode: log comprehensive frame metrics at 100 Hz.
+         * 3 lines per frame for complete data-flow visibility:
+         *   DG1: raw quaternions + rotation vector + velocities
+         *   DG2: yaw decomposition + smooth_r + classification
+         *   DG3: accumulation (new r-based + old cp-based) + state
+         *
+         * Format uses space-separated key=value for easy parsing. */
+        if (s_dc_active) {
+            if (now_ms >= s_dc_until_ms) {
+                s_dc_active = false;
+                ESP_LOGI(TAG, "data capture OFF");
+            } else {
+                /* Compute qrel and qnotyaw for diagnostic output */
+                float qrel_diag[4];
+                quat_mul(qd_conj, qcur, qrel_diag);
+                quat_normalize(qrel_diag);
 
-        if (s_gd.accum_armed && best_sig_idx >= 0 && cp_valid) {
+                float r_raw[3];  /* r before yaw removal */
+                quat_to_rotvec_deg(qrel_diag, r_raw);
+                float r_raw_mag = v3_norm(r_raw);
+
+                float acc_mag = v3_norm(s_gd.accum);
+                float cp_mag  = v3_norm(s_cp_accum);
+
+                /* DG1: raw quaternions + rotation vector + velocities */
+                ESP_LOGI(TAG, "DG1 t=%u "
+                         "q=%+.4f,%+.4f,%+.4f,%+.4f "
+                         "d=%+.4f,%+.4f,%+.4f,%+.4f "
+                         "rr=%+.2f,%+.2f,%+.2f rrm=%.2f "
+                         "r=%+.2f,%+.2f,%+.2f rm=%.2f "
+                         "vn=%.1f vo=%.1f",
+                         (unsigned)now_ms,
+                         qcur[0], qcur[1], qcur[2], qcur[3],
+                         s_gd.q_drift[0], s_gd.q_drift[1],
+                         s_gd.q_drift[2], s_gd.q_drift[3],
+                         r_raw[0], r_raw[1], r_raw[2], r_raw_mag,
+                         r[0], r[1], r[2], r_mag,
+                         vel, vel_old);
+
+                /* DG2: yaw removal result + smooth_r + classification */
+                ESP_LOGI(TAG, "DG2 "
+                         "sr=%+.3f,%+.3f,%+.3f "
+                         "c=%+.3f,%+.3f,%+.3f,%+.3f "
+                         "i=%d tv=%.1f ev=%.1f",
+                         s_gd.smooth_r[0], s_gd.smooth_r[1], s_gd.smooth_r[2],
+                         s_gd.last_conf[0], s_gd.last_conf[1],
+                         s_gd.last_conf[2], s_gd.last_conf[3],
+                         best_sig_idx, trigger_vel, end_vel);
+
+                /* DG3: accumulation (new r-based + old cp-based) + state */
+                ESP_LOGI(TAG, "DG3 "
+                         "a=%+.2f,%+.2f,%+.2f am=%.2f "
+                         "cp=%+.2f,%+.2f,%+.2f cpm=%.2f "
+                         "ps=%.2f ts=%.2f h=%u arm=%d",
+                         s_gd.accum[0], s_gd.accum[1], s_gd.accum[2], acc_mag,
+                         s_cp_accum[0], s_cp_accum[1], s_cp_accum[2], cp_mag,
+                         s_pitch_dot_sum, s_tilt_dot_sum,
+                         (unsigned)s_end_hold, (int)s_gd.accum_armed);
+            }
+        }
+
+        /* ---- Accumulation-based trigger --------------------------------
+         * Accumulate rotation vectors r while velocity > trigger.
+         * Fire when velocity drops below end_vel for END_HOLD_FRAMES
+         * and the accumulated direction matches the gesture signature.
+         * FIXED: was accumulating cross-product vectors (perpendicular
+         * to the rotation axis); now accumulates r (same space as PCA
+         * signatures) so trigger direction matches classification. */
+
+        if (s_gd.accum_armed && best_sig_idx >= 0 && r_mag > 0.1f) {
             const float *msig = NULL;
             switch (best_sig_idx) {
                 case 0: case 1: msig = sig_nod_a;   break;
@@ -998,31 +1131,36 @@ static void detector_task(void *arg)
                  * preventing re-fire from the same static tilted position
                  * after cooldown expires. */
                 {
-                    const int TRIG_ARM_FRAMES = 3;
+                    const int TRIG_ARM_FRAMES = 6;  /* 60 ms at 100 Hz */
                     if (s_consec_above_trigger >= TRIG_ARM_FRAMES) {
                         s_had_high_vel = true;
                     }
                 }
-                /* Cross-axis consistency: only accumulate if the raw cp
+                /* Axis consistency: only accumulate if the rotation vector r
                  * direction is consistent with the detected gesture's
-                 * signature.  Removed cons_ok gate — confidence-based
-                 * classification (smooth_r) already handles temporal
-                 * consistency; the old cons_ok gate caused accum to
-                 * stall whenever the classification briefly flipped. */
+                 * signature.  FIXED: was checking cp (cross product, which is
+                 * perpendicular to the rotation axis).  Now checks r directly
+                 * in the rotation-vector space where the PCA signatures live. */
                 bool axis_ok = true;
                 if (msig) {
-                    float cp_n = v3_norm(cp);
-                    if (cp_n > 0.001f) {
-                        float cp_dot_msig = fabsf(cp[0]*msig[0] + cp[1]*msig[1] + cp[2]*msig[2]) / cp_n;
-                        if (cp_dot_msig < 0.3f) axis_ok = false;
+                    float r_n = v3_norm(r);
+                    if (r_n > 0.1f) {
+                        float r_dot_msig = fabsf(r[0]*msig[0] + r[1]*msig[1] + r[2]*msig[2]) / r_n;
+                        if (r_dot_msig < 0.3f) axis_ok = false;
                     }
                 }
                 if (axis_ok) {
-                    /* Accumulate scaled cross product. */
-                    s_gd.accum[0] += cp_sc[0]; s_gd.accum[1] += cp_sc[1]; s_gd.accum[2] += cp_sc[2];
+                    /* Accumulate rotation vector r (NEW) instead of scaled
+                     * cross product cp_sc (OLD).  r is in the same space as
+                     * the PCA signatures, so accumulation direction matches
+                     * classification direction — eliminating the old mismatch
+                     * where cp⊥r caused false triggers. */
+                    s_gd.accum[0] += r[0]; s_gd.accum[1] += r[1]; s_gd.accum[2] += r[2];
+                    /* OLD cp accumulation kept for diagnostic comparison. */
+                    s_cp_accum[0] += cp_sc[0]; s_cp_accum[1] += cp_sc[1]; s_cp_accum[2] += cp_sc[2];
                     /* Only reset hold after N consecutive frames above trigger.
                      * A single DMP glitch (vel→0→high) won't reset hold. */
-                    const int TRIG_RESET_FRAMES = 3;
+                    const int TRIG_RESET_FRAMES = 6;  /* 60 ms at 100 Hz */
                     if (s_consec_above_trigger >= TRIG_RESET_FRAMES) {
                         s_end_hold = 0;
                     }
@@ -1146,6 +1284,7 @@ static void detector_task(void *arg)
                             s_consec_above_trigger = 0;
                             s_had_high_vel = false;
                             s_gd.smooth_r_valid = false;
+                            memset(s_cp_accum, 0, sizeof(s_cp_accum));
                         } else {
                             /* Cooldown active — just reset hold counter. */
                             s_end_hold = 0;
@@ -1164,6 +1303,7 @@ static void detector_task(void *arg)
             s_consistent_count = 0; s_consistent_idx = -1;
             s_consec_above_trigger = 0;
             s_had_high_vel = false;
+            memset(s_cp_accum, 0, sizeof(s_cp_accum));
         }
 
         /* ---- Phase 5: sliding baseline snap --------------------------- */
@@ -1242,9 +1382,15 @@ static void detector_task(void *arg)
              * mouse_mode_tick uses raw r (q_drift frame) projected
              * onto the calibrated signature axes (also q_drift frame).
              * r carries actual angle information (degrees) unlike
-             * smooth_r which is normalised to unit length. */
-            mouse_mode_tick(r, s_gd.smooth_r_valid,
-                            r_mag, vel);
+             * smooth_r which is normalised to unit length.
+             * At 100 Hz, only call every other frame to keep cursor
+             * speed unchanged (mouse_mode was tuned for 50 Hz). */
+            s_mouse_tick_div++;
+            if (s_mouse_tick_div >= 2) {
+                s_mouse_tick_div = 0;
+                mouse_mode_tick(r, s_gd.smooth_r_valid,
+                                r_mag, vel);
+            }
 
             /* Skip gesture event emission and accumulation — mouse mode
              * suppresses all gesture-triggered cmd_configs. */
@@ -1296,6 +1442,13 @@ void gesture_detect_start_capture(uint32_t duration_ms)
     s_dc_until_ms = now + duration_ms;
     ESP_LOGI(TAG, "data capture ON for %u ms — perform gestures now",
              (unsigned)duration_ms);
+    /* Print field legend so the log can be parsed offline. */
+    ESP_LOGI(TAG, "DG-LEGEND DG1: t=<ms> q=<qw,qx,qy,qz> d=<qdrift> "
+             "rr=<r_raw> rrm=<|r_raw|> r=<r_noyaw> rm=<|r|> vn=<vel_new> vo=<vel_old>");
+    ESP_LOGI(TAG, "DG-LEGEND DG2: sr=<smooth_r> c=<conf_N,conf_L,conf_TL,conf_TR> "
+             "i=<best_idx> tv=<trigger_vel> ev=<end_vel>");
+    ESP_LOGI(TAG, "DG-LEGEND DG3: a=<accum_r> am=<|accum_r|> cp=<accum_cp> "
+             "cpm=<|accum_cp|> ps=<pitch_sum> ts=<tilt_sum> h=<end_hold> arm=<armed>");
 }
 
 const gesture_sig_axes_t *gesture_detect_get_sig_axes(void)
@@ -1370,7 +1523,8 @@ esp_err_t gesture_detect_calibrate_neutral(uint32_t duration_ms)
 
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
-        if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        if (got_fresh) {
             if (!have_ref) {
                 memcpy(qref, q, sizeof(qref));
                 have_ref = true;
@@ -1500,7 +1654,8 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
 
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
-        if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        if (got_fresh) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs < W_MIN) {
                 rejected++;
@@ -1784,7 +1939,8 @@ esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms)
     s_gd.calibrating = true;
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
-        if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        if (got_fresh) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs < W_MIN) {
                 rejected++;
@@ -1910,7 +2066,8 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
 
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
-        if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        if (got_fresh) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs >= W_MIN) {
                 if (count > 0) {
@@ -1994,7 +2151,8 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
         s_gd.calibrating = true;
         for (uint32_t i = 0; i < rest_ticks; i++) {
             float q[4];
-            if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+            bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+            if (got_fresh) {
                 float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
                 if (w_abs >= W_MIN) {
                     if (rest_count > 0) {
@@ -2038,10 +2196,21 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
     float cp_mag_sum = 0.0f;
     uint32_t cp_count = 0;
 
+    /* For quaternion-differential velocity */
+    float prev_qcal[4] = {0.0f};
+    bool  prev_qcal_valid = false;
+    bool  prev_was_gap = false;   /* skip velocity on frame after a GAP */
+    uint32_t skip_count = 0;
+    float best_vel_old = 0.0f;   /* |Δr_mag|/dt — for comparison only */
+    float best_vel_new = 0.0f;   /* quaternion differential — actual peak */
+
     s_gd.calibrating = true;
     for (uint32_t i = 0; i < gesture_ticks_count && n_frames < 120; i++) {
         float q[4];
-        if (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0) {
+        /* Drain FIFO: read up to 30 packets, keep the last (most recent).
+         * Cap at 30 to avoid infinite loop (DMP at 100 Hz ≈ 10 ms/pkt). */
+        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        if (got_fresh) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs >= W_MIN) {
                 float qrel[4]; quat_mul(q_rest_conj, q, qrel); quat_normalize(qrel);
@@ -2052,31 +2221,104 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                  * velocity and axis statistics. */
                 if (mag > 90.0f) {
                     gesture_count++;
+                    skip_count++;
+                    prev_qcal_valid = false;  /* reset velocity chain across skip */
                     vTaskDelay(pdMS_TO_TICKS(period_ms));
                     continue;
                 }
                 /* Compute velocity BEFORE recording this frame.
-                 * Use actual elapsed ticks to handle skipped frames
-                 * (>90° quaternion wrap) where time passes but
-                 * prev_r_mag isn't updated. */
-                float vel_now = 0.0f;
+                 * TWO methods computed and logged for comparison:
+                 *   vel_old = |Δr_mag|/dt — WRONG for nodding: spikes to
+                 *     thousands of °/s when head passes through rest (mag
+                 *     drops from 70° to 0° in one frame).
+                 *   vel_new = quaternion differential — TRUE angular velocity
+                 *     independent of reference frame.
+                 *
+                 * IMPORTANT: if dt > GAP_THRESHOLD_S (50ms), the velocity
+                 * measurement is unreliable — the head could have done a
+                 * full round-trip during the gap, inflating the quaternion
+                 * differential to 1000+°/s.  Such frames are marked as
+                 * gap-frames and their velocity is not used for best_vel
+                 * or PCA. */
+                const float GAP_THRESHOLD_S = 0.050f;  /* >2.5× period_ms */
+                float vel_old = 0.0f;
+                float vel_new = 0.0f;
+                bool is_gap_frame = false;
                 TickType_t now_tick = xTaskGetTickCount();
                 if (n_frames > 0 && prev_frame_tick > 0) {
                     float dt_s = (float)(now_tick - prev_frame_tick) * portTICK_PERIOD_MS / 1000.0f;
-                    if (dt_s > 0.001f) {
-                        vel_now = fabsf(mag - prev_r_mag) / dt_s;
+                    if (dt_s > GAP_THRESHOLD_S) {
+                        is_gap_frame = true;
                     }
-                    if (vel_now > best_vel) best_vel = vel_now;
+                    if (dt_s > 0.001f) {
+                        vel_old = fabsf(mag - prev_r_mag) / dt_s;
+                    }
                 }
+                /* Quaternion-differential velocity (same method as detector) */
+                if (prev_qcal_valid && !is_gap_frame && !prev_was_gap) {
+                    float qdot = q[0]*prev_qcal[0] + q[1]*prev_qcal[1] +
+                                 q[2]*prev_qcal[2] + q[3]*prev_qcal[3];
+                    if (qdot < 0.0f) qdot = -qdot;
+                    if (qdot > 1.0f) qdot = 1.0f;
+                    TickType_t now2 = xTaskGetTickCount();
+                    float dt2 = (float)(now2 - prev_frame_tick) * portTICK_PERIOD_MS / 1000.0f;
+                    if (dt2 > 0.001f) {
+                        vel_new = 2.0f * acosf(qdot) / dt2 * RAD2DEG;
+                    }
+                }
+
+                /* Log every frame during calibration for diagnostics.
+                 * Gap frames (dt > 50ms) are flagged with 'G' — their
+                 * velocity is excluded from best_vel and PCA. */
+                if (!is_gap_frame && !prev_was_gap) {
+                    if (vel_old > best_vel_old) best_vel_old = vel_old;
+                    if (vel_new > best_vel_new) best_vel_new = vel_new;
+                }
+                best_vel = best_vel_new;  /* downstream code uses best_vel */
+
+                ESP_LOGI(TAG, "CAL-%s f=%u mag=%.1f vold=%.0f vnew=%.0f "
+                         "best_vold=%.0f best_vnew=%.0f dt=%.3f%s",
+                         names[type], (unsigned)n_frames, mag,
+                         vel_old, vel_new,
+                         best_vel_old, best_vel_new,
+                         (prev_frame_tick > 0)
+                           ? (float)(now_tick - prev_frame_tick) * portTICK_PERIOD_MS / 1000.0f
+                           : 0.0f,
+                         is_gap_frame ? " GAP" : "");
+                /* Raw quaternion log: output every 10th frame to trace
+                 * the full computation chain (q → qrel → r → mag).
+                 * Users can verify: angle(qrel) == mag? */
+                if (n_frames % 10 == 0) {
+                    ESP_LOGI(TAG, "CAL-%s RAW f=%u q=[%.4f %.4f %.4f %.4f] "
+                             "qr=[%.4f %.4f %.4f %.4f] r=[%.1f %.1f %.1f] "
+                             "qang=%.1f",
+                             names[type], (unsigned)n_frames,
+                             q[0], q[1], q[2], q[3],
+                             qrel[0], qrel[1], qrel[2], qrel[3],
+                             r[0], r[1], r[2],
+                             quat_angle_deg(qrel));
+                }
+
                 all_r[n_frames][0] = r[0];
                 all_r[n_frames][1] = r[1];
                 all_r[n_frames][2] = r[2];
                 all_mag[n_frames] = mag;
-                all_vel[n_frames] = vel_now;
+                all_vel[n_frames] = vel_new;
                 n_frames++;
                 if (mag > best_mag) best_mag = mag;
                 prev_r_mag = mag;
+                /* After a GAP frame, do NOT update the quaternion
+                 * velocity chain (prev_qcal).  The GAP frame skipped
+                 * many DMP samples, so using it as a reference would give
+                 * a false velocity.  prev_frame_tick IS always updated
+                 * so that dt remains accurate for every frame. */
+                if (!is_gap_frame) {
+                    prev_qcal[0] = q[0]; prev_qcal[1] = q[1];
+                    prev_qcal[2] = q[2]; prev_qcal[3] = q[3];
+                    prev_qcal_valid = true;
+                }
                 prev_frame_tick = now_tick;
+                prev_was_gap = is_gap_frame;
                 gesture_count++;
                 /* Compute forward-vector cross product for avg_cp */
                 {
@@ -2091,18 +2333,15 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                     prev_fwd_cal[0] = fwd_cal[0]; prev_fwd_cal[1] = fwd_cal[1]; prev_fwd_cal[2] = fwd_cal[2];
                     prev_fwd_cal_valid = true;
                 }
-                /* Debug: output every 20th frame during calibration (less BLE noise) */
-                if (n_frames % 20 == 0) {
-                    ESP_LOGI(TAG, "CAL-%s f=%u r=[%+.1f %+.1f %+.1f] mag=%.1f vel=%.0f "
-                             "best_mag=%.1f best_vel=%.0f",
-                             names[type], (unsigned)n_frames, r[0], r[1], r[2], mag, vel_now,
-                             best_mag, best_vel);
-                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(period_ms));
     }
     s_gd.calibrating = false;
+    ESP_LOGI(TAG, "CAL-%s DONE frames=%u skipped=%u best_mag=%.1f "
+             "best_vold=%.0f best_vnew=%.0f",
+             names[type], (unsigned)n_frames, (unsigned)skip_count,
+             best_mag, best_vel_old, best_vel_new);
 
     const float FRAC_MIN = 0.30f;
     const float VEL_MIN = 30.0f;  /* exclude static/near-static frames from PCA */
