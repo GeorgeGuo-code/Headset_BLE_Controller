@@ -22,6 +22,7 @@
 
 #include "MPU6050.h"
 #include "inv_mpu.h"
+#include "inv_mpu_dmp_motion_driver.h"
 #include "gesture_detect.h"
 #include "gesture_params.h"
 #include "mouse_mode.h"
@@ -32,6 +33,11 @@ static const char *TAG = "gesture_detect";
 #define GD_TASK_PERIOD_MS    10      /*!< 100 Hz polling — doubled for finer temporal resolution */
 #define GD_TASK_STACK_WORDS  4096
 #define GD_TASK_PRIORITY     5
+#define GD_DMP_RATE_HZ       33     /*!< DMP output rate during detection & calibration.
+                                         Matched to the detector's ~30 ms per-tick budget
+                                         (I2C + math + logging).  At 100 Hz the FIFO would
+                                         overflow because the detector can only consume
+                                         ~33 packets/s, causing 600 ms+ GAPs. */
 
 /* 1 = log every fire / suppress / cooldown / dominance-skip / snap decision.
  * Very useful for tuning thresholds; set to 0 for production builds.
@@ -123,6 +129,7 @@ typedef struct {
      * at constant magnitude. */
     float           prev_qcur[4];
     bool            prev_qcur_valid;
+    bool            prev_was_gap;  /* true if previous frame was a GAP */
 
     /* Rotation vector history: prev_r stores the previous frame's r
      * for the OLD velocity calculation (kept for diagnostic comparison). */
@@ -329,6 +336,39 @@ static void quat_rotate_vec(const float q[4], const float v[3], float out[3])
     float t[4];  quat_mul(q, qv, t);
     float r[4];  quat_mul(t, qc, r);
     out[0] = r[1]; out[1] = r[2]; out[2] = r[3];
+}
+
+/**
+ * @brief Drain the DMP FIFO and return ONLY the most recent quaternion.
+ *
+ *        Reads up to @p max_read packets in a burst, discarding all but
+ *        the last one.  This eliminates stale data caused by FIFO积压:
+ *        if BLE or other tasks delayed this reader, old packets pile up
+ *        in the FIFO; a single mpu_dmp_get_quat() would return the
+ *        OLDEST (stalest) packet, but drain returns the NEWEST.
+ *
+ *        Typical use: call once per tick (after vTaskDelay) to grab the
+ *        freshest orientation.  At 100 Hz DMP output, max_read=30 gives
+ *        300 ms of headroom — far more than any realistic scheduling delay.
+ *
+ * @param q_out     Output quaternion (w,x,y,z).  Undefined on failure.
+ * @param max_read  Safety cap on packets read (prevents infinite loop if
+ *                  DMP is stuck outputting zeros).  30 is generous.
+ * @return true if at least one valid packet was consumed.
+ */
+static bool mpu_drain_latest(float q_out[4], int max_read)
+{
+    bool got_any = false;
+    float q_tmp[4];
+    while (max_read-- > 0) {
+        if (mpu_dmp_get_quat(&q_tmp[0], &q_tmp[1],
+                             &q_tmp[2], &q_tmp[3]) != 0) {
+            break;   /* FIFO empty or DMP not ready */
+        }
+        memcpy(q_out, q_tmp, sizeof(q_tmp));
+        got_any = true;
+    }
+    return got_any;
 }
 
 /* Phase 6: rotate the q_neutral-frame nod_axis / tilt_axis into the
@@ -663,20 +703,20 @@ static void detector_task(void *arg)
          * hold counters don't leak into the first real gesture. */
         if (!s_cal_just_completed) {
             s_cal_just_completed = true;
+            /* 锁定 DMP 输出到 GD_DMP_RATE_HZ 以匹配检测器的处理能力。
+             * 校准结束后 orig_rate 被恢复到 100 Hz，但检测器每个 tick
+             * 需要 ~30 ms（I2C + 计算 + 日志），10 Hz 的 DMP 速率会导致
+             * FIFO 溢出 → 数据积压 → 600 ms+ 的 GAP。 33 Hz 确保每 tick
+             * 只有 ~1 个包需要读取，不会积压。 */
+            mpu_set_sample_rate(GD_DMP_RATE_HZ);
+            dmp_set_fifo_rate(GD_DMP_RATE_HZ);
             mpu_reset_fifo();
             vTaskDelay(pdMS_TO_TICKS(100));
-            /* Discard up to 10 samples, keeping the last one as q_drift seed. */
+            /* 100ms 内 DMP 产生 ~3 包，drain 清空积压。 */
             float qdiscard[4];
-            int discarded = 0;
-            for (int d = 0; d < 10; d++) {
-                if (mpu_dmp_get_quat(&qdiscard[0], &qdiscard[1],
-                                     &qdiscard[2], &qdiscard[3]) == 0) {
-                    discarded++;
-                }
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
+            bool got_fresh = mpu_drain_latest(qdiscard, 10);
             /* Seed q_drift from the freshest sample. */
-            if (discarded > 0) {
+            if (got_fresh) {
                 memcpy(s_gd.q_drift, qdiscard, sizeof(s_gd.q_drift));
                 s_gd.q_drift_valid = true;
                 s_gd.still_since_ms = 0;
@@ -706,19 +746,26 @@ static void detector_task(void *arg)
             /* Reset quaternion/r history for velocity calculation. */
             memset(s_gd.prev_qcur, 0, sizeof(s_gd.prev_qcur));
             s_gd.prev_qcur_valid = false;
+            s_gd.prev_was_gap = false;
             memset(s_gd.prev_r, 0, sizeof(s_gd.prev_r));
             s_gd.prev_r_valid = false;
             memset(s_cp_accum, 0, sizeof(s_cp_accum));
             s_mouse_tick_div = 0;
             prev_ms = 0;
-            GD_DBGI("DBG-CAL-FLUSH FIFO reset + %d samples discarded, "
-                     "detector state cleared", discarded);
+            GD_DBGI("DBG-CAL-FLUSH FIFO reset + drain, "
+                     "detector state cleared");
             continue;
         }
 
         float qcur[4];
-        if (mpu_dmp_get_quat(&qcur[0], &qcur[1], &qcur[2], &qcur[3]) != 0) {
-            /* FIFO miss — skip this tick */
+        /* Drain-latest: read pending FIFO packets, keep only the newest.
+         * At 400 kHz I2C each packet takes ~0.7 ms.
+         * 33 Hz DMP + ~30 ms tick → typically 1 packet (0.7 ms overhead).
+         * If detector falls behind briefly, 2-3 packets accumulate
+         * (1.4-2.1 ms extra) — still well within the 30 ms budget.
+         * max_read=3 caps worst-case drain at ~2.1 ms (7% of budget). */
+        if (!mpu_drain_latest(qcur, 3)) {
+            /* FIFO empty — skip this tick */
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
         }
@@ -729,10 +776,12 @@ static void detector_task(void *arg)
          * irregular frame gaps (30-100ms); using fixed GD_TASK_PERIOD_MS
          * inflates velocity and breaks glitch detection. */
         float dt_s = 0.01f;  /* fallback for first frame */
+        bool is_gap_frame = false;
         if (prev_ms > 0 && now_ms > prev_ms) {
             dt_s = (float)(now_ms - prev_ms) / 1000.0f;
             if (dt_s < 0.001f) dt_s = 0.001f;  /* clamp min */
             if (dt_s > 0.200f) dt_s = 0.200f;  /* clamp max */
+            if (dt_s > 0.050f) is_gap_frame = true;  /* BLE preemption gap */
         }
         prev_ms = now_ms;
 
@@ -903,8 +952,10 @@ static void detector_task(void *arg)
         float vel = 0.0f;       /* NEW: quaternion differential */
         float vel_old = 0.0f;   /* OLD: |Δr_mag|/dt (for diagnostics) */
 
-        /* NEW velocity: quaternion dot product → rotation angle */
-        if (s_gd.prev_qcur_valid) {
+        /* Skip velocity if this is a GAP frame or the frame after one —
+         * the quaternion is from a stale FIFO packet and the velocity
+         * would be meaningless. */
+        if (s_gd.prev_qcur_valid && !is_gap_frame && !s_gd.prev_was_gap) {
             float qdot = qcur[0]*s_gd.prev_qcur[0] + qcur[1]*s_gd.prev_qcur[1] +
                          qcur[2]*s_gd.prev_qcur[2] + qcur[3]*s_gd.prev_qcur[3];
             /* q and -q represent the same rotation.  A negative dot
@@ -916,6 +967,7 @@ static void detector_task(void *arg)
         }
         memcpy(s_gd.prev_qcur, qcur, sizeof(s_gd.prev_qcur));
         s_gd.prev_qcur_valid = true;
+        s_gd.prev_was_gap = is_gap_frame;
 
         /* OLD velocity: |Δr_mag|/dt (kept for diagnostic comparison) */
         if (prev_valid) {
@@ -1428,9 +1480,9 @@ esp_err_t gesture_detect_start(QueueHandle_t event_queue)
     }
     s_gd.event_queue = event_queue;
     s_gd.running     = true;
-    BaseType_t ok = xTaskCreate(detector_task, "gesture_det",
+    BaseType_t ok = xTaskCreatePinnedToCore(detector_task, "gesture_det",
                                 GD_TASK_STACK_WORDS, NULL,
-                                GD_TASK_PRIORITY, &s_gd.task);
+                                GD_TASK_PRIORITY, &s_gd.task, 1);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -1500,7 +1552,13 @@ esp_err_t gesture_detect_calibrate_neutral(uint32_t duration_ms)
     ESP_LOGI(TAG, "calibrating neutral for %u ms — keep head still...",
              (unsigned)duration_ms);
 
-    const uint32_t period_ms = 20;
+    /* 确保 DMP FIFO 输出在 GD_DMP_RATE_HZ，匹配 period_ms。 */
+    mpu_set_sample_rate(GD_DMP_RATE_HZ);
+    dmp_set_fifo_rate(GD_DMP_RATE_HZ);
+    mpu_reset_fifo();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    const uint32_t period_ms = 30;  /* 匹配 GD_DMP_RATE_HZ = 33 Hz */
     const uint32_t ticks     = duration_ms / period_ms;
     if (ticks < 5) {
         return ESP_ERR_INVALID_ARG;
@@ -1523,7 +1581,7 @@ esp_err_t gesture_detect_calibrate_neutral(uint32_t duration_ms)
 
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
-        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        bool got_fresh = mpu_drain_latest(q, 3);
         if (got_fresh) {
             if (!have_ref) {
                 memcpy(qref, q, sizeof(qref));
@@ -1601,6 +1659,12 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
                   "(v3: q_neutral-relative r vectors, averaged)",
              (unsigned)duration_ms);
 
+    /* 确保 DMP FIFO 输出在 GD_DMP_RATE_HZ，匹配 period_ms。 */
+    mpu_set_sample_rate(GD_DMP_RATE_HZ);
+    dmp_set_fifo_rate(GD_DMP_RATE_HZ);
+    mpu_reset_fifo();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     /* "up" in the q_neutral body frame: world up rotated into the device's
      * body frame at the moment the user calibrated neutral. Used to project
      * the averaged rotation vector onto the horizontal plane so nod_axis
@@ -1617,7 +1681,7 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
         return ESP_FAIL;
     }
 
-    const uint32_t period_ms = 20;
+    const uint32_t period_ms = 30;  /* 匹配 GD_DMP_RATE_HZ = 33 Hz */
     const uint32_t ticks     = duration_ms / period_ms;
     const float W_MIN           = 0.05f;
     const float R_MAX_PER_FRAME = 90.0f;   /* generous: yaw can inflate |r|; horizontal component is filtered separately */
@@ -1654,7 +1718,7 @@ esp_err_t gesture_detect_calibrate_axes(uint32_t duration_ms)
 
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
-        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        bool got_fresh = mpu_drain_latest(q, 3);
         if (got_fresh) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs < W_MIN) {
@@ -1884,7 +1948,13 @@ esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms)
     ESP_LOGI(TAG, "calibrating tilt for %u ms — do a few slow LEFT and RIGHT tilts...",
              (unsigned)duration_ms);
 
-    const uint32_t period_ms = 20;
+    /* 确保 DMP FIFO 输出在 GD_DMP_RATE_HZ，匹配 period_ms。 */
+    mpu_set_sample_rate(GD_DMP_RATE_HZ);
+    dmp_set_fifo_rate(GD_DMP_RATE_HZ);
+    mpu_reset_fifo();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    const uint32_t period_ms = 30;  /* 匹配 GD_DMP_RATE_HZ = 33 Hz */
     const uint32_t ticks     = duration_ms / period_ms;
     if (ticks < 5) {
         return ESP_ERR_INVALID_ARG;
@@ -1939,7 +2009,7 @@ esp_err_t gesture_detect_calibrate_tilt(uint32_t duration_ms)
     s_gd.calibrating = true;
     for (uint32_t i = 0; i < ticks; i++) {
         float q[4];
-        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
+        bool got_fresh = mpu_drain_latest(q, 3);
         if (got_fresh) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs < W_MIN) {
@@ -2056,18 +2126,33 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
 
     ESP_LOGI(TAG, "calibrating REST for %u ms...", (unsigned)duration_ms);
 
-    const uint32_t period_ms = 20;
+    const uint32_t period_ms = 30;  /* 匹配 GD_DMP_RATE_HZ = 33 Hz */
     const uint32_t ticks = duration_ms / period_ms;
     const float W_MIN = 0.05f;
+
+    /* 降低 DMP FIFO 输出频率匹配校准读取速率。
+     * 单改 mpu_set_sample_rate 只控制传感器采样率，FIFO 仍以 100Hz 输出
+     * → 校准器 50Hz 读取 vs 100Hz FIFO → 积压 → 溢出 → 跳变。
+     * 必须同时设置 dmp_set_fifo_rate 才能真正降低 FIFO 输出速率。 */
+    unsigned short orig_rate = 0;
+    mpu_get_sample_rate(&orig_rate);
+    mpu_set_sample_rate(GD_DMP_RATE_HZ);
+    dmp_set_fifo_rate(GD_DMP_RATE_HZ);
+    mpu_reset_fifo();
+    vTaskDelay(pdMS_TO_TICKS(50));  /* 等待新速率生效 */
 
     float q_sum[4] = {0};
     uint32_t count = 0;
     s_gd.calibrating = true;
 
     for (uint32_t i = 0; i < ticks; i++) {
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+        /* 直接读一包。校准在 core 1 无 BLE 竞争，FIFO 积压恒定
+         * ~2 包不会溢出。drain(N) 每次 I2C 读 ~10ms，N=5 就 50ms，
+         * 导致每帧都触发 GAP 阈值。单包读 ~10ms，总迭代 ~30ms，
+         * 不触发 GAP。 */
         float q[4];
-        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
-        if (got_fresh) {
+        if (mpu_drain_latest(q, 3)) {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs >= W_MIN) {
                 if (count > 0) {
@@ -2080,9 +2165,11 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
                 count++;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(period_ms));
     }
     s_gd.calibrating = false;
+    /* 保持 DMP 在 GD_DMP_RATE_HZ，不做 orig_rate 恢复。
+     * 检测器也期望这个速率，避免校准→检测之间的速率跳变。 */
+    mpu_reset_fifo();
 
     if (count < 3) {
         ESP_LOGE(TAG, "rest cal: too few samples (%u)", (unsigned)count);
@@ -2133,26 +2220,36 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
     static const char *names[] = { "?", "NOD", "LOOK_UP", "TILT_LEFT", "TILT_RIGHT" };
     ESP_LOGI(TAG, "calibrating gesture %s for %u ms...", names[type], (unsigned)duration_ms);
 
-    const uint32_t period_ms = 20;
+    const uint32_t period_ms = 30;  /* 匹配 GD_DMP_RATE_HZ = 33 Hz */
     const uint32_t ticks     = duration_ms / period_ms;
     const uint32_t rest_ticks = ticks / 3;
     const uint32_t gesture_ticks = ticks - rest_ticks;
     const float W_MIN = 0.05f;
 
+    /* 降低 DMP FIFO 输出频率匹配校准读取速率，消除 FIFO 溢出。
+     * 必须同时设置 dmp_set_fifo_rate 才能真正降低 FIFO 输出速率。 */
+    unsigned short orig_rate = 0;
+    mpu_get_sample_rate(&orig_rate);
+    mpu_set_sample_rate(GD_DMP_RATE_HZ);
+    dmp_set_fifo_rate(GD_DMP_RATE_HZ);
+    mpu_reset_fifo();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     float q_rest[4] = {0};
     uint32_t rest_count = 0;
 
-    if (s_cal_rest_valid) {
-        q_rest[0] = s_cal_rest_q[0]; q_rest[1] = s_cal_rest_q[1];
-        q_rest[2] = s_cal_rest_q[2]; q_rest[3] = s_cal_rest_q[3];
-        rest_count = 999;
-        ESP_LOGI(TAG, "gesture cal %s: using pre-captured rest", names[type]);
-    } else {
+    /* Always capture a fresh rest quaternion immediately before gesture
+     * capture.  Using a pre-captured rest (from calibrate_rest minutes
+     * earlier) lets DMP drift accumulate as a large initial mag offset.
+     * A short 5-frame average (~150 ms) is enough to smooth noise while
+     * keeping the rest–gesture time gap minimal. */
+    {
+        const uint32_t fresh_rest_ticks = 5;
         s_gd.calibrating = true;
-        for (uint32_t i = 0; i < rest_ticks; i++) {
+        for (uint32_t i = 0; i < fresh_rest_ticks; i++) {
+            vTaskDelay(pdMS_TO_TICKS(period_ms));
             float q[4];
-            bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
-            if (got_fresh) {
+            if (mpu_drain_latest(q, 3)) {
                 float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
                 if (w_abs >= W_MIN) {
                     if (rest_count > 0) {
@@ -2165,23 +2262,28 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                     rest_count++;
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(period_ms));
         }
         s_gd.calibrating = false;
         if (rest_count < 3) {
             ESP_LOGE(TAG, "gesture cal %s: too few rest samples (%u)", names[type], (unsigned)rest_count);
+            mpu_reset_fifo();
             return ESP_FAIL;
         }
         float rn = sqrtf(q_rest[0]*q_rest[0] + q_rest[1]*q_rest[1] +
                          q_rest[2]*q_rest[2] + q_rest[3]*q_rest[3]);
         q_rest[0] /= rn; q_rest[1] /= rn; q_rest[2] /= rn; q_rest[3] /= rn;
+        ESP_LOGI(TAG, "gesture cal %s: fresh rest (%u samples) q=[%.3f %.3f %.3f %.3f]",
+                 names[type], (unsigned)rest_count,
+                 q_rest[0], q_rest[1], q_rest[2], q_rest[3]);
     }
 
     float q_rest_conj[4]; quat_conj(q_rest, q_rest_conj);
     float best_mag = 0.0f;
     float best_vel = 0.0f;
     uint32_t gesture_count = 0;
-    uint32_t gesture_ticks_count = (rest_count >= 999) ? ticks : gesture_ticks;
+    /* Rest was captured separately above (5 frames), so gesture gets the
+     * full tick budget. */
+    uint32_t gesture_ticks_count = ticks;
 
     float all_r[120][3];
     float all_mag[120];
@@ -2206,25 +2308,78 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
 
     s_gd.calibrating = true;
     for (uint32_t i = 0; i < gesture_ticks_count && n_frames < 120; i++) {
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+        uint32_t tick_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+        /* ---- DIAG: read FIFO count before drain ---- */
+        unsigned short fifo_cnt = 0;
+        {
+            unsigned char tmp[2] = {0, 0};
+            /* Read MPU6050 FIFO_COUNT_H/L (0x72-0x73) before drain.
+             *   fifo_cnt=0 + drain fails = DMP not producing data
+             *   fifo_cnt>0 + drain fails = I2C read error (corrupt data)
+             *   fifo_cnt>0 + drain ok   = normal */
+            MPU_Read_Len(0x72, tmp, 2);
+            fifo_cnt = ((unsigned short)tmp[0] << 8) | tmp[1];
+        }
+
         float q[4];
-        /* Drain FIFO: read up to 30 packets, keep the last (most recent).
-         * Cap at 30 to avoid infinite loop (DMP at 100 Hz ≈ 10 ms/pkt). */
-        bool got_fresh = (mpu_dmp_get_quat(&q[0], &q[1], &q[2], &q[3]) == 0);
-        if (got_fresh) {
+        bool drain_ok = mpu_drain_latest(q, 3);
+
+        /* ---- DIAG: raw accel tilt for quaternion cross-check ----
+         * Read accel registers (0x3B-0x3D, 6 bytes) to compute gravity
+         * tilt angle independently of DMP quaternion.
+         * If accel_tilt ≈ mag → quaternion is correct.
+         * If accel_tilt << mag → DMP quaternion is drifting/wrong. */
+        float accel_tilt = -1.0f;  /* -1 = read failed */
+        {
+            short accel_raw[3] = {0, 0, 0};
+            if (mpu_get_accel_reg(accel_raw, NULL) == 0) {
+                /* accel_raw is in raw LSB.  With FSR=±2g, sensitivity=16384 LSB/g.
+                 * Convert to g, then compute tilt from vertical: */
+                float ax = (float)accel_raw[0] / 16384.0f;
+                float ay = (float)accel_raw[1] / 16384.0f;
+                float az = (float)accel_raw[2] / 16384.0f;
+                /* tilt = angle between gravity vector and sensor Z axis */
+                float g_xy = sqrtf(ax*ax + ay*ay);
+                accel_tilt = atan2f(g_xy, az) * 57.29578f;
+            }
+        }
+
+        /* ---- DIAG: log raw quaternion + FIFO count every frame ---- */
+        if (drain_ok) {
+            float qnorm = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+            ESP_LOGI(TAG, "DIAG f=%u tick=%u fifo=%d q=%+.4f,%+.4f,%+.4f,%+.4f "
+                     "qn=%.4f at=%.1f ok=1",
+                     (unsigned)n_frames, (unsigned)tick_ms, (int)fifo_cnt,
+                     q[0], q[1], q[2], q[3], qnorm, accel_tilt);
+        } else {
+            ESP_LOGI(TAG, "DIAG f=%u tick=%u fifo=%d at=%.1f ok=0",
+                     (unsigned)n_frames, (unsigned)tick_ms, (int)fifo_cnt,
+                     accel_tilt);
+        }
+
+        if (!drain_ok) {
+            continue;
+        }
+
+        {
             float w_abs = (q[0] < 0.0f) ? -q[0] : q[0];
             if (w_abs >= W_MIN) {
                 float qrel[4]; quat_mul(q_rest_conj, q, qrel); quat_normalize(qrel);
                 float r[3]; quat_to_rotvec_deg(qrel, r);
                 float mag = v3_norm(r);
-                /* Skip frames beyond 90 degrees — quaternion wrap artifacts
-                 * cause sudden jumps (e.g. 13° → 146°) that corrupt the
-                 * velocity and axis statistics. */
-                if (mag > 90.0f) {
+                /* Skip frames beyond 160 degrees — quat_to_rotvec_deg has
+                 * a singularity at 180° (sin(angle/2) → 0).  At 160° the
+                 * rotation vector is still numerically stable.  The old 90°
+                 * threshold was too aggressive: normal nodding can reach
+                 * 80-90° from rest, causing ALL peak frames to be discarded
+                 * and creating artificial "GAPs" in the output. */
+                if (mag > 160.0f) {
                     gesture_count++;
                     skip_count++;
                     prev_qcal_valid = false;  /* reset velocity chain across skip */
-                    vTaskDelay(pdMS_TO_TICKS(period_ms));
-                    continue;
+                    continue;   /* delay already done at top of loop */
                 }
                 /* Compute velocity BEFORE recording this frame.
                  * TWO methods computed and logged for comparison:
@@ -2240,7 +2395,7 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                  * differential to 1000+°/s.  Such frames are marked as
                  * gap-frames and their velocity is not used for best_vel
                  * or PCA. */
-                const float GAP_THRESHOLD_S = 0.050f;  /* >2.5× period_ms */
+                const float GAP_THRESHOLD_S = 0.065f;  /* ~1.3× actual dt (50ms body + UART) */
                 float vel_old = 0.0f;
                 float vel_new = 0.0f;
                 bool is_gap_frame = false;
@@ -2335,9 +2490,10 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(period_ms));
-    }
+    }   /* delay is at top of loop */
     s_gd.calibrating = false;
+    /* 保持 DMP 在 GD_DMP_RATE_HZ，不做 orig_rate 恢复。 */
+    mpu_reset_fifo();
     ESP_LOGI(TAG, "CAL-%s DONE frames=%u skipped=%u best_mag=%.1f "
              "best_vold=%.0f best_vnew=%.0f",
              names[type], (unsigned)n_frames, (unsigned)skip_count,

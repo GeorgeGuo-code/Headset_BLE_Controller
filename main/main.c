@@ -1179,7 +1179,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ble_console_init(on_console_cmd));  /* app_id 0x0055 */
     ESP_ERROR_CHECK(ble_stack_start(BLE_DEVICE_NAME));
 
-    xTaskCreate(cal_worker_task,  "cal_worker",  8192, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(cal_worker_task, "cal_worker", 8192, NULL, 3, NULL, 1);
     xTaskCreate(boot_button_task, "boot_button", 4096, NULL, 3, NULL);
 
     /* 5. UART REPL — HID smoke tests without a BLE central. Started last so

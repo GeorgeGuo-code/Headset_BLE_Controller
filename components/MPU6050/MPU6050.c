@@ -106,7 +106,10 @@ void I2C_Init()
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = MPU_ADDR,      /*!< 7-bit address; the driver appends R/W itself */
-        .scl_speed_hz    = 40000,         /*!< 40 kHz, same as legacy config */
+        .scl_speed_hz    = 400000,        /*!< 400 kHz — MPU6050 supports Fast Mode.
+                                                 40 kHz took ~7ms per FIFO read (28 B),
+                                                 starving the 10 ms detector tick.
+                                                 400 kHz cuts this to ~0.7 ms. */
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_mpu_dev));
 }

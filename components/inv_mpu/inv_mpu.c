@@ -26,6 +26,7 @@
 #include "inv_mpu_dmp_motion_driver.h"
 #include "MPU6050.h"
 #include "freertos/task.h"
+#include "esp_log.h"
 
 #define MPU6050							//定义我们使用的传感器为MPU6050
 #define MOTION_DRIVER_TARGET_MSP430		//定义驱动部分,采用MSP430的驱动(移植到STM32F1)
@@ -2964,6 +2965,90 @@ unsigned short inv_row_2_scale(const signed char *row)
         b = 7;      // error
     return b;
 }
+/* ---- Auto-detect chip mounting orientation from accelerometer ----
+ *
+ * When the headset is in its natural rest position (user looking straight
+ * ahead), read the accelerometer and figure out which chip axis points
+ * upward.  Then rebuild the DMP orientation matrix so the DMP's body-Z
+ * (up) aligns with true gravity.
+ *
+ * All six possible orientations (+/-X, +/-Y, +/-Z = up) produce a
+ * proper rotation matrix (det = +1).
+ *
+ * Call once after mpu_dmp_init() succeeds and before any calibration.
+ * The headset must be roughly level (user looking straight ahead).
+ * Returns 0 on success, non-zero on I2C / DMP error.
+ */
+int mpu_dmp_auto_orient(void)
+{
+    short accel_raw[3];
+    if (mpu_get_accel_reg(accel_raw, NULL))
+        return -1;
+
+    /* accel_raw is in LSB (±2 g FSR → ±16384 LSB).  Only sign + relative
+     * magnitude matter — no need to convert to g. */
+    float ax = (float)accel_raw[0];
+    float ay = (float)accel_raw[1];
+    float az = (float)accel_raw[2];
+    float absx = fabsf(ax), absy = fabsf(ay), absz = fabsf(az);
+
+    /* Each row of the matrix maps one body axis to chip frame.
+     * Row 0 = body X, Row 1 = body Y, Row 2 = body Z (up).
+     * Exactly one element per row is ±1, the rest are 0.             */
+    signed char mtx[9] = {0};
+
+    if (absz >= absx && absy <= absz) {
+        /* Chip-Z most aligned with gravity */
+        if (az > 0) {
+            /* +Z up → identity */
+            mtx[0]= 1; mtx[1]= 0; mtx[2]= 0;
+            mtx[3]= 0; mtx[4]= 1; mtx[5]= 0;
+            mtx[6]= 0; mtx[7]= 0; mtx[8]= 1;
+        } else {
+            /* −Z up → rotate 180° around X */
+            mtx[0]= 1; mtx[1]= 0; mtx[2]= 0;
+            mtx[3]= 0; mtx[4]=-1; mtx[5]= 0;
+            mtx[6]= 0; mtx[7]= 0; mtx[8]=-1;
+        }
+    } else if (absx >= absy) {
+        /* Chip-X most aligned with gravity */
+        if (ax > 0) {
+            /* +X up */
+            mtx[0]= 0; mtx[1]= 1; mtx[2]= 0;   /* body X = chip Y */
+            mtx[3]= 0; mtx[4]= 0; mtx[5]= 1;   /* body Y = chip Z */
+            mtx[6]= 1; mtx[7]= 0; mtx[8]= 0;   /* body Z = chip X */
+        } else {
+            /* −X up */
+            mtx[0]= 0; mtx[1]= 1; mtx[2]= 0;   /* body X = chip Y  */
+            mtx[3]= 0; mtx[4]= 0; mtx[5]=-1;   /* body Y = −chip Z */
+            mtx[6]=-1; mtx[7]= 0; mtx[8]= 0;   /* body Z = −chip X */
+        }
+    } else {
+        /* Chip-Y most aligned with gravity */
+        if (ay > 0) {
+            /* +Y up */
+            mtx[0]= 0; mtx[1]= 0; mtx[2]= 1;   /* body X = chip Z */
+            mtx[3]= 1; mtx[4]= 0; mtx[5]= 0;   /* body Y = chip X */
+            mtx[6]= 0; mtx[7]= 1; mtx[8]= 0;   /* body Z = chip Y */
+        } else {
+            /* −Y up */
+            mtx[0]= 0; mtx[1]= 0; mtx[2]=-1;   /* body X = −chip Z */
+            mtx[3]= 1; mtx[4]= 0; mtx[5]= 0;   /* body Y =  chip X */
+            mtx[6]= 0; mtx[7]=-1; mtx[8]= 0;   /* body Z = −chip Y */
+        }
+    }
+
+    unsigned short orient = inv_orientation_matrix_to_scalar(mtx);
+    int rc = dmp_set_orientation(orient);
+    if (rc) return rc;
+
+    mpu_reset_fifo();
+
+    ESP_LOGI("MPU", "auto_orient: accel=[%.0f, %.0f, %.0f] → orient=0x%03X",
+             ax, ay, az, orient);
+    return 0;
+}
+
 //空函数,未用到.
 void mget_ms(unsigned long *time)
 {
@@ -2977,6 +3062,26 @@ uint8_t mpu_dmp_init(void)
 	uint8_t res=0;
 	if(MPU_Init() == 0)	//初始化MPU6050
 	{
+		/* MPU_Init() writes hardware registers directly (FSR, rate, etc.)
+		 * but does NOT update the inv_mpu driver's cached chip_cfg.
+		 * Sync the cache now so that mpu_get_gyro_sens() / mpu_get_accel_sens()
+		 * return correct values — without this, run_self_test() scales
+		 * the gyro/accel bias by UNINITIALIZED (garbage) sensitivity,
+		 * producing completely wrong bias values written to the DMP. */
+		ESP_LOGI("MPU", "chip_cfg BEFORE sync: gyro_fsr=%d accel_fsr=%d accel_half=%d",
+		         st.chip_cfg.gyro_fsr, st.chip_cfg.accel_fsr, st.chip_cfg.accel_half);
+		st.chip_cfg.gyro_fsr  = INV_FSR_2000DPS;  /* MPU_Init sets ±2000°/s */
+		st.chip_cfg.accel_fsr = INV_FSR_2G;       /* MPU_Init sets ±2g */
+		st.chip_cfg.accel_half = 0;  /* assume rev2 (full sensitivity);
+		                       rev1 parts are rare; detect later if needed */
+		float _gsens; unsigned short _asens;
+		mpu_get_gyro_sens(&_gsens);
+		mpu_get_accel_sens(&_asens);
+		ESP_LOGI("MPU", "chip_cfg AFTER  sync: gyro_fsr=%d accel_fsr=%d accel_half=%d "
+		         "→ gyro_sens=%.1f accel_sens=%u",
+		         st.chip_cfg.gyro_fsr, st.chip_cfg.accel_fsr, st.chip_cfg.accel_half,
+		         _gsens, _asens);
+
 		res=mpu_set_sensors(INV_XYZ_GYRO|INV_XYZ_ACCEL);//设置所需要的传感器
 		if(res)return 1;
 		res=mpu_configure_fifo(INV_XYZ_GYRO|INV_XYZ_ACCEL);//设置FIFO
@@ -2985,16 +3090,24 @@ uint8_t mpu_dmp_init(void)
 		if(res)return 3;
 		res=dmp_load_motion_driver_firmware();		//加载dmp固件
 		if(res)return 4;
-		res=dmp_set_orientation(inv_orientation_matrix_to_scalar(gyro_orientation));//设置陀螺仪方向
-		if(res)return 5;
+		/* Auto-detect chip mounting orientation from accelerometer.
+		 * Must happen AFTER firmware load (DMP memory accessible) and
+		 * BEFORE self-test / DMP enable so the DMP never runs with the
+		 * wrong body-frame mapping.  Falls back to hard-coded identity
+		 * if the accel read fails. */
+		if (mpu_dmp_auto_orient() != 0) {
+			res = dmp_set_orientation(inv_orientation_matrix_to_scalar(gyro_orientation));
+			if(res)return 5;
+		}
 		res=dmp_enable_feature(DMP_FEATURE_6X_LP_QUAT|DMP_FEATURE_TAP|	//设置dmp功能
 		    DMP_FEATURE_ANDROID_ORIENT|DMP_FEATURE_SEND_RAW_ACCEL|DMP_FEATURE_SEND_CAL_GYRO|
 		    DMP_FEATURE_GYRO_CAL);
 		if(res)return 6;
 		res=dmp_set_fifo_rate(DEFAULT_MPU_HZ);	//设置DMP输出速率(最大不超过200Hz)
 		if(res)return 7;
-		res=run_self_test();		//自检
-		if(res)return 8;
+		res=run_self_test();		//自检 (非致命：芯片垂直时自检会失败，偏置由 DMP GYRO_CAL 后续校正)
+		if(res) ESP_LOGW("MPU", "self-test failed (code %u) — gyro/accel bias uncalibrated, "
+		                       "DMP GYRO_CAL will correct over time", (unsigned)res);
 		res=mpu_set_dmp_state(1);	//使能DMP
 		if(res)return 9;
 	}else return 10;

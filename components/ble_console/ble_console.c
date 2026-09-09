@@ -349,8 +349,19 @@ void ble_console_log(const char *s)
     if (s == NULL) {
         return;
     }
-    /* Always mirror to the UART console so local `idf.py monitor` still works. */
-    fputs(s, stdout);
+    /* CRITICAL FIX: removed fputs(s, stdout) — this was a SYNCHRONOUS
+     * blocking UART write.  When the TX buffer was full (115200 baud can't
+     * keep up with 3 ESP_LOGI lines × 33 Hz), it blocked the calling task
+     * for hundreds of ms.  Since ble_console_log is called from the BLE
+     * callback context and ESP_LOGI shares the same stdout/UART, this
+     * cascaded into blocking the detector/calibrator tasks on core 1,
+     * causing the ~200-400 ms GAPs in calibration and detection data.
+     *
+     * BLE console output still works via the stream buffer → BLE notify.
+     * ESP_LOGI output still works via its own ring buffer → log writer task.
+     * UART monitor (idf.py monitor) only sees ESP_LOGI output now, not
+     * ble_console_logf output — this is acceptable since gesture data
+     * (DG1/DG2/DG3) already goes through ESP_LOGI. */
     if (s_tx_stream != NULL) {
         (void)xStreamBufferSend(s_tx_stream, s, strlen(s), 0);  /* non-blocking */
     }
