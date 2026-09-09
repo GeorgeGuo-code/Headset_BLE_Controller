@@ -53,6 +53,20 @@ static const char *TAG = "gesture_detect";
 #define GD_DBGW(...) do {} while(0)
 #endif
 
+/* 1 = log detection pipeline diagnostics on state transitions.
+ * Fires on gap frames, velocity gating, accumulation state changes,
+ * q_drift snaps, and fire attempts.  Minimal UART overhead — not
+ * every frame.  Set to 0 for production builds. */
+#define GD_DEBUG_DETECT      1
+
+#if GD_DEBUG_DETECT
+#define GD_DIAGI(fmt, ...) do { if (!s_dc_active) ESP_LOGI(TAG, fmt, ##__VA_ARGS__); } while(0)
+#define GD_DIAGW(fmt, ...) do { if (!s_dc_active) ESP_LOGW(TAG, fmt, ##__VA_ARGS__); } while(0)
+#else
+#define GD_DIAGI(...) do {} while(0)
+#define GD_DIAGW(...) do {} while(0)
+#endif
+
 /* ===== Accumulation-based detection thresholds ============================ */
 #define TRIG_VEL_FRAC     0.35f  /*!< trigger velocity = peak × this fraction */
 #define END_VEL_FRAC      0.20f  /*!< end velocity = peak × this fraction */
@@ -758,16 +772,55 @@ static void detector_task(void *arg)
         }
 
         float qcur[4];
+
+        /* ---- DIAG: read FIFO count before drain ----
+         * Shows how many packets are pending — detects backlog that
+         * causes stale data.  At 33 Hz DMP, fifo_cnt > 3 means the
+         * detector is falling behind (>90 ms of packets queued).
+         * fifo_cnt > 10 means max_read=10 can't clear the backlog. */
+        unsigned short fifo_cnt = 0;
+        {
+            unsigned char tmp[2] = {0, 0};
+            MPU_Read_Len(0x72, tmp, 2);
+            fifo_cnt = ((unsigned short)tmp[0] << 8) | tmp[1];
+        }
+
         /* Drain-latest: read pending FIFO packets, keep only the newest.
          * At 400 kHz I2C each packet takes ~0.7 ms.
          * 33 Hz DMP + ~30 ms tick → typically 1 packet (0.7 ms overhead).
          * If detector falls behind briefly, 2-3 packets accumulate
          * (1.4-2.1 ms extra) — still well within the 30 ms budget.
-         * max_read=3 caps worst-case drain at ~2.1 ms (7% of budget). */
-        if (!mpu_drain_latest(qcur, 3)) {
-            /* FIFO empty — skip this tick */
+         * max_read=10 handles BLE preemption gaps up to ~300 ms
+         * (10 packets at 33 Hz = 300 ms) without stale-frame bleed.
+         *
+         * INLINE VERSION: counts packets consumed for diagnostics.
+         * If fifo_cnt > 0 but drain_count == 0, the I2C read is
+         * failing — a critical diagnostic for understanding why the
+         * FIFO stays full despite the drain running. */
+        int drain_count = 0;
+        {
+            float q_tmp[4];
+            for (int di = 0; di < 10; di++) {
+                if (mpu_dmp_get_quat(&q_tmp[0], &q_tmp[1],
+                                     &q_tmp[2], &q_tmp[3]) != 0) {
+                    break;
+                }
+                memcpy(qcur, q_tmp, sizeof(q_tmp));
+                drain_count++;
+            }
+        }
+        if (drain_count == 0) {
+            /* FIFO empty OR I2C failure — skip this tick */
             vTaskDelayUntil(&last, pdMS_TO_TICKS(GD_TASK_PERIOD_MS));
             continue;
+        }
+        if (fifo_cnt > 100 && drain_count < 3) {
+            /* Backlog exists but drain consumed few packets —
+             * likely I2C stall or DMP not producing data.
+             * Note: fifo_cnt is in BYTES (28 B per DMP packet). */
+            GD_DIAGI("DIAG-DRAIN-STALL fifo=%uB(~%.1fpk) consumed=%u",
+                     (unsigned)fifo_cnt, (float)fifo_cnt / 28.0f,
+                     drain_count);
         }
 
         uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
@@ -775,15 +828,39 @@ static void detector_task(void *arg)
         /* Compute actual dt from previous frame.  DMP FIFO misses cause
          * irregular frame gaps (30-100ms); using fixed GD_TASK_PERIOD_MS
          * inflates velocity and breaks glitch detection. */
-        float dt_s = 0.01f;  /* fallback for first frame */
+        float dt_s = 0.01f;       /* fallback for first frame */
+        float dt_raw_ms = 10.0f;  /* unclamped dt in ms for diagnostics */
         bool is_gap_frame = false;
         if (prev_ms > 0 && now_ms > prev_ms) {
-            dt_s = (float)(now_ms - prev_ms) / 1000.0f;
+            dt_raw_ms = (float)(now_ms - prev_ms);
+            dt_s = dt_raw_ms / 1000.0f;
             if (dt_s < 0.001f) dt_s = 0.001f;  /* clamp min */
             if (dt_s > 0.200f) dt_s = 0.200f;  /* clamp max */
             if (dt_s > 0.050f) is_gap_frame = true;  /* BLE preemption gap */
         }
         prev_ms = now_ms;
+
+        /* ---- DIAG: gap and backlog detection ----
+         * Gap frame: detector was blocked >50 ms (BLE preemption).
+         * Backlog: FIFO has >100 bytes (~3.5 packets at 28 B/pkt),
+         * meaning the detector is falling behind.  Note: FIFO_COUNT
+         * register is in BYTES (not packets).  1024-byte FIFO.
+         * Backlog is rate-limited to every 100th occurrence to avoid
+         * flooding the log (at 30 Hz this would be ~3 lines/sec). */
+        static uint32_t s_backlog_count = 0;
+        if (is_gap_frame) {
+            GD_DIAGI("DIAG-GAP dt=%.0fms fifo=%uB",
+                     dt_raw_ms, (unsigned)fifo_cnt);
+        } else if (fifo_cnt > 100) {
+            s_backlog_count++;
+            if (s_backlog_count % 100 == 1) {
+                GD_DIAGI("DIAG-BACKLOG fifo=%uB dt=%.0fms "
+                         "~%.1fpkts (every 100th, total=%u)",
+                         (unsigned)fifo_cnt, dt_raw_ms,
+                         (float)fifo_cnt / 28.0f,
+                         (unsigned)s_backlog_count);
+            }
+        }
 
         /* Pull a stack-local aligned copy of the neutral pose so the
          * quaternion/vector helpers can take its members as float* without
@@ -912,6 +989,10 @@ static void detector_task(void *arg)
                 } else {
                     memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
                 }
+                GD_DIAGW("DIAG-RESYNC streak=%u r_vel=%.0f r_mag=%.1f "
+                         "fifo=%u dt=%.0fms",
+                         (unsigned)(s_glitch_streak + 1), r_vel, r_mag,
+                         (unsigned)fifo_cnt, dt_raw_ms);
                 s_glitch_streak = 0;
                 prev_valid = false;
                 GD_DBGW("DBG-RESYNC q_drift→qcur after %u stale frames "
@@ -967,6 +1048,20 @@ static void detector_task(void *arg)
         }
         memcpy(s_gd.prev_qcur, qcur, sizeof(s_gd.prev_qcur));
         s_gd.prev_qcur_valid = true;
+
+        /* ---- DIAG: velocity skip after gap ----
+         * When vel is 0 due to gap/prev_gap, the accumulation pipeline
+         * can't advance.  If s_had_high_vel is set, a gesture was in
+         * progress — the gap interrupted it and may prevent firing. */
+        if (vel == 0.0f && s_gd.prev_qcur_valid && s_had_high_vel) {
+            GD_DIAGI("DIAG-VSKIP gap=%d prev_gap=%d fifo=%u "
+                     "accum=[%+.1f,%+.1f,%+.1f] hold=%u",
+                     (int)is_gap_frame, (int)s_gd.prev_was_gap,
+                     (unsigned)fifo_cnt,
+                     s_gd.accum[0], s_gd.accum[1], s_gd.accum[2],
+                     (unsigned)s_end_hold);
+        }
+
         s_gd.prev_was_gap = is_gap_frame;
 
         /* OLD velocity: |Δr_mag|/dt (kept for diagnostic comparison) */
@@ -1003,7 +1098,12 @@ static void detector_task(void *arg)
              * same space.  Using cp (which is perpendicular to the
              * rotation axis) caused nod to be misclassified as tilt. */
             if (!s_gd.smooth_r_valid) {
-                s_gd.smooth_r[0] = r[0]; s_gd.smooth_r[1] = r[1]; s_gd.smooth_r[2] = r[2];
+                float sm = v3_norm(r);
+                if (sm > 0.001f) {
+                    s_gd.smooth_r[0] = r[0]/sm; s_gd.smooth_r[1] = r[1]/sm; s_gd.smooth_r[2] = r[2]/sm;
+                } else {
+                    s_gd.smooth_r[0] = 0.0f; s_gd.smooth_r[1] = 1.0f; s_gd.smooth_r[2] = 0.0f;
+                }
                 s_gd.smooth_r_valid = true;
             } else {
                 /* Flip r if it points opposite to smooth_r to avoid
@@ -1022,22 +1122,17 @@ static void detector_task(void *arg)
              * NOD/LOOK_UP share one axis (opposite directions).
              * TILT_LEFT/TILT_RIGHT share one axis (opposite directions).
              *
-             * Axis-purity weighting: the raw dot product with the PCA
-             * signature can be misleading when signatures overlap across
-             * axes (e.g. nod_axis has a Y component that aligns with
-             * tilt motions).  We weight each confidence by how much of
-             * the smooth_r's energy lies in the expected axis:
-             *   pitch gestures (NOD/LOOK_UP) → X component only
-             *   roll gestures (TILT_L/TILT_R) → Y+Z components only
-             * This ensures a purely vertical tilt motion (Y-dominant)
-             * cannot score high on the pitch axis, and vice versa. */
-            float sr_x = fabsf(s_gd.smooth_r[0]);
-            float sr_roll = sqrtf(s_gd.smooth_r[1]*s_gd.smooth_r[1]
-                                + s_gd.smooth_r[2]*s_gd.smooth_r[2]);
+             * Uses raw dot product with PCA signatures — the PCA axes
+             * already encode the correct gesture direction for the
+             * current chip orientation, so no additional axis-purity
+             * weighting is needed.  (Old code multiplied NOD by sr_x
+             * and TILT by sr_roll, which assumed NOD=X-axis and
+             * TILT=Y+Z — this broke detection when the chip mount
+             * put the nod axis on Y instead of X.) */
             float dn  = (s_gd.sig.calibrated & GESTURE_SIG_F_NOD)
-                ? fabsf(v3_dot(s_gd.smooth_r, sig_nod_a))   * sr_x    : 0.0f;
+                ? fabsf(v3_dot(s_gd.smooth_r, sig_nod_a))   : 0.0f;
             float dtl = (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL)
-                ? fabsf(v3_dot(s_gd.smooth_r, sig_tiltL_a)) * sr_roll : 0.0f;
+                ? fabsf(v3_dot(s_gd.smooth_r, sig_tiltL_a)) : 0.0f;
             /* Index 0=NOD 1=LOOK_UP 2=TILTL 3=TILTR
              * NOD and LOOK_UP share axis → same alignment confidence.
              * TILT_LEFT and TILT_RIGHT share axis → same alignment.
@@ -1104,52 +1199,44 @@ static void detector_task(void *arg)
                 s_dc_active = false;
                 ESP_LOGI(TAG, "data capture OFF");
             } else {
-                /* Compute qrel and qnotyaw for diagnostic output */
-                float qrel_diag[4];
-                quat_mul(qd_conj, qcur, qrel_diag);
-                quat_normalize(qrel_diag);
-
-                float r_raw[3];  /* r before yaw removal */
-                quat_to_rotvec_deg(qrel_diag, r_raw);
-                float r_raw_mag = v3_norm(r_raw);
-
                 float acc_mag = v3_norm(s_gd.accum);
-                float cp_mag  = v3_norm(s_cp_accum);
 
-                /* DG1: raw quaternions + rotation vector + velocities */
-                ESP_LOGI(TAG, "DG1 t=%u "
+                /* Single merged DG line to minimize UART time (~15ms vs ~40ms
+                 * for 3 separate lines).  Critical for keeping the detector
+                 * within the DMP 30 ms packet budget — 3 lines at 115200
+                 * baud caused FIFO clogging and 200 ms+ gaps.
+                 * DIAG fields (g,fc,ct,vh,dc) added for detection debugging:
+                 *   g  = gap frame (1) or normal (0)
+                 *   fc = FIFO count before drain (>3 = backlog, >10 = overflow)
+                 *   ct = consecutive frames above trigger velocity
+                 *   vh = had-high-velocity flag (accumulation armed)
+                 *   dc = packets consumed by drain (0 = I2C stall or empty) */
+                ESP_LOGI(TAG, "DG t=%u "
                          "q=%+.4f,%+.4f,%+.4f,%+.4f "
                          "d=%+.4f,%+.4f,%+.4f,%+.4f "
-                         "rr=%+.2f,%+.2f,%+.2f rrm=%.2f "
                          "r=%+.2f,%+.2f,%+.2f rm=%.2f "
-                         "vn=%.1f vo=%.1f",
+                         "sr=%+.3f,%+.3f,%+.3f "
+                         "c=%+.3f,%+.3f,%+.3f,%+.3f "
+                         "i=%d tv=%.1f ev=%.1f "
+                         "a=%+.1f,%+.1f,%+.1f am=%.1f "
+                         "ps=%.1f ts=%.1f h=%u vn=%.0f vo=%.0f "
+                         "g=%d fc=%u ct=%d vh=%d dc=%d",
                          (unsigned)now_ms,
                          qcur[0], qcur[1], qcur[2], qcur[3],
                          s_gd.q_drift[0], s_gd.q_drift[1],
                          s_gd.q_drift[2], s_gd.q_drift[3],
-                         r_raw[0], r_raw[1], r_raw[2], r_raw_mag,
                          r[0], r[1], r[2], r_mag,
-                         vel, vel_old);
-
-                /* DG2: yaw removal result + smooth_r + classification */
-                ESP_LOGI(TAG, "DG2 "
-                         "sr=%+.3f,%+.3f,%+.3f "
-                         "c=%+.3f,%+.3f,%+.3f,%+.3f "
-                         "i=%d tv=%.1f ev=%.1f",
                          s_gd.smooth_r[0], s_gd.smooth_r[1], s_gd.smooth_r[2],
                          s_gd.last_conf[0], s_gd.last_conf[1],
                          s_gd.last_conf[2], s_gd.last_conf[3],
-                         best_sig_idx, trigger_vel, end_vel);
-
-                /* DG3: accumulation (new r-based + old cp-based) + state */
-                ESP_LOGI(TAG, "DG3 "
-                         "a=%+.2f,%+.2f,%+.2f am=%.2f "
-                         "cp=%+.2f,%+.2f,%+.2f cpm=%.2f "
-                         "ps=%.2f ts=%.2f h=%u arm=%d",
+                         best_sig_idx, trigger_vel, end_vel,
                          s_gd.accum[0], s_gd.accum[1], s_gd.accum[2], acc_mag,
-                         s_cp_accum[0], s_cp_accum[1], s_cp_accum[2], cp_mag,
                          s_pitch_dot_sum, s_tilt_dot_sum,
-                         (unsigned)s_end_hold, (int)s_gd.accum_armed);
+                         (unsigned)s_end_hold,
+                         vel, vel_old,
+                         (int)is_gap_frame, (unsigned)fifo_cnt,
+                         (int)s_consec_above_trigger, (int)s_had_high_vel,
+                         drain_count);
             }
         }
 
@@ -1185,6 +1272,12 @@ static void detector_task(void *arg)
                 {
                     const int TRIG_ARM_FRAMES = 6;  /* 60 ms at 100 Hz */
                     if (s_consec_above_trigger >= TRIG_ARM_FRAMES) {
+                        if (!s_had_high_vel) {
+                            GD_DIAGI("DIAG-HVEL-ARM consec=%d vel=%.1f "
+                                     "trig=%.1f sig=%d",
+                                     (int)s_consec_above_trigger, vel,
+                                     trigger_vel, best_sig_idx);
+                        }
                         s_had_high_vel = true;
                     }
                 }
@@ -1241,6 +1334,15 @@ static void detector_task(void *arg)
                      * axis_dominance — those used cross-product space which
                      * is perpendicular to the rotation-vector signatures. */
                     s_end_hold++;
+                    if (s_end_hold == 1) {
+                        GD_DIAGI("DIAG-ENDHOLD vel=%.1f < end=%.1f "
+                                 "sig=%d r_mag=%.1f hv=%d "
+                                 "accum=[%+.1f,%+.1f,%+.1f]",
+                                 vel, end_vel, best_sig_idx, r_mag,
+                                 (int)s_had_high_vel,
+                                 s_gd.accum[0], s_gd.accum[1],
+                                 s_gd.accum[2]);
+                    }
                     if (s_end_hold >= END_HOLD_FRAMES) {
                         /* Guard: don't fire if the raw rotation vector r_mag
                          * (in degrees) is too small — the head has returned
@@ -1250,6 +1352,10 @@ static void detector_task(void *arg)
                         if (r_mag < MIN_FIRE_R_MAG) {
                             /* Head at neutral — don't fire, but don't reset
                              * all state either; the gesture motion was real. */
+                            GD_DIAGI("DIAG-FIRE-BLOCKED-R r=%.1f < MIN=%.1f "
+                                     "hold=%u vel=%.1f",
+                                     r_mag, MIN_FIRE_R_MAG,
+                                     (unsigned)s_end_hold, vel);
                             s_end_hold = 0;
                         } else if (now_ms >= s_gd.cooldown_until_ms) {
                             static const gesture_type_t sig_gt[] = {
@@ -1339,6 +1445,11 @@ static void detector_task(void *arg)
                             memset(s_cp_accum, 0, sizeof(s_cp_accum));
                         } else {
                             /* Cooldown active — just reset hold counter. */
+                            GD_DIAGI("DIAG-FIRE-BLOCKED-COOL "
+                                     "remaining=%.0fms r=%.1f "
+                                     "hold=%u vel=%.1f",
+                                     (float)(s_gd.cooldown_until_ms - now_ms),
+                                     r_mag, (unsigned)s_end_hold, vel);
                             s_end_hold = 0;
                         }
                     }
@@ -1372,10 +1483,21 @@ static void detector_task(void *arg)
          * seconds of holding the head still. */
         bool drift_frozen = mouse_mode_is_active();
 
+        /* ---- DIAG: q_drift snap tracking ----
+         * Log when q_drift is updated via still-snap so we can see
+         * why it does/doesn't track佩戴微调.  Also log the conditions
+         * that prevent snapping (drift_frozen, proj_still, vel_still). */
+        if (drift_frozen && (proj_still || vel_still)) {
+            GD_DIAGI("DIAG-DRIFT-FROZEN proj_still=%d vel_still=%d "
+                     "r=%.1f vel=%.1f",
+                     (int)proj_still, (int)vel_still, r_mag, vel);
+        }
+
         if (!drift_frozen && proj_still) {
             if (s_gd.still_since_ms == 0) {
                 s_gd.still_since_ms = now_ms;
             } else if ((now_ms - s_gd.still_since_ms) >= STILL_DURATION_MS) {
+                uint32_t still_dur = now_ms - s_gd.still_since_ms;
                 float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
                           qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
                 if (d < 0.0f) {
@@ -1387,6 +1509,10 @@ static void detector_task(void *arg)
                 constrain_q_drift(&s_gd, &np);
                 s_gd.still_since_ms = now_ms;
                 s_vel_still_since = 0;
+                GD_DIAGI("DIAG-DRIFT-SNAP proj r=%.1f vel=%.1f "
+                         "still=%ums fifo=%u",
+                         r_mag, vel, (unsigned)still_dur,
+                         (unsigned)fifo_cnt);
             }
         } else {
             s_gd.still_since_ms = 0;
@@ -1396,6 +1522,7 @@ static void detector_task(void *arg)
             if (s_vel_still_since == 0) {
                 s_vel_still_since = now_ms;
             } else if ((now_ms - s_vel_still_since) >= 120) {
+                uint32_t still_dur = now_ms - s_vel_still_since;
                 float d = qcur[0]*s_gd.q_drift[0] + qcur[1]*s_gd.q_drift[1] +
                           qcur[2]*s_gd.q_drift[2] + qcur[3]*s_gd.q_drift[3];
                 if (d < 0.0f) {
@@ -1406,6 +1533,10 @@ static void detector_task(void *arg)
                 }
                 constrain_q_drift(&s_gd, &np);
                 s_vel_still_since = now_ms;
+                GD_DIAGI("DIAG-DRIFT-SNAP vel r=%.1f vel=%.1f "
+                         "still=%ums fifo=%u",
+                         r_mag, vel, (unsigned)still_dur,
+                         (unsigned)fifo_cnt);
             }
         } else if (!vel_still) {
             s_vel_still_since = 0;
@@ -1495,12 +1626,14 @@ void gesture_detect_start_capture(uint32_t duration_ms)
     ESP_LOGI(TAG, "data capture ON for %u ms — perform gestures now",
              (unsigned)duration_ms);
     /* Print field legend so the log can be parsed offline. */
-    ESP_LOGI(TAG, "DG-LEGEND DG1: t=<ms> q=<qw,qx,qy,qz> d=<qdrift> "
-             "rr=<r_raw> rrm=<|r_raw|> r=<r_noyaw> rm=<|r|> vn=<vel_new> vo=<vel_old>");
-    ESP_LOGI(TAG, "DG-LEGEND DG2: sr=<smooth_r> c=<conf_N,conf_L,conf_TL,conf_TR> "
-             "i=<best_idx> tv=<trigger_vel> ev=<end_vel>");
-    ESP_LOGI(TAG, "DG-LEGEND DG3: a=<accum_r> am=<|accum_r|> cp=<accum_cp> "
-             "cpm=<|accum_cp|> ps=<pitch_sum> ts=<tilt_sum> h=<end_hold> arm=<armed>");
+    ESP_LOGI(TAG, "DG-LEGEND DG: t=<ms> q=<qw,qx,qy,qz> d=<qdrift> "
+             "r=<r_noyaw> rm=<|r|> sr=<smooth_r> "
+             "c=<conf_N,conf_L,conf_TL,conf_TR> "
+             "i=<best_idx> tv=<trigger_vel> ev=<end_vel> "
+             "a=<accum_r> am=<|accum_r|> ps=<pitch_sum> ts=<tilt_sum> "
+             "h=<end_hold> vn=<vel_new> vo=<vel_old> "
+             "g=<gap> fc=<fifo_cnt> ct=<consec_trig> vh=<had_hvel> "
+             "dc=<drain_count>");
 }
 
 const gesture_sig_axes_t *gesture_detect_get_sig_axes(void)

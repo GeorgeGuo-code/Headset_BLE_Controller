@@ -1731,7 +1731,14 @@ int mpu_read_fifo(short *gyro, short *accel, unsigned long *timestamp,
     fifo_count = (data[0] << 8) | data[1];
     if (fifo_count < packet_size)
         return 0;
-    printf("FIFO count: %hd\n", fifo_count);
+    /* REMOVED: printf("FIFO count: %hd\n", fifo_count);
+     * This was a SYNCHRONOUS blocking UART write in the detector's hot path.
+     * During FIFO backlog (BLE preemption → packet accumulation → drain
+     * reads multiple packets), each printf blocked on UART TX, preventing
+     * the detector from draining the FIFO, causing MORE accumulation — a
+     * feedback loop that produced 600-1000ms GAPs in detection data.
+     * Calibration was unaffected because the FIFO never accumulated
+     * (calibrator reads at matching 33 Hz rate → 1 packet per drain). */
     if (fifo_count > (st.hw->max_fifo >> 1)) {
         /* FIFO is 50% full, better check overflow bit. */
         if (i2c_read(st.reg->int_status, data, 1))
