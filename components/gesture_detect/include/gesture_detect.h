@@ -173,6 +173,24 @@ typedef struct {
 
 const gesture_sig_axes_t *gesture_detect_get_sig_axes(void);
 
+/**
+ * @brief Enable or disable debug printing during calibration.
+ *
+ *        When enabled, the calibration functions print detailed per-frame
+ *        data (quaternions, rotation vectors, velocities, etc.) for
+ *        debugging.  When disabled, only final calibration results are
+ *        printed, reducing BLE/UART traffic.
+ *
+ * @param enable  true to enable debug printing, false to disable
+ */
+void gesture_detect_set_cal_debug(bool enable);
+
+/**
+ * @brief Get the current state of the calibration debug print flag.
+ * @return true if debug printing is enabled, false otherwise
+ */
+bool gesture_detect_get_cal_debug(void);
+
 #ifdef __cplusplus
 }
 #endif

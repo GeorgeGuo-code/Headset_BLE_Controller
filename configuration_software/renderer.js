@@ -888,7 +888,7 @@ function renderConfigs () {
         hint.textContent = '（点击右侧按钮添加）'
         trigField.appendChild(hint)
       } else {
-        for (const gid of cmd.triggers) {
+        cmd.triggers.forEach((gid, idx) => {
           const g = GESTURE_IDS.find((x) => x.id === gid)
           const tag = document.createElement('span')
           tag.className = 'cfg-tag'
@@ -897,12 +897,12 @@ function renderConfigs () {
           x.className = 'cfg-tag-x'
           x.textContent = ' ×'
           x.addEventListener('click', () => {
-            cmd.triggers = cmd.triggers.filter((t) => t !== gid)
+            cmd.triggers.splice(idx, 1)
             renderTrigTags()
           })
           tag.appendChild(x)
           trigField.appendChild(tag)
-        }
+        })
       }
     }
     renderTrigTags()
@@ -913,9 +913,7 @@ function renderConfigs () {
       const btn = document.createElement('button')
       btn.textContent = g.name
       btn.addEventListener('click', () => {
-        if (cmd.triggers.includes(g.id)) {
-          cmd.triggers = cmd.triggers.filter((t) => t !== g.id)
-        } else if (cmd.triggers.length < GESTURE_MAX) {
+        if (cmd.triggers.length < GESTURE_MAX) {
           cmd.triggers.push(g.id)
         } else {
           pushLog(`最多选择 ${GESTURE_MAX} 个手势`, 'err')
@@ -1548,6 +1546,27 @@ $('btn-cfg-save').addEventListener('click', saveConfigsToFile)
 $('btn-cfg-load').addEventListener('click', loadConfigsFromFile)
 $('btn-gesture-clear').addEventListener('click', clearGestures)
 
+/* ── 校准调试打印开关 ────────────────────────────────────────────────────── */
+
+let calDebugEnabled = false
+
+function renderDbgToggle () {
+  const btn = $('btn-dbg-toggle')
+  if (btn) {
+    btn.textContent = `打印数据: ${calDebugEnabled ? '开' : '关'}`
+    btn.classList.toggle('active', calDebugEnabled)
+  }
+}
+
+$('btn-dbg-toggle').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = calDebugEnabled ? 'dbg off' : 'dbg'
+  await sendCmd(cmd)
+  calDebugEnabled = !calDebugEnabled
+  renderDbgToggle()
+  pushLog(calDebugEnabled ? '校准调试打印已开启' : '校准调试打印已关闭', 'ok')
+})
+
 /* ── 触发难度设置 ────────────────────────────────────────────────────────── */
 
 $('btn-set-conf').addEventListener('click', async () => {
@@ -1629,6 +1648,7 @@ $('btn-mouse-speed-reset').addEventListener('click', async () => {
 renderGestures()
 renderParams()
 renderConfigs()
+renderDbgToggle()
 renderLog()
 setStatus('未连接', null)
 setConnected(false)

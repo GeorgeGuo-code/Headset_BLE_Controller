@@ -788,6 +788,17 @@ static void handle_command(const char *cmd)
         ESP_ERROR_CHECK(gesture_params_save_to_nvs(&params));
         ble_console_logf("sign_roll flipped -> positive_roll_is_right=%u\n",
                          (unsigned)(params.sign_roll == 1));
+    } else if (strcmp(cmd, "dbg") == 0 || strcmp(cmd, "dbg on") == 0) {
+        /* Enable calibration debug printing — per-frame data during
+         * cn/ctl/ctr calibration for offline analysis. */
+        gesture_detect_set_cal_debug(true);
+        ble_console_log("calibration debug: ON — per-frame data will be printed\n");
+    } else if (strcmp(cmd, "dbg off") == 0) {
+        gesture_detect_set_cal_debug(false);
+        ble_console_log("calibration debug: OFF — only final results printed\n");
+    } else if (strcmp(cmd, "dbg?") == 0) {
+        ble_console_logf("calibration debug: %s\n",
+                         gesture_detect_get_cal_debug() ? "ON" : "OFF");
     } else if (strcmp(cmd, "cd") == 0) {
         /* DEAD CODE: s_last_cap is never populated (calibrate_axes is dead).
          * The type gesture_detect_capture_t and get_last_capture are also
@@ -990,10 +1001,11 @@ static void handle_command(const char *cmd)
         }
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);
-        ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc\n");
+        ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc dbg\n");
         ble_console_log("  mouse    : mouse on|off|status|fourdir|dz|sens|acc|max|dwell\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
         ble_console_log("  configs : cmd list|get|set|del|run|fuzzy\n");
+        ble_console_log("  dbg     : dbg [on|off|?] — calibration debug printing\n");
 #ifdef ENABLE_SERIAL_TRIGGER
         ble_console_log("            command <id> (debug)\n");
 #endif

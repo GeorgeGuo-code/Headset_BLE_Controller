@@ -222,6 +222,12 @@ static float    s_cp_accum[3]   = {0.0f, 0.0f, 0.0f};
  * Skip every other frame to keep cursor speed unchanged. */
 static int      s_mouse_tick_div = 0;
 
+/* Calibration debug printing toggle.
+ * When false (default), only final calibration results are printed.
+ * When true, per-frame data (quaternions, rotation vectors, etc.)
+ * is printed during calibration for debugging. */
+static bool     s_cal_debug_enabled = false;
+
 /* ===== small math ======================================================== */
 
 static inline float absf(float v) { return v < 0.0f ? -v : v; }
@@ -1581,7 +1587,7 @@ static void detector_task(void *arg)
                 float roll_raw = apply_sign_roll(v3_dot(r, sig_tiltL_a),
                                                  s_gd.params.sign_roll);
                 /* Periodic toggle diagnostic: every 50 frames (~500 ms) */
-                {
+                if (s_cal_debug_enabled) {
                     static uint32_t s_tog_diag_cnt = 0;
                     if (++s_tog_diag_cnt >= 50) {
                         s_tog_diag_cnt = 0;
@@ -1623,7 +1629,7 @@ static void detector_task(void *arg)
             float roll_raw = apply_sign_roll(v3_dot(r, sig_tiltL_a),
                                              s_gd.params.sign_roll);
             /* Periodic toggle diagnostic (non-mouse-mode): every 50 frames */
-            {
+            if (s_cal_debug_enabled) {
                 static uint32_t s_tog_diag_cnt2 = 0;
                 if (++s_tog_diag_cnt2 >= 50) {
                     s_tog_diag_cnt2 = 0;
@@ -1702,6 +1708,17 @@ uint8_t gesture_detect_get_sign_pitch(void)
 uint8_t gesture_detect_get_sign_roll(void)
 {
     return s_gd.params.sign_roll;
+}
+
+void gesture_detect_set_cal_debug(bool enable)
+{
+    s_cal_debug_enabled = enable;
+    ESP_LOGI(TAG, "calibration debug %s", enable ? "ON" : "OFF");
+}
+
+bool gesture_detect_get_cal_debug(void)
+{
+    return s_cal_debug_enabled;
 }
 
 #if 0
@@ -2529,16 +2546,18 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
         }
 
         /* ---- DIAG: log raw quaternion + FIFO count every frame ---- */
-        if (drain_ok) {
-            float qnorm = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-            ESP_LOGI(TAG, "DIAG f=%u tick=%u fifo=%d q=%+.4f,%+.4f,%+.4f,%+.4f "
-                     "qn=%.4f at=%.1f ok=1",
-                     (unsigned)n_frames, (unsigned)tick_ms, (int)fifo_cnt,
-                     q[0], q[1], q[2], q[3], qnorm, accel_tilt);
-        } else {
-            ESP_LOGI(TAG, "DIAG f=%u tick=%u fifo=%d at=%.1f ok=0",
-                     (unsigned)n_frames, (unsigned)tick_ms, (int)fifo_cnt,
-                     accel_tilt);
+        if (s_cal_debug_enabled) {
+            if (drain_ok) {
+                float qnorm = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+                ESP_LOGI(TAG, "DIAG f=%u tick=%u fifo=%d q=%+.4f,%+.4f,%+.4f,%+.4f "
+                         "qn=%.4f at=%.1f ok=1",
+                         (unsigned)n_frames, (unsigned)tick_ms, (int)fifo_cnt,
+                         q[0], q[1], q[2], q[3], qnorm, accel_tilt);
+            } else {
+                ESP_LOGI(TAG, "DIAG f=%u tick=%u fifo=%d at=%.1f ok=0",
+                         (unsigned)n_frames, (unsigned)tick_ms, (int)fifo_cnt,
+                         accel_tilt);
+            }
         }
 
         if (!drain_ok) {
@@ -2613,27 +2632,32 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
                 }
                 best_vel = best_vel_new;  /* downstream code uses best_vel */
 
-                ESP_LOGI(TAG, "CAL-%s f=%u mag=%.1f vold=%.0f vnew=%.0f "
-                         "best_vold=%.0f best_vnew=%.0f dt=%.3f%s",
-                         names[type], (unsigned)n_frames, mag,
-                         vel_old, vel_new,
-                         best_vel_old, best_vel_new,
-                         (prev_frame_tick > 0)
-                           ? (float)(now_tick - prev_frame_tick) * portTICK_PERIOD_MS / 1000.0f
-                           : 0.0f,
-                         is_gap_frame ? " GAP" : "");
-                /* Raw quaternion log: output every 10th frame to trace
-                 * the full computation chain (q → qrel → r → mag).
-                 * Users can verify: angle(qrel) == mag? */
-                if (n_frames % 10 == 0) {
-                    ESP_LOGI(TAG, "CAL-%s RAW f=%u q=[%.4f %.4f %.4f %.4f] "
-                             "qr=[%.4f %.4f %.4f %.4f] r=[%.1f %.1f %.1f] "
-                             "qang=%.1f",
-                             names[type], (unsigned)n_frames,
-                             q[0], q[1], q[2], q[3],
-                             qrel[0], qrel[1], qrel[2], qrel[3],
-                             r[0], r[1], r[2],
-                             quat_angle_deg(qrel));
+                /* Debug printing: gated by s_cal_debug_enabled flag.
+                 * Only prints per-frame data when explicitly enabled
+                 * via the 'dbg' command, reducing BLE/UART traffic. */
+                if (s_cal_debug_enabled) {
+                    ESP_LOGI(TAG, "CAL-%s f=%u mag=%.1f vold=%.0f vnew=%.0f "
+                             "best_vold=%.0f best_vnew=%.0f dt=%.3f%s",
+                             names[type], (unsigned)n_frames, mag,
+                             vel_old, vel_new,
+                             best_vel_old, best_vel_new,
+                             (prev_frame_tick > 0)
+                               ? (float)(now_tick - prev_frame_tick) * portTICK_PERIOD_MS / 1000.0f
+                               : 0.0f,
+                             is_gap_frame ? " GAP" : "");
+                    /* Raw quaternion log: output every 10th frame to trace
+                     * the full computation chain (q → qrel → r → mag).
+                     * Users can verify: angle(qrel) == mag? */
+                    if (n_frames % 10 == 0) {
+                        ESP_LOGI(TAG, "CAL-%s RAW f=%u q=[%.4f %.4f %.4f %.4f] "
+                                 "qr=[%.4f %.4f %.4f %.4f] r=[%.1f %.1f %.1f] "
+                                 "qang=%.1f",
+                                 names[type], (unsigned)n_frames,
+                                 q[0], q[1], q[2], q[3],
+                                 qrel[0], qrel[1], qrel[2], qrel[3],
+                                 r[0], r[1], r[2],
+                                 quat_angle_deg(qrel));
+                    }
                 }
 
                 all_r[n_frames][0] = r[0];
