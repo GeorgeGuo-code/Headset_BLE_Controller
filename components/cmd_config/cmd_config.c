@@ -33,6 +33,17 @@ static SemaphoreHandle_t s_mutex;
 /* Per-config cooldown tracking (not persisted — reset on reboot). */
 static uint32_t s_last_fire_ms[CMD_CFG_MAX];
 
+/* Per-config gesture-fulfillment accumulator.
+ * Each bit in fulfilled_mask corresponds to a gesture_type_t bit that has
+ * been individually satisfied by a past gesture event.  When all bits
+ * required by trigger_value are set, the config fires and the mask resets.
+ * Fulfilled_ms tracks the timestamp of the last fulfillment update —
+ * if it exceeds GESTURE_FULFILL_WINDOW_MS, the mask is cleared (stale). */
+static uint16_t s_fulfilled_mask[CMD_CFG_MAX];
+static uint32_t s_fulfilled_ms[CMD_CFG_MAX];
+
+#define GESTURE_FULFILL_WINDOW_MS  5000   /* 5 s window to accumulate gestures */
+
 /* ── NVS helpers ────────────────────────────────────────────────────────── */
 
 static esp_err_t nvs_cfg_key(uint8_t id, char *buf, size_t buf_size)
@@ -166,6 +177,16 @@ esp_err_t cmd_config_parse_seq(const char *text, hid_seq_step_t *steps, size_t *
             steps[n].u.move.dx = (int8_t)dx;
             steps[n].u.move.dy = (int8_t)dy;
             n++;
+        } else if (tlen == 6 && strncmp(tok, "scroll", 6) == 0) {
+            long clicks;
+            if (spi(te, end, &clicks) == NULL ||
+                clicks < -128 || clicks > 127) {
+                ESP_LOGW(TAG, "parse: bad scroll arg");
+                return ESP_ERR_INVALID_ARG;
+            }
+            steps[n].kind          = HID_SEQ_SCROLL;
+            steps[n].u.scroll.clicks = (int8_t)clicks;
+            n++;
         } else {
             ESP_LOGW(TAG, "parse: unknown step '%.*s'", (int)tlen, tok);
             return ESP_ERR_INVALID_ARG;
@@ -213,6 +234,10 @@ esp_err_t cmd_config_format_seq(const cmd_config_t *cfg, char *out, size_t out_s
         case HID_SEQ_MOVE:
             snprintf(buf, sizeof(buf), "move %d %d",
                      (int)s->u.move.dx, (int)s->u.move.dy);
+            break;
+        case HID_SEQ_SCROLL:
+            snprintf(buf, sizeof(buf), "scroll %d",
+                     (int)s->u.scroll.clicks);
             break;
         default:
             snprintf(buf, sizeof(buf), "?");
@@ -410,53 +435,83 @@ void cmd_config_execute_by_trigger(cmd_trigger_type_t type, uint16_t value,
         const char *match_reason = NULL;
 
         if (type == TRIGGER_GESTURE && conf) {
-            /* ── Multi-confidence matching ─────────────────────────────
+            /* ── Multi-gesture accumulator matching ──────────────────────
              *
-             * For each gesture bit in trigger_value, check if its
-             * confidence >= min_confidence.  If ANY gesture passes,
-             * the config fires.  This is the "threshold" model:
+             * A config with trigger_value = NOD | TILT_LEFT requires BOTH
+             * gestures to be individually confirmed across separate events:
              *
-             *   conf = [0.7, 0.82, 0.85, 0.7]
-             *   trigger_value = NOD | TILT_LEFT  (bits 0+2 = 0x05)
-             *   min_confidence = 80
+             *   Event 1: GESTURE_NOD, conf=[NOD=0.91, TL=0.45]
+             *     → NOD confidence 0.91 >= 50 → set NOD bit in fulfilled
+             *     → TL confidence not checked (event is NOD, not TL)
+             *     → fulfilled=0x02 (NOD only) → not all bits → no fire
              *
-             *   → NOD:   conf[0]=0.70 < 80 → no
-             *   → TILT_LEFT: conf[2]=0.85 >= 80 → YES, fire
+             *   Event 2: GESTURE_TILT_LEFT, conf=[NOD=0.20, TL=0.89]
+             *     → TL confidence 0.89 >= 50 → set TL bit in fulfilled
+             *     → fulfilled=0x0A (NOD|TL) → all bits → FIRE
              *
-             * The old fallback_value mechanism is removed — the multi-
-             * confidence model replaces it cleanly.
+             * Single gesture_type_t events only satisfy their own type,
+             * even if other confidences are also above threshold.
              */
             static const char *glabels[] = { "NOD", "LOOK_UP", "TILT_LEFT", "TILT_RIGHT" };
-            for (int g = 0; g < 4; g++) {
-                uint16_t bit = (1 << (g + 1));  /* gesture_type_t: NOD=1 → bit1, etc. */
-                if (!(cfg->trigger_value & bit)) continue;
+            uint8_t eff_conf = cfg->min_confidence > 0
+                               ? cfg->min_confidence
+                               : CMD_CFG_DEFAULT_MIN_CONFIDENCE;
 
-                float c = conf[g];
-                bool gate = (cfg->min_confidence == 0 ||
-                             (c * 100.0f) >= (float)cfg->min_confidence);
+            /* Map gesture_type_t value (1=NOD..4=TILT_RIGHT) to bit position
+             * matching trigger_value layout (bit1=NOD, bit2=LOOK_UP, ...). */
+            uint16_t event_bit = (1 << value);  /* e.g. GESTURE_NOD=1 → bit1 */
+            uint16_t required  = cfg->trigger_value;
 
-                ESP_LOGD(TAG, "  cfg_%u: check %s conf=%.2f gate=%d",
-                         (unsigned)cfg->id, glabels[g], c, (int)gate);
+            /* Only the event's own gesture type is checked — not all conf[] */
+            if (value >= 1 && value <= 4 && (required & event_bit)) {
+                float c = conf[value - 1];  /* conf[] is 0-indexed: [0]=NOD */
+                bool gate = ((c * 100.0f) >= (float)eff_conf);
+
+                ESP_LOGD(TAG, "  cfg_%u: event=%s conf=%.2f gate=%d eff_conf=%u",
+                         (unsigned)cfg->id, glabels[value - 1], c, (int)gate,
+                         (unsigned)eff_conf);
 
                 if (gate) {
-                    match = true;
-                    match_reason = glabels[g];
-                    break;  /* first qualifying gesture wins */
+                    /* Check / update fulfillment accumulator */
+                    int idx = i;  /* config slot index */
+                    uint32_t now_ms_f = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+                    /* Reset if window expired */
+                    if (s_fulfilled_ms[idx] > 0 &&
+                        (now_ms_f - s_fulfilled_ms[idx]) > GESTURE_FULFILL_WINDOW_MS) {
+                        s_fulfilled_mask[idx] = 0;
+                    }
+
+                    s_fulfilled_mask[idx] |= event_bit;
+                    s_fulfilled_ms[idx] = now_ms_f;
+
+                    ESP_LOGD(TAG, "  cfg_%u: fulfilled=0x%02x required=0x%02x",
+                             (unsigned)cfg->id,
+                             (unsigned)s_fulfilled_mask[idx],
+                             (unsigned)required);
+
+                    if ((s_fulfilled_mask[idx] & required) == required) {
+                        match = true;
+                        match_reason = "all gestures fulfilled";
+                        s_fulfilled_mask[idx] = 0;  /* reset after fire */
+                    }
                 }
             }
             if (!match) {
-                /* Log why none qualified */
+                /* Log which gestures are still unfulfilled */
+                int idx = i;
+                uint16_t missing = cfg->trigger_value & ~s_fulfilled_mask[idx];
                 char buf[80];
                 int pos = 0;
                 for (int g = 0; g < 4; g++) {
                     uint16_t bit = (1 << (g + 1));
-                    if (!(cfg->trigger_value & bit)) continue;
-                    pos += snprintf(buf + pos, sizeof(buf) - pos,
-                                    "%s=%.0f%% ", glabels[g], conf[g] * 100.0f);
+                    if (!(missing & bit)) continue;
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s ", glabels[g]);
                 }
-                ESP_LOGD(TAG, "  cfg_%u '%s': no gesture above %u%% (%s)",
+                ESP_LOGD(TAG, "  cfg_%u '%s': not all gestures fulfilled "
+                         "(fulfilled=0x%02x missing=[%s])",
                          (unsigned)cfg->id, cfg->name,
-                         (unsigned)cfg->min_confidence, buf);
+                         (unsigned)s_fulfilled_mask[idx], buf);
             }
         } else {
             match = (cfg->trigger_value == value);

@@ -680,12 +680,7 @@ static void handle_command(const char *cmd)
         ble_console_log("calibrating REST (keep your head STILL, 2s)...\n");
         esp_err_t err = gesture_detect_calibrate_rest(2000);
         if (err == ESP_OK) {
-            const gesture_sig_axes_t *axes = gesture_detect_get_sig_axes();
-            if (axes) {
-                ble_console_log("REST calibration: OK — signatures loaded, detection ENABLED\n");
-            } else {
-                ble_console_log("REST calibration: OK — no saved signatures, run cn/ctl/ctr\n");
-            }
+            ble_console_log("REST calibration: OK — now run cn/ctl/ctr to calibrate gestures\n");
         } else {
             ble_console_logf("REST calibration: %s\n", esp_err_to_name(err));
         }
@@ -693,29 +688,14 @@ static void handle_command(const char *cmd)
         ble_console_log("calibrating NOD (do a slow chin-down nod)...\n");
         esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_NOD, 4000);
         ble_console_logf("NOD calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-        if (err == ESP_OK) {
-            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
-            ble_console_logf("  nod_axis=[%.3f %.3f %.3f]\n",
-                             sig.sig_nod[0], sig.sig_nod[1], sig.sig_nod[2]);
-        }
     } else if (strcmp(cmd, "ctl") == 0) {
         ble_console_log("calibrating TILT_LEFT (do a slow left tilt)...\n");
         esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_LEFT, 4000);
         ble_console_logf("TILT_LEFT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-        if (err == ESP_OK) {
-            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
-            ble_console_logf("  tiltL_axis=[%.3f %.3f %.3f]\n",
-                             sig.sig_tiltL[0], sig.sig_tiltL[1], sig.sig_tiltL[2]);
-        }
     } else if (strcmp(cmd, "ctr") == 0) {
         ble_console_log("calibrating TILT_RIGHT (do a slow right tilt)...\n");
         esp_err_t err = gesture_detect_calibrate_gesture(GESTURE_TILT_RIGHT, 4000);
         ble_console_logf("TILT_RIGHT calibration: %s\n", err == ESP_OK ? "OK" : esp_err_to_name(err));
-        if (err == ESP_OK) {
-            gesture_signatures_t sig; gesture_signatures_load_from_nvs(&sig);
-            ble_console_logf("  tiltR_axis=[%.3f %.3f %.3f]\n",
-                             sig.sig_tiltR[0], sig.sig_tiltR[1], sig.sig_tiltR[2]);
-        }
     } else if (strcmp(cmd, "p") == 0) {
         const gesture_params_t *p = gesture_detect_get_params();
         ble_console_logf("params: trigger=%.1f vel=%.1f zone=%.1f debounce=%u "
@@ -808,6 +788,17 @@ static void handle_command(const char *cmd)
         ESP_ERROR_CHECK(gesture_params_save_to_nvs(&params));
         ble_console_logf("sign_roll flipped -> positive_roll_is_right=%u\n",
                          (unsigned)(params.sign_roll == 1));
+    } else if (strcmp(cmd, "dbg") == 0 || strcmp(cmd, "dbg on") == 0) {
+        /* Enable calibration debug printing — per-frame data during
+         * cn/ctl/ctr calibration for offline analysis. */
+        gesture_detect_set_cal_debug(true);
+        ble_console_log("calibration debug: ON — per-frame data will be printed\n");
+    } else if (strcmp(cmd, "dbg off") == 0) {
+        gesture_detect_set_cal_debug(false);
+        ble_console_log("calibration debug: OFF — only final results printed\n");
+    } else if (strcmp(cmd, "dbg?") == 0) {
+        ble_console_logf("calibration debug: %s\n",
+                         gesture_detect_get_cal_debug() ? "ON" : "OFF");
     } else if (strcmp(cmd, "cd") == 0) {
         /* DEAD CODE: s_last_cap is never populated (calibrate_axes is dead).
          * The type gesture_detect_capture_t and get_last_capture are also
@@ -849,6 +840,12 @@ static void handle_command(const char *cmd)
             ble_console_log("mouse: toggle detection ENABLED\n");
             ble_console_log("  trigger: left tilt + right tilt + touch held\n");
         } else if (strcmp(p, "off") == 0) {
+            /* If mouse mode is currently active, deactivate it first.
+             * Otherwise the cursor keeps moving after toggle detection
+             * is disabled. */
+            if (mouse_mode_is_active()) {
+                mouse_mode_deactivate();
+            }
             mouse_mode_set_enabled(false);
             ble_console_log("mouse: toggle detection DISABLED\n");
         } else if (strcmp(p, "status") == 0) {
@@ -856,17 +853,35 @@ static void handle_command(const char *cmd)
             bool enabled = mouse_mode_is_enabled();
             const mouse_mode_params_t *mp = mouse_mode_get_params();
             /* Machine-parseable line for the config tool */
-            ble_console_logf("mouse_mode: enabled=%d active=%d dz=%.1f ref=%.1f "
-                             "max=%.0f dwell=%u\n",
-                             (int)enabled, (int)active, mp->dead_zone_deg,
+            ble_console_logf("mouse_mode: enabled=%d active=%d fourdir=%d "
+                             "dz=%.1f ref=%.1f max=%.0f dwell=%u "
+                             "speed_mult=%.2f flip_x=%d flip_y=%d\n",
+                             (int)enabled, (int)active,
+                             (int)mouse_mode_is_four_dir(),
+                             mp->dead_zone_deg,
                              mp->speed_ref_deg, mp->max_speed,
-                             (unsigned)mp->dwell_ms);
+                             (unsigned)mp->dwell_ms,
+                             mp->speed_multiplier,
+                             (int)mp->flip_x, (int)mp->flip_y);
             /* Human-readable */
-            ble_console_logf("mouse: enabled=%d active=%d dz=%.1f ref=%.1f "
-                             "max=%.0f dwell=%u ms\n",
-                             (int)enabled, (int)active, mp->dead_zone_deg,
+            ble_console_logf("mouse: enabled=%d active=%d fourdir=%d "
+                             "dz=%.1f ref=%.1f max=%.0f dwell=%u ms "
+                             "speed_mult=%.2f flip_x=%d flip_y=%d\n",
+                             (int)enabled, (int)active,
+                             (int)mouse_mode_is_four_dir(),
+                             mp->dead_zone_deg,
                              mp->speed_ref_deg, mp->max_speed,
-                             (unsigned)mp->dwell_ms);
+                             (unsigned)mp->dwell_ms,
+                             mp->speed_multiplier,
+                             (int)mp->flip_x, (int)mp->flip_y);
+        } else if (strcmp(p, "fourdir on") == 0 ||
+                   strcmp(p, "fourdir 1") == 0) {
+            mouse_mode_set_four_dir(true);
+            ble_console_logf("mouse: four-dir mode ENABLED\n");
+        } else if (strcmp(p, "fourdir off") == 0 ||
+                   strcmp(p, "fourdir 0") == 0) {
+            mouse_mode_set_four_dir(false);
+            ble_console_logf("mouse: four-dir mode DISABLED\n");
         } else if (strncmp(p, "dz", 2) == 0 && (p[2] == '\0' || p[2] == ' ')) {
             const char *q = p + 2;
             while (*q == ' ') q++;
@@ -921,19 +936,76 @@ static void handle_command(const char *cmd)
                 mouse_mode_set_params(&mp);
                 ble_console_logf("mouse dwell -> %u ms\n", (unsigned)mp.dwell_ms);
             }
+        } else if (strncmp(p, "speed", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            char *endp;
+            float val = strtof(q, &endp);
+            if (endp == q || val < 0.05f || val > 4.0f) {
+                ble_console_log("mouse speed: 0.05..4.0 (multiplier, default 1.0)\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.speed_multiplier = val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse speed -> %.2f\n", mp.speed_multiplier);
+            }
+        } else if (strncmp(p, "flipx", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            if (strcmp(q, "on") == 0 || strcmp(q, "1") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_x = true;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_x -> ON\n");
+            } else if (strcmp(q, "off") == 0 || strcmp(q, "0") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_x = false;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_x -> OFF\n");
+            } else {
+                /* Toggle */
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_x = !mp.flip_x;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse flip_x -> %s\n", mp.flip_x ? "ON" : "OFF");
+            }
+        } else if (strncmp(p, "flipy", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            if (strcmp(q, "on") == 0 || strcmp(q, "1") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_y = true;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_y -> ON\n");
+            } else if (strcmp(q, "off") == 0 || strcmp(q, "0") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_y = false;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_y -> OFF\n");
+            } else {
+                /* Toggle */
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_y = !mp.flip_y;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse flip_y -> %s\n", mp.flip_y ? "ON" : "OFF");
+            }
         } else {
-            ble_console_log("mouse: on|off|status|dz|ref|max|dwell\n");
-            ble_console_log("  dz <°/f>     velocity dead zone (0.1..10, default 0.3)\n");
-            ble_console_log("  ref <°/f>    velocity for max speed (0.5..20, default 3.0)\n");
-            ble_console_log("  max <px>     max speed (5..127, default 60)\n");
-            ble_console_log("  dwell <ms>   0=immediate, >0=dwell (default 0)\n");
+            ble_console_log("mouse: on|off|status|fourdir|dz|ref|max|dwell|speed|flipx|flipy\n");
+            ble_console_log("  dz <°/f>      velocity dead zone (0.1..10, default 2.0)\n");
+            ble_console_log("  ref <°/f>     velocity for max speed (0.5..20, default 8.0)\n");
+            ble_console_log("  max <px>      max speed (5..127, default 60)\n");
+            ble_console_log("  dwell <ms>    0=immediate, >0=dwell (default 0)\n");
+            ble_console_log("  speed <mult>  speed multiplier (0.05..4.0, default 1.0)\n");
+            ble_console_log("  flipx [on|off] flip horizontal direction\n");
+            ble_console_log("  flipy [on|off] flip vertical direction\n");
         }
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);
-        ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc\n");
-        ble_console_log("  mouse    : mouse on|off|status|dz|sens|acc|max|dwell\n");
+        ble_console_log("  gestures: cr cn ctl ctr p q 'q reset' sp sr dc dbg\n");
+        ble_console_log("  mouse    : mouse on|off|status|fourdir|dz|sens|acc|max|dwell\n");
         ble_console_log("  hid     : hs | ac <code> | ak <mods> <key> | o [path] | seq <steps>\n");
         ble_console_log("  configs : cmd list|get|set|del|run|fuzzy\n");
+        ble_console_log("  dbg     : dbg [on|off|?] — calibration debug printing\n");
 #ifdef ENABLE_SERIAL_TRIGGER
         ble_console_log("            command <id> (debug)\n");
 #endif
@@ -1181,7 +1253,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ble_console_init(on_console_cmd));  /* app_id 0x0055 */
     ESP_ERROR_CHECK(ble_stack_start(BLE_DEVICE_NAME));
 
-    xTaskCreate(cal_worker_task,  "cal_worker",  8192, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(cal_worker_task, "cal_worker", 8192, NULL, 3, NULL, 1);
     xTaskCreate(boot_button_task, "boot_button", 4096, NULL, 3, NULL);
 
     /* 5. UART REPL — HID smoke tests without a BLE central. Started last so

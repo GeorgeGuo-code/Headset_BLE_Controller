@@ -132,6 +132,10 @@ unsigned short inv_row_2_scale(const signed char *row);
 unsigned short inv_orientation_matrix_to_scalar(const signed char *mtx);
 uint8_t run_self_test(void);
 uint8_t mpu_dmp_init(void);
+/* Auto-detect chip mounting orientation from accelerometer. Call once after
+ * mpu_dmp_init() with the headset in its natural rest position (looking
+ * straight ahead). Returns 0 on success. */
+int mpu_dmp_auto_orient(void);
 uint8_t mpu_dmp_get_data(float *pitch,float *roll,float *yaw);
 /* Read one DMP FIFO packet and return the normalized body->world quaternion
  * (w,x,y,z). Return codes match mpu_dmp_get_data: 0=ok, 1=FIFO empty/error,

@@ -211,7 +211,7 @@ function trackCalibration (line) {
     const step = stepMap[gestName] || 2
     markStep(step, 'done')
     const label = GESTURE_LABEL[gestName] || gestName
-    finishCal(true, `${label} 校准完成 (peak=${m[3]}°)`)
+    finishCal(true, `${label} 校准完成 (peak=${m[3]}°) — 检测已优化`)
     sendCmd('p', true)
     return
   }
@@ -224,7 +224,7 @@ function trackCalibration (line) {
     const step = stepMap[gestName] || 2
     markStep(step, 'done')
     const label = GESTURE_LABEL[gestName] || gestName
-    finishCal(true, `${label} 校准完成`)
+    finishCal(true, `${label} 校准完成 — 检测已优化`)
     sendCmd('p', true)
     return
   }
@@ -261,8 +261,18 @@ function trackCalibration (line) {
     const step = stepMap[gestName] || 1
     markStep(step, ok ? 'done' : 'fail')
     const label = GESTURE_LABEL[gestName] || gestName
-    finishCal(ok, ok ? `${label} 校准完成` : `${label} 校准失败：${m[2]}`)
+    let msg = ok ? `${label} 校准完成` : `${label} 校准失败：${m[2]}`
+    if (ok && gestName === 'REST') {
+      msg = '静止校准完成 — 检测已开启'
+    }
+    finishCal(ok, msg)
     if (ok) sendCmd('p', true)   // 成功后自动回读参数
+    return
+  }
+
+  /* Default signatures created message */
+  if (/default signatures created/i.test(line)) {
+    finishCal(true, '静止校准完成 — 检测已开启（基础模式）')
     return
   }
 
@@ -768,6 +778,13 @@ function stepDesc (s) {
       return `按键 ${mods.length ? mods.join('+') + '+' : ''}${kname}`
     }
     case 'type': return `输入 "${s.text}"`
+    case 'click': {
+      const names = { 1: '左键', 2: '右键', 4: '中键' }
+      return `鼠标${names[s.button] || '?'}`
+    }
+    case 'scroll': {
+      return `滚轮 ${s.clicks > 0 ? '↑' : '↓'}`
+    }
     default: return '?'
   }
 }
@@ -777,6 +794,8 @@ function stepToSeqText (s) {
     case 'sleep': return `sleep ${s.ms}`
     case 'key': return `key ${s.mod} ${s.kc}`
     case 'type': return `type ${s.text}`
+    case 'click': return `click ${s.button}`
+    case 'scroll': return `scroll ${s.clicks}`
     default: return ''
   }
 }
@@ -879,7 +898,7 @@ function renderConfigs () {
         hint.textContent = '（点击右侧按钮添加）'
         trigField.appendChild(hint)
       } else {
-        for (const gid of cmd.triggers) {
+        cmd.triggers.forEach((gid, idx) => {
           const g = GESTURE_IDS.find((x) => x.id === gid)
           const tag = document.createElement('span')
           tag.className = 'cfg-tag'
@@ -888,12 +907,12 @@ function renderConfigs () {
           x.className = 'cfg-tag-x'
           x.textContent = ' ×'
           x.addEventListener('click', () => {
-            cmd.triggers = cmd.triggers.filter((t) => t !== gid)
+            cmd.triggers.splice(idx, 1)
             renderTrigTags()
           })
           tag.appendChild(x)
           trigField.appendChild(tag)
-        }
+        })
       }
     }
     renderTrigTags()
@@ -904,9 +923,7 @@ function renderConfigs () {
       const btn = document.createElement('button')
       btn.textContent = g.name
       btn.addEventListener('click', () => {
-        if (cmd.triggers.includes(g.id)) {
-          cmd.triggers = cmd.triggers.filter((t) => t !== g.id)
-        } else if (cmd.triggers.length < GESTURE_MAX) {
+        if (cmd.triggers.length < GESTURE_MAX) {
           cmd.triggers.push(g.id)
         } else {
           pushLog(`最多选择 ${GESTURE_MAX} 个手势`, 'err')
@@ -948,7 +965,11 @@ function renderConfigs () {
     btnSleep.textContent = '⏱ 等待'
     btnSleep.addEventListener('click', () => addSleep(cmd))
 
-    addBar.append(btnRun, btnKey, btnSleep)
+    const btnUrl = document.createElement('button')
+    btnUrl.textContent = '🔗 打开网址'
+    btnUrl.addEventListener('click', () => addOpenUrl(cmd))
+
+    addBar.append(btnRun, btnKey, btnSleep, btnUrl)
     targetField.append(stepsList, addBar)
     row3.append(targetLabel, targetField)
 
@@ -1047,6 +1068,47 @@ $('sleep-input').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeSleepDialog()
 })
 
+/* ── 打开网址对话框 ─────────────────────────────────────────────────────── */
+
+let urlDialogTarget = null
+
+function addOpenUrl (cmd) {
+  urlDialogTarget = cmd
+  $('url-input').value = ''
+  $('url-dialog').classList.remove('hidden')
+  $('url-input').focus()
+}
+
+function closeUrlDialog () {
+  $('url-dialog').classList.add('hidden')
+  urlDialogTarget = null
+}
+
+function confirmUrlDialog () {
+  if (!urlDialogTarget) return
+  const url = $('url-input').value.trim()
+  if (!url) { pushLog('请输入网址', 'err'); return }
+  if (!urlDialogTarget.steps) urlDialogTarget.steps = []
+  urlDialogTarget.steps.push(
+    { kind: 'key', mod: 8, kc: 21 },       // Win+R
+    { kind: 'sleep', ms: 350 },
+    { kind: 'type', text: url },
+    { kind: 'key', mod: 0, kc: 40 }        // Enter
+  )
+  closeUrlDialog()
+  renderConfigs()
+}
+
+$('url-dialog-ok').addEventListener('click', confirmUrlDialog)
+$('url-dialog-cancel').addEventListener('click', closeUrlDialog)
+$('url-dialog').addEventListener('click', (e) => {
+  if (e.target === $('url-dialog')) closeUrlDialog()
+})
+$('url-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') confirmUrlDialog()
+  if (e.key === 'Escape') closeUrlDialog()
+})
+
 /* ── 新建配置 ────────────────────────────────────────────────────────────── */
 
 function addNewConfig () {
@@ -1078,33 +1140,41 @@ function addNewCommand () {
 let keyDialogTarget = null
 let keyDialogKeys = {}
 let keyDialogLastCombo = null  /* 松开按键后保存的最终组合 */
+let keyDialogMousePending = null  /* 鼠标事件临时存储（无需等待松开） */
 
 function openKeyDialog (cmd) {
   keyDialogTarget = cmd
   keyDialogKeys = {}
   keyDialogLastCombo = null
-  $('key-status').textContent = '请按下键盘按键…'
+  keyDialogMousePending = null
+  $('key-status').textContent = '请按下键盘按键或鼠标按钮…'
   $('key-status').classList.remove('dialog-status-warn')
   $('key-result').classList.add('hidden')
   $('key-dialog-ok').disabled = true
   $('key-dialog').classList.remove('hidden')
   document.addEventListener('keydown', onKeyDialogDown)
   document.addEventListener('keyup', onKeyDialogUp)
+  document.addEventListener('mousedown', onKeyDialogMouseDown)
+  document.addEventListener('wheel', onKeyDialogWheel, { passive: false })
 }
 
 function closeKeyDialog () {
   $('key-dialog').classList.add('hidden')
   document.removeEventListener('keydown', onKeyDialogDown)
   document.removeEventListener('keyup', onKeyDialogUp)
+  document.removeEventListener('mousedown', onKeyDialogMouseDown)
+  document.removeEventListener('wheel', onKeyDialogWheel)
   keyDialogTarget = null
   keyDialogKeys = {}
   keyDialogLastCombo = null
+  keyDialogMousePending = null
 }
 
 function onKeyDialogDown (e) {
   e.preventDefault()
   e.stopPropagation()
   keyDialogKeys[e.code] = e
+  keyDialogMousePending = null
   updateKeyDisplay()
 }
 
@@ -1112,10 +1182,48 @@ function onKeyDialogUp (e) {
   e.preventDefault()
   e.stopPropagation()
   delete keyDialogKeys[e.code]
-  if (Object.keys(keyDialogKeys).length === 0) {
+  if (Object.keys(keyDialogKeys).length === 0 && !keyDialogMousePending) {
     /* keyDialogLastCombo 已由 updateKeyDisplay 在按下时保存 */
     $('key-dialog-ok').disabled = false
   }
+}
+
+const MOUSE_BTN_LABEL = { 0: '鼠标左键', 2: '鼠标右键', 1: '鼠标中键' }
+const MOUSE_BTN_HID   = { 0: { kind: 'click', button: 1 },
+                           1: { kind: 'click', button: 4 },
+                           2: { kind: 'click', button: 2 } }
+
+function onKeyDialogMouseDown (e) {
+  e.preventDefault()
+  e.stopPropagation()
+  /* 忽略对话框内的确认/取消按钮 */
+  if (e.target.closest('#key-dialog-ok, #key-dialog-cancel, .dialog-close')) return
+  const info = MOUSE_BTN_HID[e.button]
+  if (!info) return
+  keyDialogKeys = {}
+  keyDialogMousePending = { ...info }
+  $('key-status').textContent = `松开鼠标后点击确认`
+  $('key-status').classList.add('dialog-status-warn')
+  $('key-result').classList.remove('hidden')
+  $('key-display').textContent = MOUSE_BTN_LABEL[e.button] || `鼠标按钮 ${e.button}`
+  $('key-detail').textContent = `HID: click ${info.button}`
+  keyDialogLastCombo = keyDialogMousePending
+  $('key-dialog-ok').disabled = false
+}
+
+function onKeyDialogWheel (e) {
+  e.preventDefault()
+  e.stopPropagation()
+  keyDialogKeys = {}
+  const clicks = e.deltaY < 0 ? 1 : -1   /* 上滚=1, 下滚=-1 */
+  keyDialogMousePending = { kind: 'scroll', clicks }
+  $('key-status').textContent = '滚轮已识别，点击确认'
+  $('key-status').classList.add('dialog-status-warn')
+  $('key-result').classList.remove('hidden')
+  $('key-display').textContent = clicks > 0 ? '滚轮 ↑' : '滚轮 ↓'
+  $('key-detail').textContent = `HID: scroll ${clicks}`
+  keyDialogLastCombo = keyDialogMousePending
+  $('key-dialog-ok').disabled = false
 }
 
 function updateKeyDisplay () {
@@ -1171,6 +1279,16 @@ function isModifier (code) {
 $('key-dialog-ok').addEventListener('click', () => {
   if (!keyDialogTarget || !keyDialogLastCombo) return
 
+  /* 鼠标点击 / 滚轮事件：keyDialogLastCombo 带有 kind 属性 */
+  if (keyDialogLastCombo.kind === 'click' || keyDialogLastCombo.kind === 'scroll') {
+    if (!keyDialogTarget.steps) keyDialogTarget.steps = []
+    keyDialogTarget.steps.push({ ...keyDialogLastCombo })
+    closeKeyDialog()
+    renderConfigs()
+    return
+  }
+
+  /* 键盘按键事件 */
   const snap = keyDialogLastCombo._modifierSnapshot || {}
   let mod = 0
   if (snap.ctrl)  mod |= 1
@@ -1264,18 +1382,33 @@ function trackConfigResponse (line) {
 
 let mouseModeEnabled = false
 let mouseModeActive = false
+let mouseFourDir = false
+let mouseFlipX = false
+let mouseFlipY = false
+let mouseSpeedMult = 1.0
 
 function trackMouseMode (line) {
-  /* Machine-parseable: "mouse_mode: enabled=1 active=0 dz=0.3 ref=3.0 max=60 dwell=0" */
-  const m = line.match(/^mouse_mode:\s*enabled=(\d)\s+active=(\d)\s+dz=([\d.]+)\s+ref=([\d.]+)\s+max=([\d.]+)\s+dwell=(\d+)/)
+  /* Machine-parseable: "mouse_mode: enabled=1 active=0 fourdir=0 dz=2.0 ref=8.0 max=60 dwell=0 speed_mult=1.00 flip_x=0 flip_y=0" */
+  const m = line.match(/^mouse_mode:\s*enabled=(\d)\s+active=(\d)\s+fourdir=(\d)\s+dz=([\d.]+)\s+ref=([\d.]+)\s+max=([\d.]+)\s+dwell=(\d+)\s+speed_mult=([\d.]+)\s+flip_x=(\d)\s+flip_y=(\d)/)
   if (m) {
     mouseModeEnabled = m[1] === '1'
     mouseModeActive = m[2] === '1'
-    $('mouse-dz').textContent = m[3]
-    $('mouse-ref').textContent = m[4]
-    $('mouse-max').textContent = m[5]
-    $('mouse-dwell').textContent = m[6] === '0' ? '立即' : m[6] + 'ms'
+    mouseFourDir = m[3] === '1'
+    mouseSpeedMult = parseFloat(m[8])
+    mouseFlipX = m[9] === '1'
+    mouseFlipY = m[10] === '1'
+    $('mouse-dz').textContent = m[4]
+    $('mouse-ref').textContent = m[5]
+    $('mouse-max').textContent = m[6]
+    $('mouse-dwell').textContent = m[7] === '0' ? '立即' : m[7] + 'ms'
+    $('mouse-speed-mult').textContent = mouseSpeedMult.toFixed(2)
     $('mouse-params').classList.remove('hidden')
+    /* Update speed slider */
+    const slider = $('mouse-speed-slider')
+    if (slider) {
+      slider.value = mouseSpeedMult
+      $('mouse-speed-value').textContent = mouseSpeedMult.toFixed(2) + '×'
+    }
     renderMouseStatus()
     return
   }
@@ -1302,6 +1435,21 @@ function renderMouseStatus () {
     el.style.color = ''
     btn.textContent = '开启'
     btn.classList.remove('active')
+  }
+  const btn4 = $('btn-mouse-fourdir')
+  if (btn4) {
+    btn4.textContent = mouseFourDir ? '四向移动: 开' : '四向移动: 关'
+    btn4.classList.toggle('active', mouseFourDir)
+  }
+  const btnFx = $('btn-mouse-flipx')
+  if (btnFx) {
+    btnFx.textContent = mouseFlipX ? '左右翻转: 开' : '左右翻转: 关'
+    btnFx.classList.toggle('active', mouseFlipX)
+  }
+  const btnFy = $('btn-mouse-flipy')
+  if (btnFy) {
+    btnFy.textContent = mouseFlipY ? '上下翻转: 开' : '上下翻转: 关'
+    btnFy.classList.toggle('active', mouseFlipY)
   }
 }
 
@@ -1349,6 +1497,7 @@ async function fetchConfigSeqs (idx) {
 }
 
 function parseSeqTextToSteps (text) {
+  const CLICK_NAME_MAP = { left: 1, right: 2, middle: 4, 1: 1, 2: 2, 4: 4 }
   const steps = []
   for (const seg of text.split(';')) {
     const t = seg.trim()
@@ -1361,6 +1510,11 @@ function parseSeqTextToSteps (text) {
       steps.push({ kind: 'key', mod: parseInt(parts[1], 10), kc: parseInt(parts[2], 10) })
     } else if (kw === 'type') {
       steps.push({ kind: 'type', text: parts.slice(1).join(' ') })
+    } else if (kw === 'click' && parts[1]) {
+      const btn = CLICK_NAME_MAP[parts[1]] || parseInt(parts[1], 10)
+      steps.push({ kind: 'click', button: btn })
+    } else if (kw === 'scroll' && parts[1]) {
+      steps.push({ kind: 'scroll', clicks: parseInt(parts[1], 10) })
     }
   }
   return steps
@@ -1401,6 +1555,46 @@ $('btn-cfg-del-all').addEventListener('click', deleteAllConfigsFromDevice)
 $('btn-cfg-save').addEventListener('click', saveConfigsToFile)
 $('btn-cfg-load').addEventListener('click', loadConfigsFromFile)
 $('btn-gesture-clear').addEventListener('click', clearGestures)
+
+/* ── 校准调试打印开关 ────────────────────────────────────────────────────── */
+
+let calDebugEnabled = false
+
+function renderDbgToggle () {
+  const btn = $('btn-dbg-toggle')
+  if (btn) {
+    btn.textContent = `打印数据: ${calDebugEnabled ? '开' : '关'}`
+    btn.classList.toggle('active', calDebugEnabled)
+  }
+}
+
+$('btn-dbg-toggle').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = calDebugEnabled ? 'dbg off' : 'dbg'
+  await sendCmd(cmd)
+  calDebugEnabled = !calDebugEnabled
+  renderDbgToggle()
+  pushLog(calDebugEnabled ? '校准调试打印已开启' : '校准调试打印已关闭', 'ok')
+})
+
+/* ── 触发难度设置 ────────────────────────────────────────────────────────── */
+
+$('btn-set-conf').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const v = parseInt($('conf-input').value, 10)
+  if (isNaN(v) || v < 0 || v > 100) {
+    pushLog('触发难度必须在 0–100 之间', 'err')
+    return
+  }
+  /* 发送 cmd fuzzy 只给已存在的配置槽位。 */
+  $('conf-result').textContent = '发送中…'
+  for (const cmd of commands) {
+    await sendCmd(`cmd fuzzy ${cmd.id} 0 0 ${v}`, true)
+    await new Promise((r) => setTimeout(r, 50))
+  }
+  $('conf-result').textContent = `已设置 (conf=${v})`
+  pushLog(`触发难度已设置为 ${v}`, 'ok')
+})
 $('btn-mouse-toggle').addEventListener('click', async () => {
   if (!rxChar) { pushLog('未连接', 'err'); return }
   const cmd = mouseModeEnabled ? 'mouse off' : 'mouse on'
@@ -1408,12 +1602,63 @@ $('btn-mouse-toggle').addEventListener('click', async () => {
   mouseModeEnabled = !mouseModeEnabled
   renderMouseStatus()
 })
+$('btn-mouse-fourdir').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = mouseFourDir ? 'mouse fourdir off' : 'mouse fourdir on'
+  await sendCmd(cmd)
+  mouseFourDir = !mouseFourDir
+  renderMouseStatus()
+  pushLog(mouseFourDir ? '四向移动模式已开启' : '四向移动模式已关闭', 'ok')
+})
+$('btn-mouse-flipx').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = mouseFlipX ? 'mouse flipx off' : 'mouse flipx on'
+  await sendCmd(cmd)
+  mouseFlipX = !mouseFlipX
+  renderMouseStatus()
+  pushLog(mouseFlipX ? '左右翻转已开启' : '左右翻转已关闭', 'ok')
+})
+$('btn-mouse-flipy').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = mouseFlipY ? 'mouse flipy off' : 'mouse flipy on'
+  await sendCmd(cmd)
+  mouseFlipY = !mouseFlipY
+  renderMouseStatus()
+  pushLog(mouseFlipY ? '上下翻转已开启' : '上下翻转已关闭', 'ok')
+})
+
+/* Speed slider: send on change (mouseup/touchend), not on input (continuous). */
+let speedSliderDebounce = null
+$('mouse-speed-slider').addEventListener('input', (e) => {
+  /* Update display while dragging */
+  $('mouse-speed-value').textContent = parseFloat(e.target.value).toFixed(2) + '×'
+})
+$('mouse-speed-slider').addEventListener('change', async (e) => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const val = parseFloat(e.target.value)
+  $('mouse-speed-value').textContent = val.toFixed(2) + '×'
+  /* Debounce: clear previous pending send */
+  if (speedSliderDebounce) clearTimeout(speedSliderDebounce)
+  speedSliderDebounce = setTimeout(async () => {
+    await sendCmd(`mouse speed ${val.toFixed(2)}`)
+    pushLog(`速度已设置为 ${val.toFixed(2)}×`, 'ok')
+  }, 200)
+})
+$('btn-mouse-speed-reset').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const slider = $('mouse-speed-slider')
+  slider.value = 1.0
+  $('mouse-speed-value').textContent = '1.00×'
+  await sendCmd('mouse speed 1.00')
+  pushLog('速度已恢复默认 (1.00×)', 'ok')
+})
 
 /* ── 初始化 ─────────────────────────────────────────────────────────────── */
 
 renderGestures()
 renderParams()
 renderConfigs()
+renderDbgToggle()
 renderLog()
 setStatus('未连接', null)
 setConnected(false)

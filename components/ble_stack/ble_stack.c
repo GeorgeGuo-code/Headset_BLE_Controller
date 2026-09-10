@@ -33,6 +33,7 @@
 #include "esp_gatt_common_api.h"
 
 #include "ble_stack.h"
+#include "gesture_detect.h"
 
 #define TAG "ble_stack"
 
@@ -313,6 +314,7 @@ static void stack_gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
         ESP_LOGI(TAG, "[CONN] CONNECT conn_id=%u gatts_if=%d addr="ESP_BD_ADDR_STR" count=%d",
                  (unsigned)param->connect.conn_id, (int)gatts_if,
                  ESP_BD_ADDR_HEX(param->connect.remote_bda), (int)s_conn_count);
+        gesture_detect_reset_calibration();
     } else if (event == ESP_GATTS_DISCONNECT_EVT) {
         ESP_LOGI(TAG, "[CONN] DISCONNECT conn_id=%u reason=0x%x count=%d",
                  (unsigned)param->disconnect.conn_id,

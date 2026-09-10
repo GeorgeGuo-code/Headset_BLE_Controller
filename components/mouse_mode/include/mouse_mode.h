@@ -43,6 +43,13 @@ typedef struct {
                                  actually exits. Set to 0 to disable dwell
                                  (deactivate immediately on left+right).
                                  Default 0 (disabled) */
+    float speed_multiplier; /*!< Speed multiplier for cursor movement.
+                                 1.0 = default speed, 4.0 = 4× faster.
+                                 Range 0.05..4.0. Default 1.0 */
+    bool  flip_x;           /*!< Flip horizontal (left/right) cursor direction.
+                                 Default false */
+    bool  flip_y;           /*!< Flip vertical (up/down) cursor direction.
+                                 Default false */
 } mouse_mode_params_t;
 
 /**
@@ -81,21 +88,37 @@ void mouse_mode_set_enabled(bool enable);
 bool mouse_mode_is_active(void);
 
 /**
+ * @brief Enable/disable four-direction (d-pad) mouse mode.
+ *
+ *        When enabled, cursor moves only in 4 cardinal directions
+ *        (up/down/left/right) at a constant slow speed.  The dominant
+ *        axis (pitch or roll, whichever has larger projection) determines
+ *        the direction.  This mode is easier to control for basic
+ *        navigation.
+ */
+void mouse_mode_set_four_dir(bool enable);
+bool mouse_mode_is_four_dir(void);
+
+/**
  * @brief Called from gesture_detect's detector_task at 50 Hz.
  *
- *        Computes the relative rotation from the rest reference,
- *        projects onto the 3 calibrated signature axes (nod, tiltL, tiltR),
- *        applies dead zone and acceleration, and sends HID mouse reports.
+ *        Projects the raw rotation vector r (q_drift frame) onto the 3
+ *        calibrated signature axes (nod, tiltL, tiltR) to obtain the
+ *        head's angular displacement from rest in degrees.
+ *        Applies dead zone and linear speed mapping, then sends HID
+ *        mouse reports.
  *
- *        Signatures are stored in the q_drift frame. This function rotates
- *        them into the q_mouse_rest frame before projection.
+ *        r (not smooth_r) is used because smooth_r is normalised to unit
+ *        length and loses magnitude information.  r carries actual angle
+ *        data and returns to ~0 at rest, which is essential for
+ *        position-based cursor control.
  *
- * @param qcur          Current DMP quaternion (w,x,y,z)
- * @param q_drift       Current sliding baseline quaternion (w,x,y,z)
- * @param r_mag         |r| — rotation magnitude (used for dwell detection)
+ * @param r             Raw rotation vector (3, q_drift frame, degrees)
+ * @param r_valid       false when r is not yet initialised
+ * @param r_mag         |r| — rotation magnitude (degrees, used for dwell)
  * @param vel           Angular velocity °/s (used for dwell detection)
  */
-void mouse_mode_tick(const float qcur[4], const float q_drift[4],
+void mouse_mode_tick(const float r[3], bool r_valid,
                      float r_mag, float vel);
 
 /**
@@ -109,17 +132,30 @@ const mouse_mode_params_t *mouse_mode_get_params(void);
 void mouse_mode_set_params(const mouse_mode_params_t *params);
 
 /**
+ * @brief Save current parameters to NVS.
+ */
+void mouse_mode_save_params_to_nvs(void);
+
+/**
+ * @brief Load parameters from NVS (if available). Falls back to defaults
+ *        for any fields not present in NVS.
+ */
+void mouse_mode_load_params_from_nvs(void);
+
+/**
  * @brief Feed a tilt gesture into the toggle detection state machine.
  *
- *        Called from gesture_detect when a TILT_LEFT or TILT_RIGHT event
- *        fires (or would fire — during mouse_mode events are suppressed
- *        but this still runs). The state machine detects the left+right
- *        tilt sequence and toggles mouse mode.
+ *        Called from gesture_detect's detector_task. Uses the raw tilt
+ *        axis projection (not gesture events) so the toggle can detect
+ *        left+right sequences even when gesture events are suppressed
+ *        by the 1500ms cooldown.
  *
- * @param gesture   GESTURE_TILT_LEFT (3) or GESTURE_TILT_RIGHT (4)
- * @param now_ms    current tick in milliseconds
+ * @param tilt_raw   Raw roll projection onto the tilt signature axis.
+ *                   Positive = left tilt, negative = right tilt.
+ * @param dead_zone  Minimum |tilt_raw| to count as a tilt (filters sway).
+ * @param now_ms     current tick in milliseconds
  */
-void mouse_mode_toggle_step(int gesture, uint32_t now_ms);
+void mouse_mode_toggle_step(float tilt_raw, float dead_zone, uint32_t now_ms);
 
 /**
  * @brief Reset the toggle state machine to idle.
