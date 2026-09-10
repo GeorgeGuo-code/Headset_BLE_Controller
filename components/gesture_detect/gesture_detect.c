@@ -68,7 +68,7 @@ static const char *TAG = "gesture_detect";
 #endif
 
 /* ===== Accumulation-based detection thresholds ============================ */
-#define TRIG_VEL_FRAC     0.35f  /*!< trigger velocity = peak × this fraction */
+#define TRIG_VEL_FRAC     0.25f  /*!< trigger velocity = peak × this fraction */
 #define END_VEL_FRAC      0.20f  /*!< end velocity = peak × this fraction */
 #define END_HOLD_FRAMES   2      /*!< frames below end_vel before firing (2×30ms ≈ 60ms at DMP 33 Hz) */
 #define MIN_FIRE_R_MAG    3.0f   /*!< minimum smooth_r magnitude to fire (°) — prevents
@@ -1293,7 +1293,8 @@ static void detector_task(void *arg)
                  * preventing re-fire from the same static tilted position
                  * after cooldown expires. */
                 {
-                    const int TRIG_ARM_FRAMES = 6;  /* 60 ms at 100 Hz */
+                    const int TRIG_ARM_FRAMES = 3;  /* 3×30ms ≈ 90ms at DMP 33Hz — fast
+                                                       LOOK_UP only sustains 4-5 frames */
                     if (s_consec_above_trigger >= TRIG_ARM_FRAMES) {
                         if (!s_had_high_vel) {
                             GD_DIAGI("DIAG-HVEL-ARM consec=%d vel=%.1f "
@@ -1328,7 +1329,7 @@ static void detector_task(void *arg)
                     s_cp_accum[0] += cp_sc[0]; s_cp_accum[1] += cp_sc[1]; s_cp_accum[2] += cp_sc[2];
                     /* Only reset hold after N consecutive frames above trigger.
                      * A single DMP glitch (vel→0→high) won't reset hold. */
-                    const int TRIG_RESET_FRAMES = 6;  /* 6×30ms ≈ 180ms at DMP 33 Hz */
+                    const int TRIG_RESET_FRAMES = 3;  /* 3×30ms ≈ 90ms at DMP 33Hz */
                     if (s_consec_above_trigger >= TRIG_RESET_FRAMES) {
                         s_end_hold = 0;
                     }
@@ -2388,7 +2389,9 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
      * Update q_neutral to the freshly captured rest pose.  If gesture
      * signatures were already loaded from NVS (from a previous full
      * calibration), we can enable detection immediately — the user only
-     * needed to re-do the rest pose because the headset was repositioned. */
+     * needed to re-do the rest pose because the headset was repositioned.
+     * If no signatures exist, create default ones from the params so
+     * detection can start immediately after rest calibration. */
     neutral_pose_aligned_t np;
     gesture_params_get_neutral_aligned(&np);
     memcpy(np.q_neutral, s_cal_rest_q, sizeof(np.q_neutral));
@@ -2397,11 +2400,39 @@ esp_err_t gesture_detect_calibrate_rest(uint32_t duration_ms)
      * and resets q_drift_valid so the detector re-syncs on next tick. */
 
     if (s_gd.sig.calibrated & GESTURE_SIG_F_MINIMUM) {
-        ESP_LOGI(TAG, "signatures already calibrated (0x%02x) — "
-                 "rest pose updated, but full re-calibration (cn/ctl/ctr) required",
-                 (unsigned)s_gd.sig.calibrated);
+        /* Signatures already calibrated from NVS — enable detection
+         * immediately after rest calibration.  No need to re-run
+         * cn/ctl/ctr unless the user wants to recalibrate gesture axes. */
+        if (!s_gd.calibrated) {
+            s_gd.calibrated = true;
+            ESP_LOGI(TAG, "signatures loaded (0x%02x) — "
+                     "detection enabled after rest calibration",
+                     (unsigned)s_gd.sig.calibrated);
+        } else {
+            ESP_LOGI(TAG, "rest pose updated (0x%02x) — detection active",
+                     (unsigned)s_gd.sig.calibrated);
+        }
     } else {
-        ESP_LOGW(TAG, "no gesture signatures yet — run cn/ctl/ctr to calibrate axes");
+        /* No signatures calibrated yet — create default signatures from
+         * the loaded params (nod_axis, tilt_axis) so detection can start
+         * immediately.  The user can run cn/ctl/ctr later to refine. */
+        memcpy(s_gd.sig.sig_nod, np.nod_axis, sizeof(float) * 3);
+        memcpy(s_gd.sig.sig_tiltL, np.tilt_axis, sizeof(float) * 3);
+        /* tiltR = -tiltL (opposite direction) */
+        s_gd.sig.sig_tiltR[0] = -np.tilt_axis[0];
+        s_gd.sig.sig_tiltR[1] = -np.tilt_axis[1];
+        s_gd.sig.sig_tiltR[2] = -np.tilt_axis[2];
+        /* Set default peak velocities and avg_cp for basic detection */
+        s_gd.sig.peak_vel_nod = 80.0f;
+        s_gd.sig.peak_vel_tiltL = 60.0f;
+        s_gd.sig.peak_vel_tiltR = 60.0f;
+        s_gd.sig.avg_cp_nod = 0.05f;
+        s_gd.sig.avg_cp_tiltL = 0.05f;
+        s_gd.sig.avg_cp_tiltR = 0.05f;
+        s_gd.sig.calibrated = GESTURE_SIG_F_MINIMUM;
+        s_gd.calibrated = true;
+        ESP_LOGI(TAG, "default signatures created from params — "
+                 "detection enabled, run cn/ctl/ctr to improve accuracy");
     }
 
     /* Flush FIFO so the detector doesn't process stale samples from

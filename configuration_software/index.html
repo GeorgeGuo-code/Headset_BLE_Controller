@@ -34,23 +34,23 @@
           </div>
         </div>
         <div class="cal-section">
-          <h3>手势校准（4 步）<span class="hint" style="margin-left:8px;text-transform:none">—— 先静止采基准，再点头+左倾+右倾（仰头复用点头轴）</span></h3>
+          <h3>手势校准<span class="hint" style="margin-left:8px;text-transform:none">—— 保持静止即可开启检测，点头/倾斜校准可选（提高准确度）</span></h3>
           <div class="row sig-btns">
             <button data-cmd="cr"  class="need-conn" disabled>① 保持静止</button>
-            <button data-cmd="cn"  class="need-conn" disabled>② 点头 NOD</button>
-            <button data-cmd="ctl" class="need-conn" disabled>③ 左倾 TILT_L</button>
-            <button data-cmd="ctr" class="need-conn" disabled>④ 右倾 TILT_R</button>
+            <button data-cmd="cn"  class="need-conn" disabled>② 点头 NOD（可选）</button>
+            <button data-cmd="ctl" class="need-conn" disabled>③ 左倾 TILT_L（可选）</button>
+            <button data-cmd="ctr" class="need-conn" disabled>④ 右倾 TILT_R（可选）</button>
             <button id="btn-dbg-toggle" class="need-conn" disabled>打印数据: 关</button>
           </div>
           <ol id="sig-steps">
             <li class="step" data-step="1"><span class="mark"></span>
               <span class="text">保持静止（2 s）—— 头部自然朝前，不要动</span></li>
             <li class="step" data-step="2"><span class="mark"></span>
-              <span class="text">做几次点头到最低点并保持（4 s）—— 仰头复用此轴</span></li>
+              <span class="text">（可选）做几次点头到最低点并保持（4 s）—— 提高点头检测准确度</span></li>
             <li class="step" data-step="3"><span class="mark"></span>
-              <span class="text">做几次左耳朝左肩倾斜并保持（4 s）</span></li>
+              <span class="text">（可选）做几次左耳朝左肩倾斜并保持（4 s）—— 提高左倾检测准确度</span></li>
             <li class="step" data-step="4"><span class="mark"></span>
-              <span class="text">做几次右耳朝右肩倾斜并保持（4 s）</span></li>
+              <span class="text">（可选）做几次右耳朝右肩倾斜并保持（4 s）—— 提高右倾检测准确度</span></li>
           </ol>
         </div>
         <div id="cal-progress"><div id="cal-bar"></div></div>

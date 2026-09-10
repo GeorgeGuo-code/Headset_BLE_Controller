@@ -211,7 +211,7 @@ function trackCalibration (line) {
     const step = stepMap[gestName] || 2
     markStep(step, 'done')
     const label = GESTURE_LABEL[gestName] || gestName
-    finishCal(true, `${label} 校准完成 (peak=${m[3]}°)`)
+    finishCal(true, `${label} 校准完成 (peak=${m[3]}°) — 检测已优化`)
     sendCmd('p', true)
     return
   }
@@ -224,7 +224,7 @@ function trackCalibration (line) {
     const step = stepMap[gestName] || 2
     markStep(step, 'done')
     const label = GESTURE_LABEL[gestName] || gestName
-    finishCal(true, `${label} 校准完成`)
+    finishCal(true, `${label} 校准完成 — 检测已优化`)
     sendCmd('p', true)
     return
   }
@@ -261,8 +261,18 @@ function trackCalibration (line) {
     const step = stepMap[gestName] || 1
     markStep(step, ok ? 'done' : 'fail')
     const label = GESTURE_LABEL[gestName] || gestName
-    finishCal(ok, ok ? `${label} 校准完成` : `${label} 校准失败：${m[2]}`)
+    let msg = ok ? `${label} 校准完成` : `${label} 校准失败：${m[2]}`
+    if (ok && gestName === 'REST') {
+      msg = '静止校准完成 — 检测已开启'
+    }
+    finishCal(ok, msg)
     if (ok) sendCmd('p', true)   // 成功后自动回读参数
+    return
+  }
+
+  /* Default signatures created message */
+  if (/default signatures created/i.test(line)) {
+    finishCal(true, '静止校准完成 — 检测已开启（基础模式）')
     return
   }
 
