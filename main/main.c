@@ -843,20 +843,26 @@ static void handle_command(const char *cmd)
             const mouse_mode_params_t *mp = mouse_mode_get_params();
             /* Machine-parseable line for the config tool */
             ble_console_logf("mouse_mode: enabled=%d active=%d fourdir=%d "
-                             "dz=%.1f ref=%.1f max=%.0f dwell=%u\n",
+                             "dz=%.1f ref=%.1f max=%.0f dwell=%u "
+                             "speed_mult=%.2f flip_x=%d flip_y=%d\n",
                              (int)enabled, (int)active,
                              (int)mouse_mode_is_four_dir(),
                              mp->dead_zone_deg,
                              mp->speed_ref_deg, mp->max_speed,
-                             (unsigned)mp->dwell_ms);
+                             (unsigned)mp->dwell_ms,
+                             mp->speed_multiplier,
+                             (int)mp->flip_x, (int)mp->flip_y);
             /* Human-readable */
             ble_console_logf("mouse: enabled=%d active=%d fourdir=%d "
-                             "dz=%.1f ref=%.1f max=%.0f dwell=%u ms\n",
+                             "dz=%.1f ref=%.1f max=%.0f dwell=%u ms "
+                             "speed_mult=%.2f flip_x=%d flip_y=%d\n",
                              (int)enabled, (int)active,
                              (int)mouse_mode_is_four_dir(),
                              mp->dead_zone_deg,
                              mp->speed_ref_deg, mp->max_speed,
-                             (unsigned)mp->dwell_ms);
+                             (unsigned)mp->dwell_ms,
+                             mp->speed_multiplier,
+                             (int)mp->flip_x, (int)mp->flip_y);
         } else if (strcmp(p, "fourdir on") == 0 ||
                    strcmp(p, "fourdir 1") == 0) {
             mouse_mode_set_four_dir(true);
@@ -919,12 +925,68 @@ static void handle_command(const char *cmd)
                 mouse_mode_set_params(&mp);
                 ble_console_logf("mouse dwell -> %u ms\n", (unsigned)mp.dwell_ms);
             }
+        } else if (strncmp(p, "speed", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            char *endp;
+            float val = strtof(q, &endp);
+            if (endp == q || val < 0.05f || val > 4.0f) {
+                ble_console_log("mouse speed: 0.05..4.0 (multiplier, default 1.0)\n");
+            } else {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.speed_multiplier = val;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse speed -> %.2f\n", mp.speed_multiplier);
+            }
+        } else if (strncmp(p, "flipx", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            if (strcmp(q, "on") == 0 || strcmp(q, "1") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_x = true;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_x -> ON\n");
+            } else if (strcmp(q, "off") == 0 || strcmp(q, "0") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_x = false;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_x -> OFF\n");
+            } else {
+                /* Toggle */
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_x = !mp.flip_x;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse flip_x -> %s\n", mp.flip_x ? "ON" : "OFF");
+            }
+        } else if (strncmp(p, "flipy", 5) == 0 && (p[5] == '\0' || p[5] == ' ')) {
+            const char *q = p + 5;
+            while (*q == ' ') q++;
+            if (strcmp(q, "on") == 0 || strcmp(q, "1") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_y = true;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_y -> ON\n");
+            } else if (strcmp(q, "off") == 0 || strcmp(q, "0") == 0) {
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_y = false;
+                mouse_mode_set_params(&mp);
+                ble_console_log("mouse flip_y -> OFF\n");
+            } else {
+                /* Toggle */
+                mouse_mode_params_t mp = *mouse_mode_get_params();
+                mp.flip_y = !mp.flip_y;
+                mouse_mode_set_params(&mp);
+                ble_console_logf("mouse flip_y -> %s\n", mp.flip_y ? "ON" : "OFF");
+            }
         } else {
-            ble_console_log("mouse: on|off|status|dz|ref|max|dwell\n");
-            ble_console_log("  dz <°/f>     velocity dead zone (0.1..10, default 0.3)\n");
-            ble_console_log("  ref <°/f>    velocity for max speed (0.5..20, default 3.0)\n");
-            ble_console_log("  max <px>     max speed (5..127, default 60)\n");
-            ble_console_log("  dwell <ms>   0=immediate, >0=dwell (default 0)\n");
+            ble_console_log("mouse: on|off|status|fourdir|dz|ref|max|dwell|speed|flipx|flipy\n");
+            ble_console_log("  dz <°/f>      velocity dead zone (0.1..10, default 2.0)\n");
+            ble_console_log("  ref <°/f>     velocity for max speed (0.5..20, default 8.0)\n");
+            ble_console_log("  max <px>      max speed (5..127, default 60)\n");
+            ble_console_log("  dwell <ms>    0=immediate, >0=dwell (default 0)\n");
+            ble_console_log("  speed <mult>  speed multiplier (0.05..4.0, default 1.0)\n");
+            ble_console_log("  flipx [on|off] flip horizontal direction\n");
+            ble_console_log("  flipy [on|off] flip vertical direction\n");
         }
     } else if (cmd[0] != '\0') {
         ble_console_logf("unknown command: '%s'\n", cmd);

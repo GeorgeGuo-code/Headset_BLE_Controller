@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #include "mouse_mode.h"
 #include "hid_output.h"
@@ -27,6 +28,10 @@
 #include "touch_sensor.h"
 
 static const char *TAG = "mouse_mode";
+
+/* NVS storage for mouse mode parameters. */
+#define NVS_NAMESPACE   "mouse_mode"
+#define NVS_KEY_PARAMS  "params"
 
 /* Forward declaration: gesture_detect_get_sig_axes() returns a pointer to
  * the 3 calibrated signature axes (in q_drift frame). Defined in
@@ -50,8 +55,11 @@ extern uint8_t gesture_detect_get_sign_roll(void);
 #define MOUSE_DEFAULT_SPEED_REF_DEG   8.0f   /*!< ° from rest that maps to max_speed */
 #define MOUSE_DEFAULT_MAX_SPEED      60.0f
 #define MOUSE_DEFAULT_DWELL_MS     0       /*!< 0 = deactivate immediately */
+#define MOUSE_DEFAULT_SPEED_MULT    1.0f   /*!< 1× default speed */
+#define MOUSE_DEFAULT_FLIP_X       false
+#define MOUSE_DEFAULT_FLIP_Y       false
 
-#define FOUR_DIR_SPEED             10.0f   /*!< four-dir: constant px/frame */
+#define CURSOR_BASE_SPEED          10.0f   /*!< base cursor speed: constant px/frame */
 
 /* ===== Module state ====================================================== */
 
@@ -91,14 +99,23 @@ esp_err_t mouse_mode_init(void)
     s_mm.dwell_active = false;
 
     /* Default parameters */
-    s_mm.params.dead_zone_deg = MOUSE_DEFAULT_DEAD_ZONE_DEG;
-    s_mm.params.speed_ref_deg = MOUSE_DEFAULT_SPEED_REF_DEG;
-    s_mm.params.max_speed     = MOUSE_DEFAULT_MAX_SPEED;
-    s_mm.params.dwell_ms      = MOUSE_DEFAULT_DWELL_MS;
+    s_mm.params.dead_zone_deg  = MOUSE_DEFAULT_DEAD_ZONE_DEG;
+    s_mm.params.speed_ref_deg  = MOUSE_DEFAULT_SPEED_REF_DEG;
+    s_mm.params.max_speed      = MOUSE_DEFAULT_MAX_SPEED;
+    s_mm.params.dwell_ms       = MOUSE_DEFAULT_DWELL_MS;
+    s_mm.params.speed_multiplier = MOUSE_DEFAULT_SPEED_MULT;
+    s_mm.params.flip_x         = MOUSE_DEFAULT_FLIP_X;
+    s_mm.params.flip_y         = MOUSE_DEFAULT_FLIP_Y;
 
-    ESP_LOGI(TAG, "mouse_mode init: enabled=%d dz=%.1f ref=%.1f max=%.0f dwell=%u",
+    /* Try loading saved params from NVS */
+    mouse_mode_load_params_from_nvs();
+
+    ESP_LOGI(TAG, "mouse_mode init: enabled=%d dz=%.1f ref=%.1f max=%.0f "
+             "dwell=%u speed_mult=%.2f flip_x=%d flip_y=%d",
              (int)s_mm.enabled, s_mm.params.dead_zone_deg, s_mm.params.speed_ref_deg,
-             s_mm.params.max_speed, (unsigned)s_mm.params.dwell_ms);
+             s_mm.params.max_speed, (unsigned)s_mm.params.dwell_ms,
+             s_mm.params.speed_multiplier,
+             (int)s_mm.params.flip_x, (int)s_mm.params.flip_y);
     return ESP_OK;
 }
 
@@ -164,9 +181,58 @@ void mouse_mode_set_params(const mouse_mode_params_t *params)
 {
     if (params == NULL) return;
     s_mm.params = *params;
-    ESP_LOGI(TAG, "params updated: dz=%.1f ref=%.1f max=%.0f dwell=%u",
+    ESP_LOGI(TAG, "params updated: dz=%.1f ref=%.1f max=%.0f dwell=%u "
+             "speed_mult=%.2f flip_x=%d flip_y=%d",
              s_mm.params.dead_zone_deg, s_mm.params.speed_ref_deg,
-             s_mm.params.max_speed, (unsigned)s_mm.params.dwell_ms);
+             s_mm.params.max_speed, (unsigned)s_mm.params.dwell_ms,
+             s_mm.params.speed_multiplier,
+             (int)s_mm.params.flip_x, (int)s_mm.params.flip_y);
+    /* Auto-persist to NVS */
+    mouse_mode_save_params_to_nvs();
+}
+
+void mouse_mode_save_params_to_nvs(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open failed for save: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_blob(h, NVS_KEY_PARAMS, &s_mm.params, sizeof(s_mm.params));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS save failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "params saved to NVS");
+    }
+}
+
+void mouse_mode_load_params_from_nvs(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "NVS: no saved mouse params (%s), using defaults",
+                 esp_err_to_name(err));
+        return;
+    }
+    size_t required = sizeof(s_mm.params);
+    mouse_mode_params_t loaded;
+    err = nvs_get_blob(h, NVS_KEY_PARAMS, &loaded, &required);
+    nvs_close(h);
+    if (err == ESP_OK && required == sizeof(s_mm.params)) {
+        s_mm.params = loaded;
+        ESP_LOGI(TAG, "params loaded from NVS: speed_mult=%.2f flip_x=%d flip_y=%d",
+                 s_mm.params.speed_multiplier,
+                 (int)s_mm.params.flip_x, (int)s_mm.params.flip_y);
+    } else {
+        ESP_LOGI(TAG, "NVS: no valid mouse params (%s), using defaults",
+                 esp_err_to_name(err));
+    }
 }
 
 /* ===== Tick: called from detector_task at 50 Hz ========================= */
@@ -212,6 +278,10 @@ void mouse_mode_tick(const float r[3], bool r_valid,
 
     int dx = 0, dy = 0;
 
+    /* Apply speed multiplier to the base cursor speed. */
+    int speed = (int)(CURSOR_BASE_SPEED * s_mm.params.speed_multiplier);
+    if (speed < 1) speed = 1;
+
     if (s_mm.four_dir) {
         /* ── Four-direction (d-pad) mode ──
          * Determine the dominant axis; only move in that axis at a
@@ -221,7 +291,6 @@ void mouse_mode_tick(const float r[3], bool r_valid,
         bool roll_active  = abs_roll  > s_mm.params.dead_zone_deg;
 
         if (pitch_active || roll_active) {
-            int speed = (int)FOUR_DIR_SPEED;
             if (pitch_active && abs_pitch >= abs_roll) {
                 /* Dominant axis is pitch → vertical only */
                 dy = (pitch_disp > 0.0f) ? speed : -speed;
@@ -231,10 +300,7 @@ void mouse_mode_tick(const float r[3], bool r_valid,
             }
         }
     } else {
-        /* ── Proportional mode: same constant speed as four-dir,
-         *     but both axes can move simultaneously. ── */
-        int speed = (int)FOUR_DIR_SPEED;
-
+        /* ── Proportional mode: both axes can move simultaneously. ── */
         if (abs_pitch > s_mm.params.dead_zone_deg) {
             dy = (pitch_disp > 0.0f) ? speed : -speed;
         }
@@ -247,6 +313,10 @@ void mouse_mode_tick(const float r[3], bool r_valid,
             dx = (roll_disp > 0.0f) ? speed : -speed;
         }
     }
+
+    /* Apply flip flags. */
+    if (s_mm.params.flip_x) dx = -dx;
+    if (s_mm.params.flip_y) dy = -dy;
 
     /* Clamp to HID range [-127, 127] */
     if (dx < -127) dx = -127;
@@ -300,14 +370,15 @@ void mouse_mode_tick(const float r[3], bool r_valid,
  * Toggle state machine for the left+right tilt activation/deactivation
  * gesture. Runs inside gesture_detect's detector_task.
  *
- * States:
- *   IDLE        → TILT_LEFT detected → LEFT_SEEN
- *   LEFT_SEEN   → TILT_RIGHT detected within 1500ms → toggle!
- *                 timeout → reset to IDLE
- *   (any)       → mouse_mode toggled → reset to IDLE
+ * Uses the RAW tilt axis projection (not gesture events) to detect
+ * left and right tilt phases. This bypasses the 1500ms gesture cooldown
+ * that would otherwise suppress the second tilt gesture.
  *
- * In mouse_mode, after toggling, set dwell_active so mouse_mode_tick()
- * monitors for stillness before final deactivation.
+ * States:
+ *   IDLE        -> tilt_raw > dead_zone -> LEFT_SEEN
+ *   LEFT_SEEN   -> tilt_raw < -dead_zone within TOGGLE_WINDOW_MS -> toggle!
+ *                  timeout -> reset to IDLE
+ *   (any)       -> mouse_mode toggled -> reset to IDLE
  */
 typedef enum {
     TG_IDLE = 0,
@@ -316,7 +387,7 @@ typedef enum {
 
 typedef struct {
     toggle_state_t state;
-    uint32_t       left_seen_ms;   /*!< when TILT_LEFT was detected */
+    uint32_t       left_seen_ms;   /*!< when left tilt was detected */
 } toggle_ctx_t;
 
 static toggle_ctx_t s_tg;
@@ -330,42 +401,53 @@ void mouse_mode_toggle_reset(void)
 }
 
 /**
- * @brief Process a tilt gesture for toggle detection.
+ * @brief Process raw tilt projection for toggle detection.
  *
- *        Called from gesture_detect when a TILT_LEFT or TILT_RIGHT event
- *        fires (or would fire — during mouse_mode events are suppressed
- *        but the state machine still runs).
+ *        Called every detector tick with the raw roll projection onto
+ *        the tilt signature axis. Detects left and right tilt phases
+ *        independently of gesture event emission (bypasses the 1500ms
+ *        gesture cooldown).
  *
- * @param gesture   GESTURE_TILT_LEFT or GESTURE_TILT_RIGHT
- * @param now_ms    current tick in ms
+ * @param tilt_raw   Raw roll projection (positive = left tilt)
+ * @param dead_zone  Minimum |tilt_raw| to register as a tilt
+ * @param now_ms     current tick in ms
  */
-void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
+void mouse_mode_toggle_step(float tilt_raw, float dead_zone, uint32_t now_ms)
 {
     /* When disabled and not active, don't process toggle gestures.
      * When active, always allow toggle (for deactivation). */
     if (!s_mm.enabled && !mouse_mode_is_active()) {
         return;
     }
+
+    bool left_detected  = (tilt_raw > dead_zone);
+    bool right_detected = (tilt_raw < -dead_zone);
+
     switch (s_tg.state) {
     case TG_IDLE:
-        if (gesture == 3) {  /* GESTURE_TILT_LEFT */
+        if (left_detected) {
             s_tg.state = TG_LEFT_SEEN;
             s_tg.left_seen_ms = now_ms;
+            ESP_LOGI(TAG, "TOGGLE-IDLE→LEFT_SEEN: tilt_raw=%.2f dead=%.2f",
+                     tilt_raw, dead_zone);
         }
         break;
 
     case TG_LEFT_SEEN:
-        if (gesture == 4) {  /* GESTURE_TILT_RIGHT */
+        if (right_detected) {
             /* Check window */
             if ((now_ms - s_tg.left_seen_ms) <= TOGGLE_WINDOW_MS) {
+                ESP_LOGI(TAG, "TOGGLE-LEFT_SEEN→FIRE: tilt_raw=%.2f dt=%u ms",
+                         tilt_raw, (unsigned)(now_ms - s_tg.left_seen_ms));
                 /* Toggle! */
                 if (mouse_mode_is_active()) {
                     /* Deactivation requires touch held (left click pressed) */
                     if (!touch_sensor_is_pressed()) {
-                        ESP_LOGD(TAG, "toggle deactivate ignored — touch not held");
+                        ESP_LOGW(TAG, "TOGGLE deactivate BLOCKED — touch not held");
                         s_tg.state = TG_IDLE;
                         break;
                     }
+                    ESP_LOGI(TAG, "TOGGLE deactivate CONFIRMED — touch held");
                     if (s_mm.params.dwell_ms == 0) {
                         /* Immediate deactivation */
                         ESP_LOGI(TAG, "toggle deactivate (immediate)");
@@ -387,18 +469,24 @@ void mouse_mode_toggle_step(int gesture, uint32_t now_ms)
                     ble_console_logf("[MOUSE] toggle: activated\n");
                     mouse_mode_activate();
                 }
+            } else {
+                ESP_LOGW(TAG, "TOGGLE-LEFT_SEEN→TIMEOUT: dt=%u ms > %u ms",
+                         (unsigned)(now_ms - s_tg.left_seen_ms),
+                         (unsigned)TOGGLE_WINDOW_MS);
             }
             s_tg.state = TG_IDLE;
-        } else if (gesture == 3) {
-            /* Another left tilt — restart the window */
+        } else if (left_detected) {
+            /* Still tilting left — restart the window */
             s_tg.left_seen_ms = now_ms;
-        } else {
-            /* Non-tilt gesture — reset */
-            s_tg.state = TG_IDLE;
         }
-        /* Also check timeout */
+        /* else: head in neutral or transitioning — stay in LEFT_SEEN,
+         * wait for right tilt or timeout. Do NOT reset here because
+         * the head MUST pass through neutral between left and right. */
+        /* Check timeout */
         if (s_tg.state == TG_LEFT_SEEN &&
             (now_ms - s_tg.left_seen_ms) > TOGGLE_WINDOW_MS) {
+            ESP_LOGW(TAG, "TOGGLE timeout — left_seen %u ms ago",
+                     (unsigned)(now_ms - s_tg.left_seen_ms));
             s_tg.state = TG_IDLE;
         }
         break;

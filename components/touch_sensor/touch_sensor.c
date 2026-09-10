@@ -35,6 +35,12 @@
 #include "hid_output.h"
 #include "touch_sensor.h"
 
+/* Forward declaration: defined in mouse_mode.c. Used to gate HID mouse
+ * reports so the touch sensor only sends left-click when mouse mode is
+ * active.  Avoids a circular CMake dependency between touch_sensor and
+ * mouse_mode. */
+extern bool mouse_mode_is_active(void);
+
 #define TAG "touch_sensor"
 
 /* The example does 3 oneshot scans to settle the channel baseline. Each can
@@ -98,6 +104,22 @@ static void press_release_worker(void *arg)
         }
 
         uint16_t conn_id = hid_output_conn_id();
+        /* Only send HID mouse reports when mouse mode is active.
+         * When mouse mode is off, the touch sensor still runs (for
+         * toggle detection via touch_sensor_is_pressed()), but should
+         * not send left-click HID reports. If a press was in flight
+         * when mouse mode deactivated, release it to avoid a stuck key. */
+        if (!mouse_mode_is_active()) {
+            if (s_pressed) {
+                /* Clear stuck button from a press that started before
+                 * mouse mode was deactivated. */
+                if (hid_output_is_ready()) {
+                    esp_hidd_send_mouse_value(conn_id, 0, 0, 0);
+                }
+                s_pressed = false;
+            }
+            continue;
+        }
         if (cmd == CMD_PRESS) {
             if (!s_pressed) {
                 esp_hidd_send_mouse_value(conn_id, MOUSE_BTN_LEFT, 0, 0);

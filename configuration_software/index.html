@@ -87,6 +87,18 @@
           <span class="hint">速度参考: <span id="mouse-ref">-</span>°</span>
           <span class="hint">最大速度: <span id="mouse-max">-</span></span>
           <span class="hint">停用: <span id="mouse-dwell">-</span></span>
+          <span class="hint">速度倍率: <span id="mouse-speed-mult">-</span>×</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="btn-mouse-flipx" class="need-conn" disabled>左右翻转: 关</button>
+          <button id="btn-mouse-flipy" class="need-conn" disabled>上下翻转: 关</button>
+        </div>
+        <div class="row" style="margin-top:8px; align-items:center;">
+          <label class="hint" style="margin-right:8px;">速度：</label>
+          <input id="mouse-speed-slider" type="range" min="0.05" max="4" step="0.05" value="1"
+                 style="flex:1; max-width:200px;" class="need-conn" disabled>
+          <span id="mouse-speed-value" class="hint" style="min-width:40px; text-align:center;">1.00×</span>
+          <button id="btn-mouse-speed-reset" class="need-conn" disabled style="margin-left:4px;">恢复默认</button>
         </div>
         <p class="hint" style="margin-top:8px">触发：左倾 + 右倾（立即）<br>停用：左倾 + 右倾 + 鼠标左键（立即）<br>四向移动：恒定慢速，仅上下左右</p>
       </section>

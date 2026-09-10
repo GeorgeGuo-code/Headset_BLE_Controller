@@ -959,27 +959,24 @@ static void detector_task(void *arg)
             quat_to_rotvec_deg(qrel, r);
         }
 
-        /* Runtime glitch filter: reject DMP samples where the relative
-         * rotation exceeds what a human head can physically produce.
+        /* Runtime glitch filter: reject DMP samples where the rotation
+         * from rest exceeds what a human head can physically produce.
          *
-         * FIX (v2): use angular velocity (°/s) instead of per-frame
-         * rotation (°/frame) for the threshold.  Per-frame thresholds
-         * break with irregular frame timing (DMP FIFO misses cause
-         * 30-100ms gaps, inflating per-frame rotation 3-10×).
-         * Angular velocity normalises by actual dt, so a 37° rotation
-         * in 30ms (1233°/s) correctly exceeds the 500°/s limit,
-         * while a 5° rotation in 10ms (500°/s) does not.
+         * Uses r_mag (displacement from rest, in degrees) directly,
+         * NOT velocity (r_mag/dt). The cursor movement design is
+         * displacement-based: as long as r_mag > dead_zone, the cursor
+         * moves at constant speed.  So r_mag is the natural metric.
          *
-         * GLITCH_RESYNC_FRAMES increased from 10 to 30 (300ms at 100Hz)
-         * to distinguish fast gestures (200-300ms) from persistent drift
-         * (seconds).  A gesture produces large |r| for 200-300ms then
-         * returns to neutral; drift stays large indefinitely. */
-        const float R_MAX_RUNTIME_VEL = 500.0f;  /* °/s — human limit ~200°/s */
+         * GLITCH_RESYNC_FRAMES = 30 (300ms) to distinguish fast
+         * gestures from persistent drift. */
+        const float R_MAX_RUNTIME_MAG = 120.0f;  /* ° — human head can't rotate this far from rest in one frame */
         const uint32_t GLITCH_RESYNC_FRAMES = 30;  /* 300 ms at 100 Hz */
         static uint32_t s_glitch_streak = 0;
         float r_mag = v3_norm(r);
-        float r_vel = (dt_s > 0.001f) ? (r_mag / dt_s) : 0.0f;  /* °/s */
-        if (r_vel > R_MAX_RUNTIME_VEL) {
+        /* Glitch detection: check r_mag directly (not velocity).
+         * r_mag is the displacement from rest — if it exceeds ~120°,
+         * it's likely a DMP glitch, not a real head rotation. */
+        if (r_mag > R_MAX_RUNTIME_MAG) {
             s_glitch_streak++;
             if (s_glitch_streak >= GLITCH_RESYNC_FRAMES) {
                 /* Persistent offset: q_drift has drifted from the actual
@@ -998,15 +995,16 @@ static void detector_task(void *arg)
                 } else {
                     memcpy(s_gd.q_drift, qcur, sizeof(s_gd.q_drift));
                 }
-                GD_DIAGW("DIAG-RESYNC streak=%u r_vel=%.0f r_mag=%.1f "
+                GD_DIAGW("DIAG-RESYNC streak=%u r_mag=%.1f "
                          "fifo=%u dt=%.0fms",
-                         (unsigned)(s_glitch_streak + 1), r_vel, r_mag,
+                         (unsigned)(s_glitch_streak + 1), r_mag,
                          (unsigned)fifo_cnt, dt_raw_ms);
                 s_glitch_streak = 0;
                 prev_valid = false;
-                GD_DBGW("DBG-RESYNC q_drift→qcur after %u stale frames "
-                         "(r_vel was %.0f°/s, r_mag=%.1f°)",
-                         (unsigned)GLITCH_RESYNC_FRAMES, r_vel, r_mag);
+                GD_DBGW("DBG-RESYNC q_drift→qcur after %u frames "
+                         "(r_mag=%.1f° > %.0f° threshold)",
+                         (unsigned)GLITCH_RESYNC_FRAMES, r_mag,
+                         R_MAX_RUNTIME_MAG);
             } else {
                 prev_valid = false;
             }
@@ -1573,21 +1571,29 @@ static void detector_task(void *arg)
 
         /* ── Mouse mode: send cursor reports or skip gesture emission ── */
         if (mouse_mode_is_active()) {
-            /* Feed tilt events into the toggle state machine even while
-             * mouse_mode is active — this detects the deactivation
-             * left+right tilt sequence.
-             * NOTE: best_sig_idx==2 means the roll axis matched (both
-             * TILT_LEFT and TILT_RIGHT share this axis). Direction is
-             * determined by the sign of the projection onto the tilt
-             * signature, NOT by best_sig_idx. */
-            if (best_sig_idx == 2 && s_gd.smooth_r_valid) {
+            /* Feed raw tilt projection into the toggle state machine.
+             * Uses the raw roll projection r onto the tiltL signature
+             * axis (with sign_roll applied). This bypasses the 1500ms
+             * gesture cooldown that would suppress the second tilt. */
+            if (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) {
                 float sig_tiltL_a[3];
                 memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
-                float roll_proj = apply_sign_roll(v3_dot(s_gd.smooth_r, sig_tiltL_a),
-                                                  s_gd.params.sign_roll);
-                gesture_type_t toggle_gest = (roll_proj >= 0.0f)
-                    ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
-                mouse_mode_toggle_step((int)toggle_gest, now_ms);
+                float roll_raw = apply_sign_roll(v3_dot(r, sig_tiltL_a),
+                                                 s_gd.params.sign_roll);
+                /* Periodic toggle diagnostic: every 50 frames (~500 ms) */
+                {
+                    static uint32_t s_tog_diag_cnt = 0;
+                    if (++s_tog_diag_cnt >= 50) {
+                        s_tog_diag_cnt = 0;
+                        ESP_LOGI(TAG, "TOGGLE-DIAG roll_raw=%.2f dead=%.2f "
+                                 "enabled=%d active=%d",
+                                 roll_raw, s_gd.params.neutral_zone_deg,
+                                 (int)mouse_mode_is_enabled(),
+                                 (int)mouse_mode_is_active());
+                    }
+                }
+                mouse_mode_toggle_step(roll_raw, s_gd.params.neutral_zone_deg,
+                                       now_ms);
             }
 
             /* Send cursor movement HID reports.
@@ -1604,23 +1610,32 @@ static void detector_task(void *arg)
                                 r_mag, vel);
             }
 
-            /* Skip gesture event emission and accumulation — mouse mode
+            /* Skip remaining gesture processing — mouse mode
              * suppresses all gesture-triggered cmd_configs. */
             goto tick_end;
         }
 
-        /* Non-mouse-mode: feed tilt events into toggle detection for
-         * activation. This runs AFTER emit_event so normal gesture
-         * processing is unaffected — toggle is purely additive.
-         * Same axis+direction logic as the mouse_mode branch above. */
-        if (best_sig_idx == 2 && s_gd.smooth_r_valid) {
+        /* Non-mouse-mode: feed raw tilt projection into toggle detection
+         * for activation. Same raw-projection approach as mouse mode. */
+        if (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) {
             float sig_tiltL_a[3];
             memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
-            float roll_proj = apply_sign_roll(v3_dot(s_gd.smooth_r, sig_tiltL_a),
-                                              s_gd.params.sign_roll);
-            gesture_type_t toggle_gest = (roll_proj >= 0.0f)
-                ? GESTURE_TILT_LEFT : GESTURE_TILT_RIGHT;
-            mouse_mode_toggle_step((int)toggle_gest, now_ms);
+            float roll_raw = apply_sign_roll(v3_dot(r, sig_tiltL_a),
+                                             s_gd.params.sign_roll);
+            /* Periodic toggle diagnostic (non-mouse-mode): every 50 frames */
+            {
+                static uint32_t s_tog_diag_cnt2 = 0;
+                if (++s_tog_diag_cnt2 >= 50) {
+                    s_tog_diag_cnt2 = 0;
+                    ESP_LOGI(TAG, "TOGGLE-OUT-DIAG roll_raw=%.2f dead=%.2f "
+                             "enabled=%d active=%d",
+                             roll_raw, s_gd.params.neutral_zone_deg,
+                             (int)mouse_mode_is_enabled(),
+                             (int)mouse_mode_is_active());
+                }
+            }
+            mouse_mode_toggle_step(roll_raw, s_gd.params.neutral_zone_deg,
+                                   now_ms);
         }
 
 tick_end:
@@ -2788,6 +2803,30 @@ esp_err_t gesture_detect_calibrate_gesture(gesture_type_t type, uint32_t duratio
     }
     s_gd.sig.calibrated |= flag;
     gesture_signatures_save_to_nvs(&s_gd.sig);
+
+    /* ---- Sync neutral pose axes with new PCA axes --------------------
+     * infer_signs() compares sig_nod/sig_tiltL (fresh PCA axis from this
+     * calibration) against np.nod_axis/np.tilt_axis (from NVS) to decide
+     * sign_pitch/sign_roll.  Without this sync, a re-calibration with a
+     * different佩戴 position produces new PCA axes that are misaligned
+     * with the stale np axes → both signs are inferred backwards.
+     *
+     * Only update tilt_axis from TILT_LEFT (not TILT_RIGHT) because
+     * infer_signs expects tilt_axis to point in the LEFT direction. */
+    {
+        gesture_params_t p = s_gd.params;
+        if (type == GESTURE_NOD) {
+            memcpy(p.neutral.nod_axis, axis, sizeof(float)*3);
+            ESP_LOGI(TAG, "synced np.nod_axis = [%+.3f %+.3f %+.3f]",
+                     axis[0], axis[1], axis[2]);
+        } else if (type == GESTURE_TILT_LEFT) {
+            memcpy(p.neutral.tilt_axis, axis, sizeof(float)*3);
+            ESP_LOGI(TAG, "synced np.tilt_axis = [%+.3f %+.3f %+.3f]",
+                     axis[0], axis[1], axis[2]);
+        }
+        gesture_params_save_to_nvs(&p);
+        memcpy(&s_gd.params, &p, sizeof(s_gd.params));
+    }
 
     ESP_LOGI(TAG, "gesture %s: axis=[%.3f %.3f %.3f] peak=%.1f avg_frames=%u/%u calibrated=0x%02x",
              names[type], axis[0], axis[1], axis[2], best_mag,

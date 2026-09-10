@@ -1375,19 +1375,32 @@ function trackConfigResponse (line) {
 let mouseModeEnabled = false
 let mouseModeActive = false
 let mouseFourDir = false
+let mouseFlipX = false
+let mouseFlipY = false
+let mouseSpeedMult = 1.0
 
 function trackMouseMode (line) {
-  /* Machine-parseable: "mouse_mode: enabled=1 active=0 fourdir=0 dz=2.0 ref=8.0 max=60 dwell=0" */
-  const m = line.match(/^mouse_mode:\s*enabled=(\d)\s+active=(\d)\s+fourdir=(\d)\s+dz=([\d.]+)\s+ref=([\d.]+)\s+max=([\d.]+)\s+dwell=(\d+)/)
+  /* Machine-parseable: "mouse_mode: enabled=1 active=0 fourdir=0 dz=2.0 ref=8.0 max=60 dwell=0 speed_mult=1.00 flip_x=0 flip_y=0" */
+  const m = line.match(/^mouse_mode:\s*enabled=(\d)\s+active=(\d)\s+fourdir=(\d)\s+dz=([\d.]+)\s+ref=([\d.]+)\s+max=([\d.]+)\s+dwell=(\d+)\s+speed_mult=([\d.]+)\s+flip_x=(\d)\s+flip_y=(\d)/)
   if (m) {
     mouseModeEnabled = m[1] === '1'
     mouseModeActive = m[2] === '1'
     mouseFourDir = m[3] === '1'
+    mouseSpeedMult = parseFloat(m[8])
+    mouseFlipX = m[9] === '1'
+    mouseFlipY = m[10] === '1'
     $('mouse-dz').textContent = m[4]
     $('mouse-ref').textContent = m[5]
     $('mouse-max').textContent = m[6]
     $('mouse-dwell').textContent = m[7] === '0' ? '立即' : m[7] + 'ms'
+    $('mouse-speed-mult').textContent = mouseSpeedMult.toFixed(2)
     $('mouse-params').classList.remove('hidden')
+    /* Update speed slider */
+    const slider = $('mouse-speed-slider')
+    if (slider) {
+      slider.value = mouseSpeedMult
+      $('mouse-speed-value').textContent = mouseSpeedMult.toFixed(2) + '×'
+    }
     renderMouseStatus()
     return
   }
@@ -1418,11 +1431,17 @@ function renderMouseStatus () {
   const btn4 = $('btn-mouse-fourdir')
   if (btn4) {
     btn4.textContent = mouseFourDir ? '四向移动: 开' : '四向移动: 关'
-    if (mouseFourDir) {
-      btn4.classList.add('active')
-    } else {
-      btn4.classList.remove('active')
-    }
+    btn4.classList.toggle('active', mouseFourDir)
+  }
+  const btnFx = $('btn-mouse-flipx')
+  if (btnFx) {
+    btnFx.textContent = mouseFlipX ? '左右翻转: 开' : '左右翻转: 关'
+    btnFx.classList.toggle('active', mouseFlipX)
+  }
+  const btnFy = $('btn-mouse-flipy')
+  if (btnFy) {
+    btnFy.textContent = mouseFlipY ? '上下翻转: 开' : '上下翻转: 关'
+    btnFy.classList.toggle('active', mouseFlipY)
   }
 }
 
@@ -1561,6 +1580,48 @@ $('btn-mouse-fourdir').addEventListener('click', async () => {
   mouseFourDir = !mouseFourDir
   renderMouseStatus()
   pushLog(mouseFourDir ? '四向移动模式已开启' : '四向移动模式已关闭', 'ok')
+})
+$('btn-mouse-flipx').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = mouseFlipX ? 'mouse flipx off' : 'mouse flipx on'
+  await sendCmd(cmd)
+  mouseFlipX = !mouseFlipX
+  renderMouseStatus()
+  pushLog(mouseFlipX ? '左右翻转已开启' : '左右翻转已关闭', 'ok')
+})
+$('btn-mouse-flipy').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const cmd = mouseFlipY ? 'mouse flipy off' : 'mouse flipy on'
+  await sendCmd(cmd)
+  mouseFlipY = !mouseFlipY
+  renderMouseStatus()
+  pushLog(mouseFlipY ? '上下翻转已开启' : '上下翻转已关闭', 'ok')
+})
+
+/* Speed slider: send on change (mouseup/touchend), not on input (continuous). */
+let speedSliderDebounce = null
+$('mouse-speed-slider').addEventListener('input', (e) => {
+  /* Update display while dragging */
+  $('mouse-speed-value').textContent = parseFloat(e.target.value).toFixed(2) + '×'
+})
+$('mouse-speed-slider').addEventListener('change', async (e) => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const val = parseFloat(e.target.value)
+  $('mouse-speed-value').textContent = val.toFixed(2) + '×'
+  /* Debounce: clear previous pending send */
+  if (speedSliderDebounce) clearTimeout(speedSliderDebounce)
+  speedSliderDebounce = setTimeout(async () => {
+    await sendCmd(`mouse speed ${val.toFixed(2)}`)
+    pushLog(`速度已设置为 ${val.toFixed(2)}×`, 'ok')
+  }, 200)
+})
+$('btn-mouse-speed-reset').addEventListener('click', async () => {
+  if (!rxChar) { pushLog('未连接', 'err'); return }
+  const slider = $('mouse-speed-slider')
+  slider.value = 1.0
+  $('mouse-speed-value').textContent = '1.00×'
+  await sendCmd('mouse speed 1.00')
+  pushLog('速度已恢复默认 (1.00×)', 'ok')
 })
 
 /* ── 初始化 ─────────────────────────────────────────────────────────────── */
