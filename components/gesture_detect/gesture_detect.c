@@ -1263,6 +1263,61 @@ static void detector_task(void *arg)
             }
         }
 
+        /* ── Mouse mode early exit: suppress all gesture emission ──
+         * When mouse mode is active, skip the entire accumulation-based
+         * trigger, sliding baseline snap, and non-mouse-mode toggle.
+         * Only feed the toggle state machine (for deactivation) and
+         * send cursor movement reports.
+         *
+         * MUST run BEFORE the accumulation check below — otherwise
+         * partially accumulated rotation vectors from head-tracking
+         * motion could satisfy the fire condition and emit a gesture
+         * event while the user is just moving the cursor. */
+        if (mouse_mode_is_active()) {
+            /* Feed raw tilt projection into the toggle state machine.
+             * Uses the raw roll projection r onto the tiltL signature
+             * axis (with sign_roll applied). This bypasses the 1500ms
+             * gesture cooldown that would suppress the second tilt. */
+            if (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) {
+                float sig_tiltL_a[3];
+                memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
+                float roll_raw = apply_sign_roll(v3_dot(r, sig_tiltL_a),
+                                                 s_gd.params.sign_roll);
+                /* Periodic toggle diagnostic: every 50 frames (~500 ms) */
+                if (s_cal_debug_enabled) {
+                    static uint32_t s_tog_diag_cnt = 0;
+                    if (++s_tog_diag_cnt >= 50) {
+                        s_tog_diag_cnt = 0;
+                        ESP_LOGI(TAG, "TOGGLE-DIAG roll_raw=%.2f dead=%.2f "
+                                 "enabled=%d active=%d",
+                                 roll_raw, s_gd.params.neutral_zone_deg,
+                                 (int)mouse_mode_is_enabled(),
+                                 (int)mouse_mode_is_active());
+                    }
+                }
+                mouse_mode_toggle_step(roll_raw, s_gd.params.neutral_zone_deg,
+                                       now_ms);
+            }
+
+            /* Send cursor movement HID reports.
+             * mouse_mode_tick uses raw r (q_drift frame) projected
+             * onto the calibrated signature axes (also q_drift frame).
+             * r carries actual angle information (degrees) unlike
+             * smooth_r which is normalised to unit length.
+             * At 100 Hz, only call every other frame to keep cursor
+             * speed unchanged (mouse_mode was tuned for 50 Hz). */
+            s_mouse_tick_div++;
+            if (s_mouse_tick_div >= 2) {
+                s_mouse_tick_div = 0;
+                mouse_mode_tick(r, s_gd.smooth_r_valid,
+                                r_mag, vel);
+            }
+
+            /* Skip remaining gesture processing — mouse mode
+             * suppresses all gesture-triggered cmd_configs. */
+            goto tick_end;
+        }
+
         /* ---- Accumulation-based trigger --------------------------------
          * Accumulate rotation vectors r while velocity > trigger.
          * Fire when velocity drops below end_vel for END_HOLD_FRAMES
@@ -1574,52 +1629,6 @@ static void detector_task(void *arg)
             }
         } else if (!vel_still) {
             s_vel_still_since = 0;
-        }
-
-        /* ── Mouse mode: send cursor reports or skip gesture emission ── */
-        if (mouse_mode_is_active()) {
-            /* Feed raw tilt projection into the toggle state machine.
-             * Uses the raw roll projection r onto the tiltL signature
-             * axis (with sign_roll applied). This bypasses the 1500ms
-             * gesture cooldown that would suppress the second tilt. */
-            if (s_gd.sig.calibrated & GESTURE_SIG_F_TILTL) {
-                float sig_tiltL_a[3];
-                memcpy(sig_tiltL_a, s_gd.sig.sig_tiltL, sizeof(sig_tiltL_a));
-                float roll_raw = apply_sign_roll(v3_dot(r, sig_tiltL_a),
-                                                 s_gd.params.sign_roll);
-                /* Periodic toggle diagnostic: every 50 frames (~500 ms) */
-                if (s_cal_debug_enabled) {
-                    static uint32_t s_tog_diag_cnt = 0;
-                    if (++s_tog_diag_cnt >= 50) {
-                        s_tog_diag_cnt = 0;
-                        ESP_LOGI(TAG, "TOGGLE-DIAG roll_raw=%.2f dead=%.2f "
-                                 "enabled=%d active=%d",
-                                 roll_raw, s_gd.params.neutral_zone_deg,
-                                 (int)mouse_mode_is_enabled(),
-                                 (int)mouse_mode_is_active());
-                    }
-                }
-                mouse_mode_toggle_step(roll_raw, s_gd.params.neutral_zone_deg,
-                                       now_ms);
-            }
-
-            /* Send cursor movement HID reports.
-             * mouse_mode_tick uses raw r (q_drift frame) projected
-             * onto the calibrated signature axes (also q_drift frame).
-             * r carries actual angle information (degrees) unlike
-             * smooth_r which is normalised to unit length.
-             * At 100 Hz, only call every other frame to keep cursor
-             * speed unchanged (mouse_mode was tuned for 50 Hz). */
-            s_mouse_tick_div++;
-            if (s_mouse_tick_div >= 2) {
-                s_mouse_tick_div = 0;
-                mouse_mode_tick(r, s_gd.smooth_r_valid,
-                                r_mag, vel);
-            }
-
-            /* Skip remaining gesture processing — mouse mode
-             * suppresses all gesture-triggered cmd_configs. */
-            goto tick_end;
         }
 
         /* Non-mouse-mode: feed raw tilt projection into toggle detection
